@@ -1,0 +1,199 @@
+repo / folder layout
+Modernization_Terraform/
+└─ sanitychecks/
+   ├─ scripts/
+   │  ├─ Scan-RG-Permissions-ByCustodian.ps1
+   │  ├─ Scan-RG-Permissions-AllADH.ps1
+   │  ├─ Scan-RG-Tags.ps1
+   │  ├─ Scan-KV-Secrets-ByCustodian.ps1
+   │  ├─ Scan-KV-Secrets-AllADH.ps1
+   │  ├─ Scan-KV-Permissions.ps1
+   │  ├─ Scan-KV-Networks.ps1
+   │  ├─ Scan-VNet-Topology.ps1
+   │  ├─ Scan-ADF.ps1
+   │  └─ Validate-ADLS.ps1
+   ├─ inputs/
+   │  ├─ prod_permissions.csv
+   │  ├─ nonprod_permissions.csv
+   │  ├─ kvsecretsscan.csv
+   │  └─ adls_permissions.csv
+   └─ .azure-pipelines/
+      ├─ pipeline.yml
+      ├─ stages/
+      │  ├─ rg_permissions.stage.yml
+      │  ├─ rg_tags.stage.yml
+      │  ├─ kv_secrets.stage.yml
+      │  ├─ kv_permissions.stage.yml
+      │  ├─ kv_firewall.stage.yml
+      │  ├─ vnet.stage.yml
+      │  ├─ adf.stage.yml
+      │  └─ adls.stage.yml
+      └─ templates/
+         └─ job.powershell-with-az.yml
+
+pipeline stages (what runs, with which script, and what it produces)
+
+1) RG Permissions
+
+Script(s): Scan-RG-Permissions-ByCustodian.ps1 (single), Scan-RG-Permissions-AllADH.ps1 (all)
+
+Inputs: prod_permissions.csv or nonprod_permissions.csv (selected by adh_subscription_type)
+
+Output artifacts (to $(Build.ArtifactStagingDirectory)/rg-permissions):
+
+rg_permissions_<cust-or-ALLADH>_<timestamp>.csv
+
+rg_permissions_<cust-or-ALLADH>_<timestamp>.html
+
+2) RG Tags
+
+Script: Scan-RG-Tags.ps1
+
+Inputs: none (discovery scan)
+
+Output artifacts (to .../rg-tags):
+
+rg_tags_<timestamp>.csv
+
+rg_tags_<timestamp>.html
+
+3) Key Vault – Secrets
+
+Script(s): Scan-KV-Secrets-ByCustodian.ps1, Scan-KV-Secrets-AllADH.ps1
+
+Inputs: kvsecretsscan.csv
+
+Output artifacts (to .../kv-secrets):
+
+kv_secrets_<cust-or-ALLADH>_<timestamp>.csv
+
+kv_secrets_<cust-or-ALLADH>_<timestamp>.html
+
+4) Key Vault – Permissions
+
+Script: Scan-KV-Permissions.ps1
+
+Inputs: none (discovery scan)
+
+Output artifacts (to .../kv-perms):
+
+kv_rbac_<timestamp>.csv
+
+kv_accesspolicies_<timestamp>.csv
+
+5) Key Vault – Firewall / Networks
+
+Script: Scan-KV-Networks.ps1
+
+Inputs: none (discovery scan)
+
+Output artifacts (to .../kv-firewall):
+
+kv_networks_<timestamp>.csv
+
+kv_networks_<timestamp>.html
+
+6) VNet & Peerings
+
+Script: Scan-VNet-Topology.ps1
+
+Inputs: none (discovery scan)
+
+Output artifacts (to .../vnet-topology):
+
+vnet_topology_<timestamp>.csv
+
+vnet_topology_<timestamp>.html
+
+7) Azure Data Factory
+
+Script: Scan-ADF.ps1
+
+Inputs: none (discovery scan)
+
+Output artifacts (to .../adf-scan):
+
+adf_overview_<timestamp>.csv
+
+adf_linkedservices_<timestamp>.csv
+
+adf_integrationruntimes_<timestamp>.csv
+
+adf_summary_<timestamp>.html
+
+8) ADLS Validation (RBAC + ACLs vs input)
+
+Script: Validate-ADLS.ps1
+
+Inputs: adls_permissions.csv
+
+Output artifacts (to .../adls-validate):
+
+adls_validation_<timestamp>.csv
+
+adls_validation_<timestamp>.html
+
+inputs (CSV schemas)
+
+prod_permissions.csv / nonprod_permissions.csv
+Used by RG Permissions scan (ByCustodian/AllADH)
+
+resource_group_name,role_definition_name,ad_group_name
+ADH_<Custodian>_APP,Reader,ADH_<Custodian>_Readers
+ADH_<Custodian>_KV,Key Vault Secrets Officer,ADH_<Custodian>_KV_Custodians
+
+
+The scripts replace <Custodian> with the passed adh_group (e.g., CSM, NHH).
+
+kvsecretsscan.csv
+Required secrets to exist in each KV
+
+SECRET_NAME
+sql-admin-password
+storage-conn-string
+
+
+adls_permissions.csv
+Expected ADLS RBAC/ACLs; storage account name is derived from adh_group + adh_subscription_type
+
+ResourceGroupName,StorageAccountName,ContainerName,Identity,AccessPath,PermissionType,Type,Scope
+ADH_<Custodian>_ADLS,adh<Cust>adlsnonprd,dev,ADH_<Custodian>_DataScientists,/,r-x,group,access
+ADH_<Custodian>_ADLS,adh<Cust>adlsnonprd,dev,spn://<appId>,/catalog,rwx,spn,default
+ADH_<Custodian>_ADLS,adh<Cust>adlsprd,prd,ADH_<Custodian>_Readers,/catalog/lz,r-x,group,access
+
+
+Replace tokens at runtime:
+
+<Custodian> → adh_group
+
+<Cust> → lower/abbr variant of adh_group if your script expects it (or same casing, depending on your convention)
+
+Type: group or spn (use spn://<appId> or a display name your script resolves)
+
+Scope: access or default
+
+PermissionType: POSIX style (rwx, r-x, lr-, etc.)
+
+how it’s parameterized (high-level)
+
+adh_group: the custodian key (e.g., CSM)
+
+adh_subscription_type: nonprd or prd
+
+run_mode (in pipeline.yml): ByCustodian or AllADH
+
+Agent pool logic (in templates/job.powershell-with-az.yml):
+
+If poolType: hosted → vmImage: windows-latest
+
+If poolType: self and poolName empty → compute "<adh_group>_<adh_subscription_type><poolSuffix>" (e.g., CSM_prd_agent1)
+
+If run_mode: AllADH → you pass a fixed poolName (MDM_nonprd_agent1 or MDM_prd_agent1)
+
+how subscriptions are targeted
+
+ByCustodian scans subscriptions whose name contains ADH and the adh_group and matches the env (nonprd vs prd|prod), so it’s resilient to naming variations like:
+
+nonprd_azure_***_ADH<adh_group> or prd_azure_***_ADH<adh_group>
+
+AllADH scans all ADH subscriptions (env-specific when the stage/script expects it).
