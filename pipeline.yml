@@ -1,17 +1,13 @@
 trigger: none
 pr: none
 
-# Optional schedule: ~01:30 IST on the 1st (20:00 UTC on day 30)
-schedules:
-- cron: "0 20 30 * *"
-  displayName: "Monthly sanity checks"
-  branches:
-    include: [ main ]
-  always: true
+# (Optional) run monthly
+# schedules:
+# - cron: "0 20 30 * *"
+#   displayName: "Monthly sanity checks"
+#   branches: { include: [ main ] }
+#   always: true
 
-# =======================
-# Parameters
-# =======================
 parameters:
 - name: run_mode
   type: string
@@ -23,7 +19,7 @@ parameters:
   type: string
   default: ""
 
-# Multi-custodian (optional). UI won't show as required.
+# Multi-custodian (optional list)
 - name: adh_groups_list
   type: object
   default: []          # e.g. ["CSM","NHH","MDM"]
@@ -38,9 +34,10 @@ parameters:
   default: self
   values: [self, hosted]
 
+# ⚠️ Fix: give harmless default to bypass UI "Required"
 - name: poolName
   type: string
-  default: ""          # leave blank to auto-compute "<adh_group>_<type><suffix>"
+  default: "auto"      # "auto" or "" => compute <adh_group>_<type><suffix>
 
 - name: poolSuffix
   type: string
@@ -65,9 +62,8 @@ parameters:
   type: string
   default: '$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv'
 
-# =======================
-# Stages (each template returns ONE stage)
-# =======================
+# ===== Stages (each template returns ONE stage) =====
+stages:
 - template: stages/rg_permissions.stage.yml
   parameters:
     run_mode:              ${{ parameters.run_mode }}
