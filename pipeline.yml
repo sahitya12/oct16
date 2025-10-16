@@ -1,0 +1,172 @@
+trigger: none
+pr: none
+
+# Optional schedule: ~01:30 IST on the 1st (20:00 UTC on day 30)
+schedules:
+- cron: "0 20 30 * *"
+  displayName: "Monthly sanity checks"
+  branches:
+    include: [ main ]
+  always: true
+
+# =======================
+# Parameters
+# =======================
+parameters:
+- name: run_mode
+  type: string
+  default: ByCustodian
+  values: [ByCustodian, AllADH, MultiCustodian]
+
+# Single-custodian
+- name: adh_group
+  type: string
+  default: ""
+
+# Multi-custodian (optional). UI won't show as required.
+- name: adh_groups_list
+  type: object
+  default: []          # e.g. ["CSM","NHH","MDM"]
+
+- name: adh_subscription_type
+  type: string
+  default: nonprd
+  values: [nonprd, prd]
+
+- name: poolType
+  type: string
+  default: self
+  values: [self, hosted]
+
+- name: poolName
+  type: string
+  default: ""          # leave blank to auto-compute "<adh_group>_<type><suffix>"
+
+- name: poolSuffix
+  type: string
+  default: "_agent1"
+  values: ["_agent1","_agent2"]
+
+- name: variableGroup
+  type: string
+  default: "modernization_tfstate_backend_details"
+
+# Input files
+- name: prodCsvPath
+  type: string
+  default: '$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv'
+- name: nonProdCsvPath
+  type: string
+  default: '$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv'
+- name: kvSecretsCsvPath
+  type: string
+  default: '$(Build.SourcesDirectory)/sanitychecks/inputs/kvsecretsscan.csv'
+- name: adlsCsvPath
+  type: string
+  default: '$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv'
+
+# =======================
+# Stages (each template returns ONE stage)
+# =======================
+- template: stages/rg_permissions.stage.yml
+  parameters:
+    run_mode:              ${{ parameters.run_mode }}
+    adh_group:             ${{ parameters.adh_group }}
+    adh_groups_list:       ${{ parameters.adh_groups_list }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    variableGroup:         ${{ parameters.variableGroup }}
+    prodCsvPath:           ${{ parameters.prodCsvPath }}
+    nonProdCsvPath:        ${{ parameters.nonProdCsvPath }}
+    poolType:              ${{ parameters.poolType }}
+    poolName:              ${{ parameters.poolName }}
+    poolSuffix:            ${{ parameters.poolSuffix }}
+
+- template: stages/rg_tags.stage.yml
+  parameters:
+    run_mode:              ${{ parameters.run_mode }}
+    adh_group:             ${{ parameters.adh_group }}
+    adh_groups_list:       ${{ parameters.adh_groups_list }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    variableGroup:         ${{ parameters.variableGroup }}
+    poolType:              ${{ parameters.poolType }}
+    poolName:              ${{ parameters.poolName }}
+    poolSuffix:            ${{ parameters.poolSuffix }}
+
+- template: stages/kv_secrets.stage.yml
+  parameters:
+    run_mode:              ${{ parameters.run_mode }}
+    adh_group:             ${{ parameters.adh_group }}
+    adh_groups_list:       ${{ parameters.adh_groups_list }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    variableGroup:         ${{ parameters.variableGroup }}
+    kvSecretsCsvPath:      ${{ parameters.kvSecretsCsvPath }}
+    poolType:              ${{ parameters.poolType }}
+    poolName:              ${{ parameters.poolName }}
+    poolSuffix:            ${{ parameters.poolSuffix }}
+
+- template: stages/kv_permissions.stage.yml
+  parameters:
+    run_mode:              ${{ parameters.run_mode }}
+    adh_group:             ${{ parameters.adh_group }}
+    adh_groups_list:       ${{ parameters.adh_groups_list }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    variableGroup:         ${{ parameters.variableGroup }}
+    poolType:              ${{ parameters.poolType }}
+    poolName:              ${{ parameters.poolName }}
+    poolSuffix:            ${{ parameters.poolSuffix }}
+
+- template: stages/kv_firewall.stage.yml
+  parameters:
+    run_mode:              ${{ parameters.run_mode }}
+    adh_group:             ${{ parameters.adh_group }}
+    adh_groups_list:       ${{ parameters.adh_groups_list }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    variableGroup:         ${{ parameters.variableGroup }}
+    poolType:              ${{ parameters.poolType }}
+    poolName:              ${{ parameters.poolName }}
+    poolSuffix:            ${{ parameters.poolSuffix }}
+
+- template: stages/vnet.stage.yml
+  parameters:
+    run_mode:              ${{ parameters.run_mode }}
+    adh_group:             ${{ parameters.adh_group }}
+    adh_groups_list:       ${{ parameters.adh_groups_list }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    variableGroup:         ${{ parameters.variableGroup }}
+    poolType:              ${{ parameters.poolType }}
+    poolName:              ${{ parameters.poolName }}
+    poolSuffix:            ${{ parameters.poolSuffix }}
+
+- template: stages/adf.stage.yml
+  parameters:
+    run_mode:              ${{ parameters.run_mode }}
+    adh_group:             ${{ parameters.adh_group }}
+    adh_groups_list:       ${{ parameters.adh_groups_list }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    variableGroup:         ${{ parameters.variableGroup }}
+    poolType:              ${{ parameters.poolType }}
+    poolName:              ${{ parameters.poolName }}
+    poolSuffix:            ${{ parameters.poolSuffix }}
+
+- template: stages/adls.stage.yml
+  parameters:
+    run_mode:              ${{ parameters.run_mode }}
+    adh_group:             ${{ parameters.adh_group }}
+    adh_groups_list:       ${{ parameters.adh_groups_list }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    variableGroup:         ${{ parameters.variableGroup }}
+    adlsCsvPath:           ${{ parameters.adlsCsvPath }}
+    poolType:              ${{ parameters.poolType }}
+    poolName:              ${{ parameters.poolName }}
+    poolSuffix:            ${{ parameters.poolSuffix }}
+
+- template: stages/databricks.stage.yml
+  parameters:
+    run_mode:              ${{ parameters.run_mode }}
+    adh_group:             ${{ parameters.adh_group }}
+    adh_groups_list:       ${{ parameters.adh_groups_list }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    variableGroup:         ${{ parameters.variableGroup }}
+    poolType:              ${{ parameters.poolType }}
+    poolName:              ${{ parameters.poolName }}
+    poolSuffix:            ${{ parameters.poolSuffix }}
