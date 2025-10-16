@@ -1,0 +1,80 @@
+parameters:
+  variableGroup: ''
+  displayName: ''
+  scriptPath: ''
+  workingDir: ''
+  arguments: ''
+  artifactName: ''
+  publishPath: ''
+  poolType: 'self'           # 'hosted' | 'self'
+  poolName: 'auto'           # ⚠️ 'auto' or '' => compute pool name
+  poolSuffix: '_agent1'      # _agent1 | _agent2
+  adh_group: ''              # for default pool name
+  adh_subscription_type: ''  # prd | nonprd
+
+jobs:
+- job: run_powershell
+  displayName: ${{ parameters.displayName }}
+
+  # Hosted uses Microsoft agents
+  ${{ if eq(parameters.poolType, 'hosted') }}:
+    pool:
+      vmImage: 'windows-latest'
+
+  # Self-hosted uses explicit or computed pool name
+  ${{ if ne(parameters.poolType, 'hosted') }}:
+    pool:
+      # If a specific pool name is provided (and not 'auto'), use it
+      ${{ if and(ne(parameters.poolName, ''), ne(parameters.poolName, 'auto')) }}:
+        name: ${{ parameters.poolName }}
+      # Otherwise compute "<adh_group>_<adh_subscription_type><poolSuffix>"
+      ${{ if or(eq(parameters.poolName, ''), eq(parameters.poolName, 'auto')) }}:
+        name: ${{ format('{0}_{1}{2}', parameters.adh_group, parameters.adh_subscription_type, parameters.poolSuffix) }}
+
+  variables:
+  - group: ${{ parameters.variableGroup }}
+
+  steps:
+  - checkout: self
+
+  - task: PowerShell@2
+    displayName: Prepare output folder
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $ErrorActionPreference = 'Stop'
+        $out = "${{ parameters.publishPath }}"
+        if ([string]::IsNullOrWhiteSpace($out)) { throw "publishPath parameter is empty." }
+        if (-not (Test-Path -LiteralPath $out)) { New-Item -ItemType Directory -Path $out -Force | Out-Null }
+        Write-Host "Prepared: $out"
+
+  - task: PowerShell@2
+    displayName: Run ${{ parameters.scriptPath }}
+    inputs:
+      targetType: filePath
+      filePath: ${{ parameters.scriptPath }}
+      workingDirectory: ${{ parameters.workingDir }}
+      arguments: ${{ parameters.arguments }}
+      pwsh: true
+
+  - task: PowerShell@2
+    displayName: List publish dir
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $out = "${{ parameters.publishPath }}"
+        if (Test-Path -LiteralPath $out) {
+          Get-ChildItem -Recurse -Force $out | Format-Table -AutoSize
+        } else {
+          Write-Warning "Publish path missing: $out"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          Set-Content -Path (Join-Path $out 'README.txt') -Value 'No output files were produced.'
+        }
+
+  - task: PublishBuildArtifacts@1
+    displayName: Publish ${{ parameters.artifactName }}
+    inputs:
+      PathtoPublish: ${{ parameters.publishPath }}
+      ArtifactName: ${{ parameters.artifactName }}
