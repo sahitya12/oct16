@@ -1,0 +1,22 @@
+parameters:
+  adh_group: ''
+  adh_subscription_type: 'nonprd'
+  poolName: 'Self-Hosted-Pool'
+  agentName: ''
+  variableGroup: 'modernization_tfstate_backend_details'
+
+jobs:
+- template: ../templates/job.powershell-with-az.yml
+  parameters:
+    variableGroup: ${{ parameters.variableGroup }}
+    displayName: 'ADF Scan'
+    scriptPath: 'sanitychecks/scripts/Scan-ADF.ps1'
+    workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
+    arguments: >-
+      -TenantId "$(tenant_id)" -ClientId "$(backend_client_id)" -ClientSecret "$(backend_client_secret)"
+      -adh_group "${{ parameters.adh_group }}" -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+      -OutputDir "$(Build.ArtifactStagingDirectory)/adf-scan" -BranchName "$(Build.SourceBranchName)"
+    artifactName: "adf-scan"
+    publishPath: "$(Build.ArtifactStagingDirectory)/adf-scan"
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ parameters.agentName }}
