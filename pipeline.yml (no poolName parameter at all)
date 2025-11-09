@@ -1,4 +1,3 @@
-# sanitychecks/.azure-pipelines/pipeline.yml
 trigger: none
 pr: none
 
@@ -10,14 +9,13 @@ parameters:
   type: string
   default: nonprd
   values: [nonprd, prd]
-- name: poolType
-  type: string
-  default: self           # self | hosted
-  values: [self, hosted]
 - name: poolSuffix
   type: string
   default: '_agent1'
   values: ['_agent1','_agent2']
+- name: poolName
+  type: string
+  default: 'Self-Hosted-Pool'   # <- not required at run time
 - name: prodCsvPath
   type: string
   default: '$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv'
@@ -31,87 +29,100 @@ parameters:
   type: string
   default: '$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv'
 
+# Helper: compute the agent capability text (e.g., KTK_nonprd_agent1)
+variables:
+- name: agentCapability
+  value: ${{ format('{0}_{1}{2}', parameters.adh_group, parameters.adh_subscription_type, parameters.poolSuffix) }}
+
 stages:
+# ---- RG Permissions ----
 - stage: RG_Permissions
-  displayName: "Resource Group Permissions"
+  displayName: "RG Permissions (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
   jobs:
   - template: stages/rg_permissions.stage.yml
     parameters:
-      adh_group: ${{ parameters.adh_group }}
+      adh_group:             ${{ parameters.adh_group }}
       adh_subscription_type: ${{ parameters.adh_subscription_type }}
-      prodCsvPath: ${{ parameters.prodCsvPath }}
-      nonProdCsvPath: ${{ parameters.nonProdCsvPath }}
-      poolType: ${{ parameters.poolType }}
-      poolSuffix: ${{ parameters.poolSuffix }}
+      prodCsvPath:           ${{ parameters.prodCsvPath }}
+      nonProdCsvPath:        ${{ parameters.nonProdCsvPath }}
+      poolName:              ${{ parameters.poolName }}
+      agentName:             $(agentCapability)
 
+# ---- RG Tags ----
 - stage: RG_Tags
-  displayName: "Resource Group Tags"
+  displayName: "RG Tags (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
   jobs:
   - template: stages/rg_tags.stage.yml
     parameters:
-      adh_group: ${{ parameters.adh_group }}
+      adh_group:             ${{ parameters.adh_group }}
       adh_subscription_type: ${{ parameters.adh_subscription_type }}
-      poolType: ${{ parameters.poolType }}
-      poolSuffix: ${{ parameters.poolSuffix }}
+      poolName:              ${{ parameters.poolName }}
+      agentName:             $(agentCapability)
 
+# ---- KV Secrets ----
 - stage: KV_Secrets
-  displayName: "Key Vault Secrets"
+  displayName: "KV Secrets (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
   jobs:
   - template: stages/kv_secrets.stage.yml
     parameters:
-      adh_group: ${{ parameters.adh_group }}
+      adh_group:             ${{ parameters.adh_group }}
       adh_subscription_type: ${{ parameters.adh_subscription_type }}
-      kvSecretsCsvPath: ${{ parameters.kvSecretsCsvPath }}
-      poolType: ${{ parameters.poolType }}
-      poolSuffix: ${{ parameters.poolSuffix }}
+      kvSecretsCsvPath:      ${{ parameters.kvSecretsCsvPath }}
+      poolName:              ${{ parameters.poolName }}
+      agentName:             $(agentCapability)
 
+# ---- KV Permissions ----
 - stage: KV_Permissions
-  displayName: "Key Vault Permissions"
+  displayName: "KV Permissions (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
   jobs:
   - template: stages/kv_permissions.stage.yml
     parameters:
-      adh_group: ${{ parameters.adh_group }}
+      adh_group:             ${{ parameters.adh_group }}
       adh_subscription_type: ${{ parameters.adh_subscription_type }}
-      poolType: ${{ parameters.poolType }}
-      poolSuffix: ${{ parameters.poolSuffix }}
+      poolName:              ${{ parameters.poolName }}
+      agentName:             $(agentCapability)
 
+# ---- KV Firewall ----
 - stage: KV_Firewall
-  displayName: "Key Vault Firewall"
+  displayName: "KV Firewall (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
   jobs:
   - template: stages/kv_firewall.stage.yml
     parameters:
-      adh_group: ${{ parameters.adh_group }}
+      adh_group:             ${{ parameters.adh_group }}
       adh_subscription_type: ${{ parameters.adh_subscription_type }}
-      poolType: ${{ parameters.poolType }}
-      poolSuffix: ${{ parameters.poolSuffix }}
+      poolName:              ${{ parameters.poolName }}
+      agentName:             $(agentCapability)
 
+# ---- VNet ----
 - stage: VNet_Scan
-  displayName: "VNet & Peerings"
+  displayName: "VNet & Peerings (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
   jobs:
   - template: stages/vnet.stage.yml
     parameters:
-      adh_group: ${{ parameters.adh_group }}
+      adh_group:             ${{ parameters.adh_group }}
       adh_subscription_type: ${{ parameters.adh_subscription_type }}
-      poolType: ${{ parameters.poolType }}
-      poolSuffix: ${{ parameters.poolSuffix }}
+      poolName:              ${{ parameters.poolName }}
+      agentName:             $(agentCapability)
 
+# ---- ADF ----
 - stage: ADF_Scan
-  displayName: "ADF Scan"
+  displayName: "ADF Scan (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
   jobs:
   - template: stages/adf.stage.yml
     parameters:
-      adh_group: ${{ parameters.adh_group }}
+      adh_group:             ${{ parameters.adh_group }}
       adh_subscription_type: ${{ parameters.adh_subscription_type }}
-      poolType: ${{ parameters.poolType }}
-      poolSuffix: ${{ parameters.poolSuffix }}
+      poolName:              ${{ parameters.poolName }}
+      agentName:             $(agentCapability)
 
+# ---- ADLS ----
 - stage: ADLS_Validate
-  displayName: "ADLS RBAC + ACL Validation"
+  displayName: "ADLS RBAC + ACL Validation (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
   jobs:
   - template: stages/adls.stage.yml
     parameters:
-      adh_group: ${{ parameters.adh_group }}
+      adh_group:             ${{ parameters.adh_group }}
       adh_subscription_type: ${{ parameters.adh_subscription_type }}
-      adlsCsvPath: ${{ parameters.adlsCsvPath }}
-      poolType: ${{ parameters.poolType }}
-      poolSuffix: ${{ parameters.poolSuffix }}
+      adlsCsvPath:           ${{ parameters.adlsCsvPath }}
+      poolName:              ${{ parameters.poolName }}
+      agentName:             $(agentCapability)
