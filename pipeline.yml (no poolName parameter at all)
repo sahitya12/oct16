@@ -1,0 +1,117 @@
+# sanitychecks/.azure-pipelines/pipeline.yml
+trigger: none
+pr: none
+
+parameters:
+- name: adh_group
+  type: string
+  default: ''
+- name: adh_subscription_type
+  type: string
+  default: nonprd
+  values: [nonprd, prd]
+- name: poolType
+  type: string
+  default: self           # self | hosted
+  values: [self, hosted]
+- name: poolSuffix
+  type: string
+  default: '_agent1'
+  values: ['_agent1','_agent2']
+- name: prodCsvPath
+  type: string
+  default: '$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv'
+- name: nonProdCsvPath
+  type: string
+  default: '$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv'
+- name: kvSecretsCsvPath
+  type: string
+  default: '$(Build.SourcesDirectory)/sanitychecks/inputs/kvsecretsscan.csv'
+- name: adlsCsvPath
+  type: string
+  default: '$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv'
+
+stages:
+- stage: RG_Permissions
+  displayName: "Resource Group Permissions"
+  jobs:
+  - template: stages/rg_permissions.stage.yml
+    parameters:
+      adh_group: ${{ parameters.adh_group }}
+      adh_subscription_type: ${{ parameters.adh_subscription_type }}
+      prodCsvPath: ${{ parameters.prodCsvPath }}
+      nonProdCsvPath: ${{ parameters.nonProdCsvPath }}
+      poolType: ${{ parameters.poolType }}
+      poolSuffix: ${{ parameters.poolSuffix }}
+
+- stage: RG_Tags
+  displayName: "Resource Group Tags"
+  jobs:
+  - template: stages/rg_tags.stage.yml
+    parameters:
+      adh_group: ${{ parameters.adh_group }}
+      adh_subscription_type: ${{ parameters.adh_subscription_type }}
+      poolType: ${{ parameters.poolType }}
+      poolSuffix: ${{ parameters.poolSuffix }}
+
+- stage: KV_Secrets
+  displayName: "Key Vault Secrets"
+  jobs:
+  - template: stages/kv_secrets.stage.yml
+    parameters:
+      adh_group: ${{ parameters.adh_group }}
+      adh_subscription_type: ${{ parameters.adh_subscription_type }}
+      kvSecretsCsvPath: ${{ parameters.kvSecretsCsvPath }}
+      poolType: ${{ parameters.poolType }}
+      poolSuffix: ${{ parameters.poolSuffix }}
+
+- stage: KV_Permissions
+  displayName: "Key Vault Permissions"
+  jobs:
+  - template: stages/kv_permissions.stage.yml
+    parameters:
+      adh_group: ${{ parameters.adh_group }}
+      adh_subscription_type: ${{ parameters.adh_subscription_type }}
+      poolType: ${{ parameters.poolType }}
+      poolSuffix: ${{ parameters.poolSuffix }}
+
+- stage: KV_Firewall
+  displayName: "Key Vault Firewall"
+  jobs:
+  - template: stages/kv_firewall.stage.yml
+    parameters:
+      adh_group: ${{ parameters.adh_group }}
+      adh_subscription_type: ${{ parameters.adh_subscription_type }}
+      poolType: ${{ parameters.poolType }}
+      poolSuffix: ${{ parameters.poolSuffix }}
+
+- stage: VNet_Scan
+  displayName: "VNet & Peerings"
+  jobs:
+  - template: stages/vnet.stage.yml
+    parameters:
+      adh_group: ${{ parameters.adh_group }}
+      adh_subscription_type: ${{ parameters.adh_subscription_type }}
+      poolType: ${{ parameters.poolType }}
+      poolSuffix: ${{ parameters.poolSuffix }}
+
+- stage: ADF_Scan
+  displayName: "ADF Scan"
+  jobs:
+  - template: stages/adf.stage.yml
+    parameters:
+      adh_group: ${{ parameters.adh_group }}
+      adh_subscription_type: ${{ parameters.adh_subscription_type }}
+      poolType: ${{ parameters.poolType }}
+      poolSuffix: ${{ parameters.poolSuffix }}
+
+- stage: ADLS_Validate
+  displayName: "ADLS RBAC + ACL Validation"
+  jobs:
+  - template: stages/adls.stage.yml
+    parameters:
+      adh_group: ${{ parameters.adh_group }}
+      adh_subscription_type: ${{ parameters.adh_subscription_type }}
+      adlsCsvPath: ${{ parameters.adlsCsvPath }}
+      poolType: ${{ parameters.poolType }}
+      poolSuffix: ${{ parameters.poolSuffix }}
