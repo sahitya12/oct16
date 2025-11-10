@@ -1,24 +1,27 @@
 parameters:
   adh_group: ''
   adh_subscription_type: 'nonprd'
-  adlsCsvPath: ''
   poolName: 'Self-Hosted-Pool'
   agentName: ''
   variableGroup: 'modernization_tfstate_backend_details'
+  adlsCsvPath: '$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv'
 
+stage: ADLS_Validate
+displayName: "ADLS RBAC + ACL Validation (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
 jobs:
 - template: ../templates/job.powershell-with-az.yml
   parameters:
     variableGroup: ${{ parameters.variableGroup }}
     displayName: 'ADLS RBAC + ACL Validation'
     scriptPath: 'sanitychecks/scripts/Validate-ADLS.ps1'
-    workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
+    workingDir:  '$(Build.SourcesDirectory)/sanitychecks/scripts'
     arguments: >-
       -TenantId "$(tenant_id)" -ClientId "$(backend_client_id)" -ClientSecret "$(backend_client_secret)"
       -CsvPath "${{ parameters.adlsCsvPath }}"
       -adh_group "${{ parameters.adh_group }}" -adh_subscription_type "${{ parameters.adh_subscription_type }}"
       -OutputDir "$(Build.ArtifactStagingDirectory)/adls-validate" -BranchName "$(Build.SourceBranchName)"
-    artifactName: "adls-validate"
-    publishPath: "$(Build.ArtifactStagingDirectory)/adls-validate"
+    artifactName: 'adls-validate'
+    publishPath:  '$(Build.ArtifactStagingDirectory)/adls-validate'
+    poolType: self
     poolName: ${{ parameters.poolName }}
     agentName: ${{ parameters.agentName }}
