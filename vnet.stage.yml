@@ -5,21 +5,22 @@ parameters:
   agentName: ''
   variableGroup: 'modernization_tfstate_backend_details'
 
-stage: VNet_Scan
-displayName: "VNet & Peerings (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
-jobs:
-- template: ../templates/job.powershell-with-az.yml
-  parameters:
-    variableGroup: ${{ parameters.variableGroup }}
-    displayName: 'VNet & Peerings Scan'
-    scriptPath: 'sanitychecks/scripts/Scan-VNet-Topology.ps1'
-    workingDir:  '$(Build.SourcesDirectory)/sanitychecks/scripts'
-    arguments: >-
-      -TenantId "$(tenant_id)" -ClientId "$(backend_client_id)" -ClientSecret "$(backend_client_secret)"
-      -adh_group "${{ parameters.adh_group }}" -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-      -OutputDir "$(Build.ArtifactStagingDirectory)/vnet-scan" -BranchName "$(Build.SourceBranchName)"
-    artifactName: 'vnet-scan'
-    publishPath:  '$(Build.ArtifactStagingDirectory)/vnet-scan'
-    poolType: self
-    poolName: ${{ parameters.poolName }}
-    agentName: ${{ parameters.agentName }}
+stages:
+- stage: VNet_Scan
+  displayName: "VNet & Peerings (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
+  jobs:
+  - template: ../templates/job.powershell-with-az.yml
+    parameters:
+      variableGroup: ${{ parameters.variableGroup }}
+      displayName: 'VNet & Peerings Scan'
+      scriptPath: 'sanitychecks/scripts/Scan-VNet-Topology.ps1'
+      workingDir:  '$(Build.SourcesDirectory)/sanitychecks/scripts'
+      arguments: >-
+        -TenantId "$(tenant_id)" -ClientId "$(backend_client_id)" -ClientSecret "$(backend_client_secret)"
+        -adh_group "${{ parameters.adh_group }}" -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+        -OutputDir "$(Build.ArtifactStagingDirectory)/vnet-scan" -BranchName "$(Build.SourceBranchName)"
+      artifactName: 'vnet-scan'
+      publishPath:  '$(Build.ArtifactStagingDirectory)/vnet-scan'
+      poolType: self
+      poolName: ${{ parameters.poolName }}
+      agentName: ${{ parameters.agentName }}
