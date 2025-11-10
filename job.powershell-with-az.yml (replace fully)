@@ -1,9 +1,6 @@
 # ==========================================
 # Template: job.powershell-with-az.yml
-# Purpose : Run a PowerShell script in a given pool
-#           with proper authentication & artifact publishing
 # ==========================================
-
 parameters:
   variableGroup: ''
   displayName: ''
@@ -14,45 +11,37 @@ parameters:
   publishPath: ''
 
   poolType: 'self'             # 'hosted' | 'self'
-  poolName: ''                 # optional explicit name
-  poolSuffix: '_agent1'        # _agent1 | _agent2
-  adh_group: ''                # for default pool name
-  adh_subscription_type: ''    # prd | nonprd
-  agentName: ''                # optional agent demand
+  poolName: ''                 # explicit pool name; if empty + self, uses 'Self-Hosted-Pool'
+  poolSuffix: '_agent1'        # not used here but kept for compatibility
+  adh_group: ''                # not used here but kept for compatibility
+  adh_subscription_type: ''    # not used here but kept for compatibility
+  agentName: ''                # OPTIONAL: exact agent name to target with demands
 
 jobs:
 - job: run_powershell
   displayName: ${{ parameters.displayName }}
 
-  # =======================
-  # Agent Pool Selection
-  # =======================
+  # -------- Pool selection --------
   ${{ if eq(parameters.poolType, 'hosted') }}:
     pool:
       vmImage: 'windows-latest'
 
   ${{ if ne(parameters.poolType, 'hosted') }}:
     pool:
-      ${{ if ne(parameters.poolName, '') }}:
-        name: ${{ parameters.poolName }}
-      ${{ if eq(parameters.poolName, '') }}:
-        name: 'Self-Hosted-Pool'
-      demands:
-        ${{ if ne(parameters.agentName, '') }}:
-          - AgentName -equals ${{ parameters.agentName }}
+      name: ${{ coalesce(parameters.poolName, 'Self-Hosted-Pool') }}
+      # Only render demands when agentName is provided; otherwise omit block entirely
+      ${{ if ne(parameters.agentName, '') }}:
+        demands:
+        # Use a built-in capability to match exact agent:
+        # 'Agent.Name' is the canonical capability key exposed by agents
+        - Agent.Name -equals ${{ parameters.agentName }}
 
   variables:
   - group: ${{ parameters.variableGroup }}
 
   steps:
-  # =======================
-  # Checkout Repo
-  # =======================
   - checkout: self
 
-  # =======================
-  # Prepare Output Folder
-  # =======================
   - task: PowerShell@2
     displayName: Prepare output folder
     inputs:
@@ -61,20 +50,14 @@ jobs:
       script: |
         $ErrorActionPreference = 'Stop'
         $out = "${{ parameters.publishPath }}"
-        if ([string]::IsNullOrWhiteSpace($out)) {
-          throw "publishPath parameter is empty."
-        }
-
+        if ([string]::IsNullOrWhiteSpace($out)) { throw "publishPath parameter is empty." }
         if (-not (Test-Path -LiteralPath $out)) {
-          Write-Host "Creating output directory: $out"
           New-Item -ItemType Directory -Path $out -Force | Out-Null
+          Write-Host "Created: $out"
         } else {
-          Write-Host "Output directory already exists: $out"
+          Write-Host "Exists:  $out"
         }
 
-  # =======================
-  # Run PowerShell Script
-  # =======================
   - task: PowerShell@2
     displayName: Run ${{ parameters.scriptPath }}
     inputs:
@@ -84,9 +67,6 @@ jobs:
       arguments: ${{ parameters.arguments }}
       pwsh: true
 
-  # =======================
-  # List Output Folder
-  # =======================
   - task: PowerShell@2
     displayName: List publish dir
     inputs:
@@ -95,26 +75,18 @@ jobs:
       script: |
         $ErrorActionPreference = 'Stop'
         $out = "${{ parameters.publishPath }}"
-
-        if ([string]::IsNullOrWhiteSpace($out)) {
-          throw "publishPath parameter is empty."
-        }
-
+        if ([string]::IsNullOrWhiteSpace($out)) { throw "publishPath parameter is empty." }
         if (Test-Path -LiteralPath $out) {
-          Write-Host "Contents of: $out"
+          Write-Host "Contents of $out:"
           Get-ChildItem -Recurse -Force -LiteralPath $out |
             Select-Object FullName, Length, LastWriteTime |
             Format-Table -AutoSize
-        }
-        else {
-          Write-Warning "Publish path missing: $out (creating it and dropping a README)"
+        } else {
+          Write-Warning "Folder not found, creating placeholder."
           New-Item -ItemType Directory -Path $out -Force | Out-Null
           Set-Content -Path (Join-Path $out 'README.txt') -Value 'No output files were produced.'
         }
 
-  # =======================
-  # Publish Artifact
-  # =======================
   - task: PublishBuildArtifacts@1
     displayName: Publish artifact
     inputs:
