@@ -37,7 +37,8 @@ Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
 Write-Host "Connected to Azure tenant: $TenantId" -ForegroundColor Green
 
 # --- Determine subscriptions for the ADH group and environment ---
-$subs = Get-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+$subs = @(Resolve-AdhSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type)
+
 if (-not $subs -or $subs.Count -eq 0) {
     throw "No matching subscriptions found for adh_group='$adh_group' environment='$adh_subscription_type'."
 }
