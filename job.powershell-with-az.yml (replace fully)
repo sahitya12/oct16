@@ -1,4 +1,4 @@
-# Reusable PowerShell job that pins to a self-hosted pool and routes via capability
+# Reusable PowerShell job that works with Hosted or Self-hosted pools.
 parameters:
   variableGroup: ''
   displayName: ''
@@ -8,19 +8,27 @@ parameters:
   artifactName: ''
   publishPath: ''
 
-  # Agent routing
-  poolName: 'Self-Hosted-Pool'     # your real pool name
-  agentName: ''                    # capability value to match, e.g. KTK_nonprd_agent1
+  # Agent selection
+  poolType: 'self'                 # 'hosted' | 'self'
+  poolName: 'Self-Hosted-Pool'     # self-hosted pool name
+  agentName: ''                    # display name of the agent to target (e.g., KTK_nonprd_agent1)
 
 jobs:
 - job: run_powershell
   displayName: ${{ parameters.displayName }}
 
-  pool:
-    name: ${{ parameters.poolName }}
-    ${{ if ne(parameters.agentName, '') }}:
-      demands:
-      - AgentName -equals ${{ parameters.agentName }}
+  # Hosted pool
+  ${{ if eq(parameters.poolType, 'hosted') }}:
+    pool:
+      vmImage: 'windows-latest'
+
+  # Self-hosted pool (with optional Agent.Name demand)
+  ${{ if ne(parameters.poolType, 'hosted') }}:
+    pool:
+      name: ${{ parameters.poolName }}
+      ${{ if ne(parameters.agentName, '') }}:
+        demands:
+        - Agent.Name -equals ${{ parameters.agentName }}
 
   variables:
   - group: ${{ parameters.variableGroup }}
