@@ -1,3 +1,6 @@
+Import-Module Az.Accounts, Az.Resources -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
+
 param(
   [Parameter(Mandatory)][string]$TenantId,
   [Parameter(Mandatory)][string]$ClientId,
