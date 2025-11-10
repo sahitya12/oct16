@@ -1,6 +1,4 @@
-# ==========================================
-# Template: job.powershell-with-az.yml
-# ==========================================
+# sanitychecks/.azure-pipelines/templates/job.powershell-with-az.yml
 parameters:
   variableGroup: ''
   displayName: ''
@@ -11,30 +9,25 @@ parameters:
   publishPath: ''
 
   poolType: 'self'             # 'hosted' | 'self'
-  poolName: ''                 # explicit pool name; if empty + self, uses 'Self-Hosted-Pool'
-  poolSuffix: '_agent1'        # not used here but kept for compatibility
-  adh_group: ''                # not used here but kept for compatibility
-  adh_subscription_type: ''    # not used here but kept for compatibility
-  agentName: ''                # OPTIONAL: exact agent name to target with demands
+  poolName: ''                 # optional explicit name
+  poolSuffix: '_agent1'        # _agent1 | _agent2
+  adh_group: ''                # for default pool name
+  adh_subscription_type: ''    # prd | nonprd
 
 jobs:
 - job: run_powershell
   displayName: ${{ parameters.displayName }}
 
-  # -------- Pool selection --------
   ${{ if eq(parameters.poolType, 'hosted') }}:
     pool:
       vmImage: 'windows-latest'
 
   ${{ if ne(parameters.poolType, 'hosted') }}:
     pool:
-      name: ${{ coalesce(parameters.poolName, 'Self-Hosted-Pool') }}
-      # Only render demands when agentName is provided; otherwise omit block entirely
-      ${{ if ne(parameters.agentName, '') }}:
-        demands:
-        # Use a built-in capability to match exact agent:
-        # 'Agent.Name' is the canonical capability key exposed by agents
-        - Agent.Name -equals ${{ parameters.agentName }}
+      ${{ if ne(parameters.poolName, '') }}:
+        name: ${{ parameters.poolName }}
+      ${{ if eq(parameters.poolName, '') }}:
+        name: ${{ format('{0}_{1}{2}', parameters.adh_group, parameters.adh_subscription_type, parameters.poolSuffix) }}
 
   variables:
   - group: ${{ parameters.variableGroup }}
@@ -48,15 +41,12 @@ jobs:
       targetType: inline
       pwsh: true
       script: |
-        $ErrorActionPreference = 'Stop'
         $out = "${{ parameters.publishPath }}"
         if ([string]::IsNullOrWhiteSpace($out)) { throw "publishPath parameter is empty." }
         if (-not (Test-Path -LiteralPath $out)) {
           New-Item -ItemType Directory -Path $out -Force | Out-Null
-          Write-Host "Created: $out"
-        } else {
-          Write-Host "Exists:  $out"
         }
+        Write-Host "Prepared: $($out)"
 
   - task: PowerShell@2
     displayName: Run ${{ parameters.scriptPath }}
@@ -73,23 +63,17 @@ jobs:
       targetType: inline
       pwsh: true
       script: |
-        $ErrorActionPreference = 'Stop'
         $out = "${{ parameters.publishPath }}"
         if ([string]::IsNullOrWhiteSpace($out)) { throw "publishPath parameter is empty." }
-        if (Test-Path -LiteralPath $out) {
-          Write-Host "Contents of $out:"
-          Get-ChildItem -Recurse -Force -LiteralPath $out |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-Table -AutoSize
-        } else {
-          Write-Warning "Folder not found, creating placeholder."
+        if (-not (Test-Path -LiteralPath $out)) {
+          Write-Warning "Publish path missing: $($out)"
           New-Item -ItemType Directory -Path $out -Force | Out-Null
-          Set-Content -Path (Join-Path $out 'README.txt') -Value 'No output files were produced.'
         }
+        Write-Host "Contents of $($out):"
+        Get-ChildItem -Recurse -Force -LiteralPath $out | Format-Table -AutoSize
 
   - task: PublishBuildArtifacts@1
     displayName: Publish artifact
     inputs:
       PathtoPublish: ${{ parameters.publishPath }}
       ArtifactName: ${{ parameters.artifactName }}
-      publishLocation: 'Container'
