@@ -17,7 +17,18 @@ param(
 Import-Module Az.Accounts, Az.Resources -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
-Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
+# --- Connect to Azure ---
+Write-Host "Connecting to Azure using Service Principal credentials..." -ForegroundColor Cyan
+try {
+    $secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+    $credential = New-Object System.Management.Automation.PSCredential ($ClientId, $secureSecret)
+    Connect-AzAccount -ServicePrincipal -Tenant $TenantId -Credential $credential -ErrorAction Stop | Out-Null
+    Write-Host "Connected successfully to tenant $TenantId" -ForegroundColor Green
+}
+catch {
+    throw "Failed to connect to Azure: $($_.Exception.Message)"
+}
+
 
 # Pick the right CSV and load rows
 $csvPath = if ($adh_subscription_type -eq 'prd') { $ProdCsvPath } else { $NonProdCsvPath }
