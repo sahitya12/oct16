@@ -7,22 +7,23 @@ parameters:
   prodCsvPath: '$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv'
   nonProdCsvPath: '$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv'
 
-stage: RG_Permissions
-displayName: "RG Permissions (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
-jobs:
-- template: ../templates/job.powershell-with-az.yml
-  parameters:
-    variableGroup: ${{ parameters.variableGroup }}
-    displayName: 'RG Permissions Scan'
-    scriptPath: 'sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1'
-    workingDir:  '$(Build.SourcesDirectory)/sanitychecks/scripts'
-    arguments: >-
-      -TenantId "$(tenant_id)" -ClientId "$(backend_client_id)" -ClientSecret "$(backend_client_secret)"
-      -ProdCsvPath "${{ parameters.prodCsvPath }}" -NonProdCsvPath "${{ parameters.nonProdCsvPath }}"
-      -adh_group "${{ parameters.adh_group }}" -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-      -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions" -BranchName "$(Build.SourceBranchName)"
-    artifactName: 'rg-permissions'
-    publishPath:  '$(Build.ArtifactStagingDirectory)/rg-permissions'
-    poolType: self
-    poolName: ${{ parameters.poolName }}
-    agentName: ${{ parameters.agentName }}
+stages:
+- stage: RG_Permissions
+  displayName: "RG Permissions (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
+  jobs:
+  - template: ../templates/job.powershell-with-az.yml
+    parameters:
+      variableGroup: ${{ parameters.variableGroup }}
+      displayName: 'RG Permissions Scan'
+      scriptPath: 'sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1'
+      workingDir:  '$(Build.SourcesDirectory)/sanitychecks/scripts'
+      arguments: >-
+        -TenantId "$(tenant_id)" -ClientId "$(backend_client_id)" -ClientSecret "$(backend_client_secret)"
+        -ProdCsvPath "${{ parameters.prodCsvPath }}" -NonProdCsvPath "${{ parameters.nonProdCsvPath }}"
+        -adh_group "${{ parameters.adh_group }}" -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+        -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions" -BranchName "$(Build.SourceBranchName)"
+      artifactName: 'rg-permissions'
+      publishPath:  '$(Build.ArtifactStagingDirectory)/rg-permissions'
+      poolType: self
+      poolName: ${{ parameters.poolName }}
+      agentName: ${{ parameters.agentName }}
