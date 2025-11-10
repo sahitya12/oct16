@@ -1,4 +1,9 @@
-# Reusable PowerShell job that works with Hosted or Self-hosted pools.
+# ==========================================
+# Template: job.powershell-with-az.yml
+# Purpose : Run a PowerShell script in a given pool
+#           with proper authentication & artifact publishing
+# ==========================================
+
 parameters:
   variableGroup: ''
   displayName: ''
@@ -8,47 +13,68 @@ parameters:
   artifactName: ''
   publishPath: ''
 
-  # Agent selection
-  poolType: 'self'                 # 'hosted' | 'self'
-  poolName: 'Self-Hosted-Pool'     # self-hosted pool name
-  agentName: ''                    # display name of the agent to target (e.g., KTK_nonprd_agent1)
+  poolType: 'self'             # 'hosted' | 'self'
+  poolName: ''                 # optional explicit name
+  poolSuffix: '_agent1'        # _agent1 | _agent2
+  adh_group: ''                # for default pool name
+  adh_subscription_type: ''    # prd | nonprd
+  agentName: ''                # optional agent demand
 
 jobs:
 - job: run_powershell
   displayName: ${{ parameters.displayName }}
 
-  # Hosted pool
+  # =======================
+  # Agent Pool Selection
+  # =======================
   ${{ if eq(parameters.poolType, 'hosted') }}:
     pool:
       vmImage: 'windows-latest'
 
-  # Self-hosted pool (with optional Agent.Name demand)
   ${{ if ne(parameters.poolType, 'hosted') }}:
     pool:
-      name: ${{ parameters.poolName }}
-      ${{ if ne(parameters.agentName, '') }}:
-        demands:
-        - Agent.Name -equals ${{ parameters.agentName }}
+      ${{ if ne(parameters.poolName, '') }}:
+        name: ${{ parameters.poolName }}
+      ${{ if eq(parameters.poolName, '') }}:
+        name: 'Self-Hosted-Pool'
+      demands:
+        ${{ if ne(parameters.agentName, '') }}:
+          - AgentName -equals ${{ parameters.agentName }}
 
   variables:
   - group: ${{ parameters.variableGroup }}
 
   steps:
+  # =======================
+  # Checkout Repo
+  # =======================
   - checkout: self
 
+  # =======================
+  # Prepare Output Folder
+  # =======================
   - task: PowerShell@2
     displayName: Prepare output folder
     inputs:
       targetType: inline
       pwsh: true
       script: |
+        $ErrorActionPreference = 'Stop'
         $out = "${{ parameters.publishPath }}"
-        if ([string]::IsNullOrWhiteSpace($out)) { throw "publishPath parameter is empty." }
-        if (-not (Test-Path -LiteralPath $out)) {
-          New-Item -ItemType Directory -Path $out -Force | Out-Null
+        if ([string]::IsNullOrWhiteSpace($out)) {
+          throw "publishPath parameter is empty."
         }
-        Write-Host "Prepared: $out"
 
+        if (-not (Test-Path -LiteralPath $out)) {
+          Write-Host "Creating output directory: $out"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+        } else {
+          Write-Host "Output directory already exists: $out"
+        }
+
+  # =======================
+  # Run PowerShell Script
+  # =======================
   - task: PowerShell@2
     displayName: Run ${{ parameters.scriptPath }}
     inputs:
@@ -58,22 +84,40 @@ jobs:
       arguments: ${{ parameters.arguments }}
       pwsh: true
 
+  # =======================
+  # List Output Folder
+  # =======================
   - task: PowerShell@2
     displayName: List publish dir
     inputs:
       targetType: inline
       pwsh: true
       script: |
+        $ErrorActionPreference = 'Stop'
         $out = "${{ parameters.publishPath }}"
+
+        if ([string]::IsNullOrWhiteSpace($out)) {
+          throw "publishPath parameter is empty."
+        }
+
         if (Test-Path -LiteralPath $out) {
-          Get-ChildItem -Recurse -Force $out | Format-Table -AutoSize
-        } else {
-          Write-Warning "Publish path missing: $out"
+          Write-Host "Contents of: $out"
+          Get-ChildItem -Recurse -Force -LiteralPath $out |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+        }
+        else {
+          Write-Warning "Publish path missing: $out (creating it and dropping a README)"
           New-Item -ItemType Directory -Path $out -Force | Out-Null
           Set-Content -Path (Join-Path $out 'README.txt') -Value 'No output files were produced.'
+        }
 
+  # =======================
+  # Publish Artifact
+  # =======================
   - task: PublishBuildArtifacts@1
     displayName: Publish artifact
     inputs:
       PathtoPublish: ${{ parameters.publishPath }}
       ArtifactName: ${{ parameters.artifactName }}
+      publishLocation: 'Container'
