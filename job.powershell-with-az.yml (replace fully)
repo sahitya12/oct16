@@ -36,6 +36,20 @@ jobs:
   - checkout: self
 
   - task: PowerShell@2
+  displayName: Ensure Az modules
+  inputs:
+    targetType: inline
+    pwsh: true
+    script: |
+      $mods = 'Az.Accounts','Az.Resources'
+      foreach ($m in $mods) {
+        if (-not (Get-Module -ListAvailable -Name $m)) {
+          Write-Host "Installing $m…"
+          Install-Module $m -Scope CurrentUser -Force -AllowClobber
+        }
+      }
+
+  - task: PowerShell@2
     displayName: Prepare output folder
     inputs:
       targetType: inline
