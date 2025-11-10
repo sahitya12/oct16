@@ -1,42 +1,7 @@
 function Resolve-AdhSubscriptions {
     <#
-    .SYNOPSIS
-      Resolve ADH subscriptions for a custodian (adh_group) and environment (nonprd|prd).
-
-    .DESCRIPTION
-      Matches your naming rules:
-        - nonprd  → dev_azure_*_ADH<suffix>
-        - prd     → prd_azure_*_ADH<suffix>
-      Suffix variants tried (in order):
-        1) ADH<ADH_GROUP>
-        2) ADH<FIRST_LETTER><ADH_GROUP>   (legacy/variant like ADHMMDM, ADHNNHH)
-      Special cases map certain groups to a fixed suffix (e.g., KTK → ADHPlatform).
-
-      Returns the single best match by default, or all matches with -All.
-
-    .PARAMETER AdhGroup
-      The custodian (e.g., 'KTK', 'MDM', 'NHH', 'JS', ...).
-
-    .PARAMETER Environment
-      'nonprd' (default) or 'prd'.
-
-    .PARAMETER All
-      Return all matching subscriptions instead of the single preferred one.
-
-    .PARAMETER Loose
-      Adds a final, very tolerant pattern: ADH*<ADH_GROUP>* (use only if needed).
-
-    .OUTPUTS
-      If -All is not used: Microsoft.Azure.Commands.Profile.Models.Core.PSAzureSubscription
-      If -All is used:    Array of PSAzureSubscription
-
-    .EXAMPLE
-      Resolve-AdhSubscriptions -AdhGroup KTK -Environment nonprd
-      # → dev_azure_20401_ADHPlatform
-
-    .EXAMPLE
-      Resolve-AdhSubscriptions -AdhGroup MDM -Environment prd -All
-      # → prd_azure_20910_ADHMMDM (+ any others that match)
+      Resolves subscriptions for a given ADH custodian and environment.
+      Updated mapping logic for KTK, MDM, NHH and future ADH groups.
     #>
     [CmdletBinding()]
     param(
@@ -52,67 +17,58 @@ function Resolve-AdhSubscriptions {
         [switch]$Loose
     )
 
-    # Normalize
     $g = $AdhGroup.Trim().ToUpperInvariant()
 
-    # 1) Environment prefix
+    # --- Prefix for environment
     $envPrefix = if ($Environment -eq 'prd') { 'prd_azure_' } else { 'dev_azure_' }
 
-    # 2) Special case map (extend as needed)
-    #    KTK must scan the Platform subscription.
+    # --- Map any special custodian to a fixed suffix
     $specialMap = @{
-        'KTK' = 'ADHPlatform'
+        'KTK' = 'ADHPlatform'   # special case: AI / Platform team
+        # Add others here if you ever need fixed routing
+        # 'ABC' = 'ADHCommon', etc.
     }
 
-    # 3) Build suffix variants
+    # --- Build suffix variants
     $variants = [System.Collections.Generic.List[string]]::new()
     if ($specialMap.ContainsKey($g)) {
-        $variants.Add($specialMap[$g])          # e.g., ADHPlatform
+        $variants.Add($specialMap[$g])
     }
     else {
         $first = $g.Substring(0,1)
-        $variants.Add("ADH$g")                  # ADHMDM, ADHNHH, ADHJS
-        $variants.Add("ADH$first$g")            # ADHMMDM, ADHNNHH, ADHJJS
-        if ($Loose) {
-            $variants.Add("ADH*$g*")            # Optional very loose fallback
-        }
+        $variants.Add("ADH$g")       # ADHMDM, ADHNHH
+        $variants.Add("ADH$first$g") # ADHMMDM, ADHNNHH
+        if ($Loose) { $variants.Add("ADH*$g*") }
     }
 
-    # 4) Enumerate subscriptions and match
+    # --- Get all subs visible to the SPN
     try {
         $allSubs = Get-AzSubscription -ErrorAction Stop
     }
     catch {
-        throw "Resolve-AdhSubscriptions: failed to call Get-AzSubscription. $($_.Exception.Message)"
+        throw "Resolve-AdhSubscriptions: failed to list subscriptions. $($_.Exception.Message)"
     }
 
+    # --- Match subscriptions by pattern
     $matches = @()
     foreach ($v in $variants) {
-        # v can be exact (ADHNNHH) or wildcard (ADH*NNHH*)
-        $pattern = "$envPrefix*_*$v"            # e.g., dev_azure_*_ADHMMDM
+        $pattern = "$envPrefix*_*$v"
         $matches += $allSubs | Where-Object { $_.Name -like $pattern }
     }
 
-    # De-duplicate and keep enabled/active ones first if possible
-    $matches = $matches |
-        Sort-Object Name -Unique
-
-    if (-not $matches -or $matches.Count -eq 0) {
-        $hint = $variants -join ', '
-        throw "Resolve-AdhSubscriptions: No subscriptions matched for adh_group '$g' ($Environment). Tried patterns: $hint"
+    $matches = $matches | Sort-Object Name -Unique
+    if (-not $matches) {
+        throw "Resolve-AdhSubscriptions: No match for adh_group '$g' ($Environment). Tried: $($variants -join ', ')"
     }
 
-    if ($All) {
-        return $matches
-    }
+    if ($All) { return $matches }
 
-    # 5) Pick a single 'best' match deterministically
+    # --- Ranking logic: exact > first-letter variant > special map
     function Get-Rank([string]$name) {
-        # Lowest number is preferred
-        if ($name -like "$envPrefix*_ADH$g")                   { return 0 } # ADH<GROUP>
-        elseif ($name -like "$envPrefix*_ADH$($g.Substring(0,1))$g") { return 1 } # ADH<FIRST><GROUP>
-        elseif ($name -like "$envPrefix*_ADHPlatform")         { return 2 } # Special
-        else                                                   { return 9 }
+        if ($name -like "$envPrefix*_ADH$g") { return 0 }
+        elseif ($name -like "$envPrefix*_ADH$($g.Substring(0,1))$g") { return 1 }
+        elseif ($name -like "$envPrefix*_ADHPlatform") { return 2 }
+        else { return 9 }
     }
 
     $preferred = $matches |
@@ -120,8 +76,7 @@ function Resolve-AdhSubscriptions {
         Select-Object -First 1
 
     if (-not $preferred) {
-        $names = ($matches | Select-Object -ExpandProperty Name) -join '; '
-        throw "Resolve-AdhSubscriptions: Could not select a preferred subscription from: $names"
+        throw "Resolve-AdhSubscriptions: could not choose preferred subscription from: $($matches.Name -join ', ')"
     }
 
     return $preferred
