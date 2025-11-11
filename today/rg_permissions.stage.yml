@@ -16,10 +16,6 @@ parameters:
     type: string
     default: ''
 
-variables:
-- name: InputsRoot
-  value: '$(Build.SourcesDirectory)/sanitychecks/inputs'
-
 stages:
 - stage: rg_permissions
   displayName: "RG Permissions (ByCustodian)"
@@ -31,6 +27,9 @@ stages:
       name: ${{ parameters.poolName }}
       demands:
       - Agent.Name -equals ${{ parameters.agentName }}
+
+    variables:
+      InputsRoot: '$(Build.SourcesDirectory)/sanitychecks/inputs'
 
     steps:
     - checkout: self
@@ -46,7 +45,6 @@ stages:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Write-Host "OutputDir: $out"
 
-    # --- Debug step (PowerShell instead of CMD)
     - task: PowerShell@2
       displayName: "Debug: show script being executed"
       inputs:
@@ -62,7 +60,6 @@ stages:
           Write-Host "`nFirst 40 lines of $file"
           Get-Content $file -TotalCount 40
 
-    # --- Debug step to verify CSVs exist (now points to sanitychecks/inputs)
     - task: PowerShell@2
       displayName: "Debug: check CSV inputs exist"
       inputs:
@@ -76,7 +73,6 @@ stages:
           if (-not (Test-Path -LiteralPath $prod)) { throw "prod_permissions.csv not found at $prod" }
           if (-not (Test-Path -LiteralPath $nonp)) { throw "nonprod_permissions.csv not found at $nonp" }
 
-    # --- Run the main RG Permission scan
     - task: PowerShell@2
       displayName: "Run RG Permissions Scan (ByCustodian)"
       inputs:
@@ -96,7 +92,6 @@ stages:
       env:
         AZURE_CORE_ONLY_SHOW_ERRORS: '1'
 
-    # --- Publish artifacts
     - task: PublishBuildArtifacts@1
       displayName: "Publish RG permissions artifact"
       inputs:
