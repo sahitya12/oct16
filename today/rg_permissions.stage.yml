@@ -1,0 +1,97 @@
+# stages/rg_permissions.stage.yml
+parameters:
+  - name: adh_group
+    type: string
+    default: ''
+  - name: adh_subscription_type
+    type: string
+    default: nonprd
+    values:
+      - nonprd
+      - prd
+  - name: poolName
+    type: string
+    default: 'Self-Hosted-Pool'
+  - name: agentName
+    type: string
+    default: ''
+
+stages:
+- stage: rg_permissions
+  displayName: "RG Permissions (ByCustodian)"
+  condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
+  jobs:
+  - job: scan_rg_permissions
+    displayName: "Scan RG Permissions: ${{ parameters.adh_group }} (${{ parameters.adh_subscription_type }})"
+    pool:
+      name: ${{ parameters.poolName }}
+      # Pin to a specific self-hosted agent name if you use per-group agents
+      demands:
+      - Agent.Name -equals ${{ parameters.agentName }}
+
+    steps:
+    - checkout: self
+      clean: true
+
+    # (Optional) create the output folder up front
+    - task: PowerShell@2
+      displayName: "Prepare output dir"
+      inputs:
+        targetType: inline
+        pwsh: true
+        script: |
+          $out = "$(Build.ArtifactStagingDirectory)/rg-permissions"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Write-Host "OutputDir: $out"
+
+    # ---- Debug step to prove which script is executed on the agent ----
+    - script: |
+        echo "Listing script dir:"
+        ls -la "$(Build.SourcesDirectory)/sanitychecks/scripts"
+        echo ""
+        echo "Cat first lines of Scan-RG-Permissions-ByCustodian.ps1:"
+        head -n 30 "$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1"
+      displayName: "Debug: show script being executed"
+
+    # ---- (Optional) sanity check the CSV input paths exist ----
+    - task: PowerShell@2
+      displayName: "Debug: check CSV inputs exist"
+      inputs:
+        targetType: inline
+        pwsh: true
+        script: |
+          $prod = "$(Build.SourcesDirectory)/inputs/prod_permissions.csv"
+          $nonp = "$(Build.SourcesDirectory)/inputs/nonprod_permissions.csv"
+          Write-Host "ProdCsvPath    : $prod"
+          Write-Host "NonProdCsvPath : $nonp"
+          if (-not (Test-Path -LiteralPath $prod)) { Write-Error "prod_permissions.csv not found at $prod" }
+          if (-not (Test-Path -LiteralPath $nonp)) { Write-Error "nonprod_permissions.csv not found at $nonp" }
+
+    # ---- Run the scan with the exact parameter names expected by the script ----
+    - task: PowerShell@2
+      displayName: "Run RG Permissions Scan (ByCustodian)"
+      inputs:
+        targetType: filePath
+        filePath: "$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1"
+        arguments: >
+          -TenantId $(tenantId)
+          -ClientId $(clientId)
+          -ClientSecret $(clientSecret)
+          -adh_group ${{ parameters.adh_group }}
+          -adh_subscription_type ${{ parameters.adh_subscription_type }}
+          -ProdCsvPath "$(Build.SourcesDirectory)/inputs/prod_permissions.csv"
+          -NonProdCsvPath "$(Build.SourcesDirectory)/inputs/nonprod_permissions.csv"
+          -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
+          -BranchName "$(Build.SourceBranchName)"
+        pwsh: true
+      env:
+        # keeps Az noise low; optional
+        AZURE_CORE_ONLY_SHOW_ERRORS: '1'
+
+    # ---- Publish the results (CSV + HTML) ----
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish RG permissions artifact"
+      inputs:
+        PathtoPublish: "$(Build.ArtifactStagingDirectory)/rg-permissions"
+        ArtifactName: "rg-permissions"
+        publishLocation: "Container"
