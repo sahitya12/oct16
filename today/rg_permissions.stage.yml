@@ -6,9 +6,7 @@ parameters:
   - name: adh_subscription_type
     type: string
     default: nonprd
-    values:
-      - nonprd
-      - prd
+    values: [nonprd, prd]
   - name: poolName
     type: string
     default: 'Self-Hosted-Pool'
@@ -25,7 +23,6 @@ stages:
     displayName: "Scan RG Permissions: ${{ parameters.adh_group }} (${{ parameters.adh_subscription_type }})"
     pool:
       name: ${{ parameters.poolName }}
-      # Pin to a specific self-hosted agent name if you use per-group agents
       demands:
       - Agent.Name -equals ${{ parameters.agentName }}
 
@@ -33,7 +30,6 @@ stages:
     - checkout: self
       clean: true
 
-    # (Optional) create the output folder up front
     - task: PowerShell@2
       displayName: "Prepare output dir"
       inputs:
@@ -44,16 +40,18 @@ stages:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Write-Host "OutputDir: $out"
 
-    # ---- Debug step to prove which script is executed on the agent ----
-    - script: |
-        echo "Listing script dir:"
-        ls -la "$(Build.SourcesDirectory)/sanitychecks/scripts"
-        echo ""
-        echo "Cat first lines of Scan-RG-Permissions-ByCustodian.ps1:"
-        head -n 30 "$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1"
+    # --- FIX: run the debug step with PowerShell (not CMD) ---
+    - pwsh: |
+        $dir  = "$(Build.SourcesDirectory)/sanitychecks/scripts"
+        $file = Join-Path $dir 'Scan-RG-Permissions-ByCustodian.ps1'
+
+        Write-Host "Listing script dir: $dir"
+        Get-ChildItem -Force $dir | Format-Table -AutoSize
+
+        Write-Host "`nFirst 40 lines of $file"
+        Get-Content $file -TotalCount 40
       displayName: "Debug: show script being executed"
 
-    # ---- (Optional) sanity check the CSV input paths exist ----
     - task: PowerShell@2
       displayName: "Debug: check CSV inputs exist"
       inputs:
@@ -64,10 +62,9 @@ stages:
           $nonp = "$(Build.SourcesDirectory)/inputs/nonprod_permissions.csv"
           Write-Host "ProdCsvPath    : $prod"
           Write-Host "NonProdCsvPath : $nonp"
-          if (-not (Test-Path -LiteralPath $prod)) { Write-Error "prod_permissions.csv not found at $prod" }
-          if (-not (Test-Path -LiteralPath $nonp)) { Write-Error "nonprod_permissions.csv not found at $nonp" }
+          if (-not (Test-Path -LiteralPath $prod)) { throw "prod_permissions.csv not found at $prod" }
+          if (-not (Test-Path -LiteralPath $nonp)) { throw "nonprod_permissions.csv not found at $nonp" }
 
-    # ---- Run the scan with the exact parameter names expected by the script ----
     - task: PowerShell@2
       displayName: "Run RG Permissions Scan (ByCustodian)"
       inputs:
@@ -85,10 +82,8 @@ stages:
           -BranchName "$(Build.SourceBranchName)"
         pwsh: true
       env:
-        # keeps Az noise low; optional
         AZURE_CORE_ONLY_SHOW_ERRORS: '1'
 
-    # ---- Publish the results (CSV + HTML) ----
     - task: PublishBuildArtifacts@1
       displayName: "Publish RG permissions artifact"
       inputs:
