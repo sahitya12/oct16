@@ -1,60 +1,86 @@
-# stages/rg_permissions.stage.yml
-# Minimal, no variable group, no agent pinning, safe artifact publishing
-
+# sanitychecks/.azure-pipelines/stages/rg_permissions.stage.yml
 parameters:
   - name: adh_group
     type: string
     default: ''
   - name: adh_subscription_type
     type: string
-    default: 'nonprd'   # values: nonprd | prd
+    default: nonprd
+    values: [nonprd, prd]
   - name: poolName
     type: string
     default: 'Self-Hosted-Pool'
   - name: agentName
     type: string
-    default: ''         # ignored in this minimal file (no demands)
+    default: ''
 
 stages:
 - stage: rg_permissions
   displayName: "RG Permissions (ByCustodian)"
+  condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
+
   jobs:
-  - job: run_permission_check
-    displayName: "Validate RG Permissions"
+  - job: scan_rg_permissions
+    displayName: "Scan RG Permissions: ${{ parameters.adh_group }} (${{ parameters.adh_subscription_type }})"
     pool:
       name: ${{ parameters.poolName }}
+      demands:
+      - Agent.Name -equals ${{ parameters.agentName }}
 
     steps:
     - checkout: self
-      displayName: "Checkout repo"
+      clean: true
 
-    # Ensure outputs folder exists so PublishBuildArtifacts never errors
+    # 🧹 Prepare output directory
     - task: PowerShell@2
-      displayName: "Prep outputs folder"
+      displayName: "Prepare output dir"
       inputs:
         targetType: inline
         pwsh: true
         script: |
-          New-Item -ItemType Directory -Path "outputs" -Force | Out-Null
+          $out = "$(Build.ArtifactStagingDirectory)/rg-permissions"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Write-Host "✅ OutputDir: $out"
 
-    # Run your scanner (adjust path if your script lives elsewhere)
+    # 🔍 Show and verify script path
+    - task: PowerShell@2
+      displayName: "Debug: verify script path"
+      inputs:
+        targetType: inline
+        pwsh: true
+        script: |
+          $scriptPath = "$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1"
+          Write-Host "🔎 Checking for script at: $scriptPath"
+          if (-not (Test-Path $scriptPath)) { 
+            Write-Error "❌ Script not found at: $scriptPath" 
+          } else {
+            Write-Host "✅ Script exists."
+          }
+
+    # 🏃‍♂️ Run the RG Permissions Scan script
     - task: PowerShell@2
       displayName: "Run Scan-RG-Permissions-ByCustodian.ps1"
       inputs:
         targetType: filePath
-        filePath: scripts/Scan-RG-Permissions-ByCustodian.ps1
+        filePath: "$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1"
         arguments: >
+          -TenantId "$(tenantId)"
+          -ClientId "$(clientId)"
+          -ClientSecret "$(clientSecret)"
           -adh_group "${{ parameters.adh_group }}"
           -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+          -ProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
+          -NonProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
+          -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
+          -BranchName "$(Build.SourceBranchName)"
         pwsh: true
-        errorActionPreference: stop
-        failOnStderr: false
+      env:
+        AZURE_CORE_ONLY_SHOW_ERRORS: '1'
 
-    # Publish results (safe even if folder is empty)
+    # 📦 Publish results
     - task: PublishBuildArtifacts@1
-      displayName: "Publish RG permission results"
-      condition: succeededOrFailed()
+      displayName: "Publish RG permissions artifact"
       inputs:
-        PathtoPublish: "outputs"
-        ArtifactName: "rg-permissions-results"
+        PathtoPublish: "$(Build.ArtifactStagingDirectory)/rg-permissions"
+        ArtifactName: "rg-permissions"
         publishLocation: "Container"
