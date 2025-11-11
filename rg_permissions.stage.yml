@@ -1,11 +1,12 @@
+# stages/rg_permissions.stage.yml
+# Aligned with your parameter block and job template usage
+
 parameters:
   adh_group: ''
   adh_subscription_type: 'nonprd'
   poolName: 'Self-Hosted-Pool'
   agentName: ''
   variableGroup: 'modernization_tfstate_backend_details'
-  prodCsvPath: '$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv'
-  nonProdCsvPath: '$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv'
 
 stages:
 - stage: RG_Permissions
@@ -19,7 +20,6 @@ stages:
       workingDir:  '$(Build.SourcesDirectory)/sanitychecks/scripts'
       arguments: >-
         -TenantId "$(tenant_id)" -ClientId "$(backend_client_id)" -ClientSecret "$(backend_client_secret)"
-        -ProdCsvPath "${{ parameters.prodCsvPath }}" -NonProdCsvPath "${{ parameters.nonProdCsvPath }}"
         -adh_group "${{ parameters.adh_group }}" -adh_subscription_type "${{ parameters.adh_subscription_type }}"
         -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions" -BranchName "$(Build.SourceBranchName)"
       artifactName: 'rg-permissions'
