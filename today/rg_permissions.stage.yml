@@ -1,4 +1,3 @@
-# stages/rg_permissions.stage.yml
 parameters:
   - name: adh_group
     type: string
@@ -6,9 +5,7 @@ parameters:
   - name: adh_subscription_type
     type: string
     default: nonprd
-    values:
-      - nonprd
-      - prd
+    values: [nonprd, prd]
   - name: poolName
     type: string
     default: 'Self-Hosted-Pool'
@@ -28,73 +25,43 @@ stages:
       demands:
       - Agent.Name -equals ${{ parameters.agentName }}
 
-    variables:
-      InputsRoot: '$(Build.SourcesDirectory)/sanitychecks/inputs'
-
     steps:
     - checkout: self
       clean: true
 
+    # Optional: prove the CSVs exist where we point the script
     - task: PowerShell@2
-      displayName: "Prepare output dir"
+      displayName: "Debug: check CSVs"
       inputs:
         targetType: inline
         pwsh: true
         script: |
-          $out = "$(Build.ArtifactStagingDirectory)/rg-permissions"
-          New-Item -ItemType Directory -Force -Path $out | Out-Null
-          Write-Host "OutputDir: $out"
+          $prod = "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
+          $nonp = "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
+          Write-Host "ProdCsvPath    = $prod"
+          Write-Host "NonProdCsvPath = $nonp"
+          if (-not (Test-Path -LiteralPath $prod)) { Write-Error "prod_permissions.csv not found at $prod" }
+          if (-not (Test-Path -LiteralPath $nonp)) { Write-Error "nonprod_permissions.csv not found at $nonp" }
 
     - task: PowerShell@2
-      displayName: "Debug: show script being executed"
-      inputs:
-        targetType: inline
-        pwsh: true
-        script: |
-          $dir  = "$(Build.SourcesDirectory)/sanitychecks/scripts"
-          $file = Join-Path $dir 'Scan-RG-Permissions-ByCustodian.ps1'
-
-          Write-Host "Listing script dir: $dir"
-          Get-ChildItem -Force $dir | Format-Table -AutoSize
-
-          Write-Host "`nFirst 40 lines of $file"
-          Get-Content $file -TotalCount 40
-
-    - task: PowerShell@2
-      displayName: "Debug: check CSV inputs exist"
-      inputs:
-        targetType: inline
-        pwsh: true
-        script: |
-          $prod = "$(InputsRoot)/prod_permissions.csv"
-          $nonp = "$(InputsRoot)/nonprod_permissions.csv"
-          Write-Host "ProdCsvPath    : $prod"
-          Write-Host "NonProdCsvPath : $nonp"
-          if (-not (Test-Path -LiteralPath $prod)) { throw "prod_permissions.csv not found at $prod" }
-          if (-not (Test-Path -LiteralPath $nonp)) { throw "nonprod_permissions.csv not found at $nonp" }
-
-    - task: PowerShell@2
-      displayName: "Run RG Permissions Scan (ByCustodian)"
+      displayName: "Run RG Permissions Scan"
       inputs:
         targetType: filePath
         filePath: "$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1"
         arguments: >
-          -TenantId $(tenantId)
-          -ClientId $(clientId)
-          -ClientSecret $(ClientSecret)
-          -adh_group ${{ parameters.adh_group }}
-          -adh_subscription_type ${{ parameters.adh_subscription_type }}
-          -ProdCsvPath "$(InputsRoot)/prod_permissions.csv"
-          -NonProdCsvPath "$(InputsRoot)/nonprod_permissions.csv"
+          -TenantId "$(tenant_id)"
+          -ClientId "$(backend_client_id)"
+          -ClientSecret "$(backend_client_secret)"
+          -adh_group "${{ parameters.adh_group }}"
+          -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+          -ProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
+          -NonProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
           -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
           -BranchName "$(Build.SourceBranchName)"
         pwsh: true
-      env:
-        AZURE_CORE_ONLY_SHOW_ERRORS: '1'
 
     - task: PublishBuildArtifacts@1
-      displayName: "Publish RG permissions artifact"
+      displayName: "Publish RG Permissions"
       inputs:
         PathtoPublish: "$(Build.ArtifactStagingDirectory)/rg-permissions"
         ArtifactName: "rg-permissions"
-        publishLocation: "Container"
