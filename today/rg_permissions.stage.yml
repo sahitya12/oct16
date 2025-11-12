@@ -1,85 +1,32 @@
-# stages/rg_permissions.stage.yml
 parameters:
-  - name: adh_group
-    type: string
-    default: ''
-  - name: adh_subscription_type
-    type: string
-    default: nonprd
-    values: [nonprd, prd]
-  - name: poolName
-    type: string
-    default: 'Self-Hosted-Pool'
-  - name: agentName
-    type: string
-    default: ''
+  adh_group: ''
+  adh_subscription_type: 'nonprd'
+  poolName: ''
+  agentName: ''
+  prodCsvPath: '$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv'
+  nonProdCsvPath: '$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv'
 
 stages:
-- stage: rg_permissions
-  displayName: "RG Permissions (ByCustodian)"
-  condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
-  variables:
-  # make your secrets available to all jobs/steps in this stage
-  - group: modernization_tfstate_backend_details
-
+- stage: RG_Permissions
+  displayName: "RG Permissions (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
   jobs:
-  - job: scan_rg_permissions
-    displayName: "Scan RG Permissions: ${{ parameters.adh_group }} (${{ parameters.adh_subscription_type }})"
-    pool:
-      name: ${{ parameters.poolName }}
-      demands:
-      - Agent.Name -equals ${{ parameters.agentName }}
-
-    steps:
-    - checkout: self
-      clean: true
-
-    - task: PowerShell@2
-      displayName: "Prep outputs folder"
-      inputs:
-        targetType: inline
-        pwsh: true
-        script: |
-          $out = "$(Build.ArtifactStagingDirectory)/rg-permissions"
-          New-Item -ItemType Directory -Force -Path $out | Out-Null
-          "OutputDir: $out"
-
-    # Optional quick guard so we fail fast if the CSVs are missing
-    - task: PowerShell@2
-      displayName: "Validate RG Permissions CSVs exist"
-      inputs:
-        targetType: inline
-        pwsh: true
-        script: |
-          $prod = "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
-          $nonp = "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
-          "ProdCsv : $prod"
-          "NonProd : $nonp"
-          if (-not (Test-Path -LiteralPath $prod))  { throw "prod_permissions.csv not found at $prod" }
-          if (-not (Test-Path -LiteralPath $nonp))  { throw "nonprod_permissions.csv not found at $nonp" }
-
-    - task: PowerShell@2
-      displayName: "Run RG Permissions Scan (ByCustodian)"
-      inputs:
-        targetType: filePath
-        filePath: "$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1"
-        pwsh: true
-        arguments: >
-          -TenantId "$(tenant_id)"
-          -ClientId "$(backend_client_id)"
-          -ClientSecret "$(backend_client_secret)"
-          -adh_group "${{ parameters.adh_group }}"
-          -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-          -ProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
-          -NonProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
-          -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
-          -BranchName "$(Build.SourceBranchName)"
-      env:
-        AZURE_CORE_ONLY_SHOW_ERRORS: '1'
-
-    - task: PublishBuildArtifacts@1
-      displayName: "Publish RG permissions artifact"
-      inputs:
-        PathtoPublish: "$(Build.ArtifactStagingDirectory)/rg-permissions"
-        ArtifactName: "rg-permissions"
-        publishLocation: "Container"
+  - template: ../templates/job.powershell-with-az.yml
+    parameters:
+      displayName: 'Run RG Permissions Scan'
+      variableGroup: modernization_tfstate_backend_details
+      workingDir:  '$(Build.SourcesDirectory)/sanitychecks/scripts'
+      scriptPath:  'sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1'
+      arguments: >-
+        -TenantId "$(tenant_id)"
+        -ClientId "$(backend_client_id)"
+        -ClientSecret "$(backend_client_secret)"
+        -adh_group "${{ parameters.adh_group }}"
+        -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+        -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
+        -BranchName "$(Build.SourceBranchName)"
+        -ProdCsvPath "${{ parameters.prodCsvPath }}"
+        -NonProdCsvPath "${{ parameters.nonProdCsvPath }}"
+      artifactName: 'rg-permissions'
+      publishPath:  '$(Build.ArtifactStagingDirectory)/rg-permissions'
+      poolName:     ${{ parameters.poolName }}
+      agentName:    ${{ parameters.agentName }}
