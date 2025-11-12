@@ -1,0 +1,24 @@
+stages:
+- stage: Databricks_Scan
+  displayName: "Databricks Sanity Check"
+  jobs:
+  - job: DatabricksScan
+    pool:
+      name: $(AgentPool)
+    steps:
+    - checkout: self
+    - task: PowerShell@2
+      displayName: Run Databricks Scan
+      inputs:
+        pwsh: true
+        filePath: sanitychecks/scripts/Scan-Databricks.ps1
+        arguments: >
+          -DatabricksHost "$(databricks_host)"
+          -DatabricksToken "$(databricks_token)"
+          -adh_group "${{ parameters.adh_group }}"
+          -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+          -OutputDir "$(Build.ArtifactStagingDirectory)/databricks-scan"
+          -ExpectedCsv "sanitychecks/inputs/databricks_expected.csv"
+          -BranchName "$(Build.SourceBranchName)"
+    - publish: $(Build.ArtifactStagingDirectory)/databricks-scan
+      artifact: databricks-scan
