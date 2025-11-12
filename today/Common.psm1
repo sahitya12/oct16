@@ -1,9 +1,12 @@
+#requires -Modules Az.Accounts, Az.Resources
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
 function Ensure-Dir {
   param([Parameter(Mandatory)][string]$Path)
-  if (-not (Test-Path -LiteralPath $Path)) {
-    New-Item -ItemType Directory -Force -Path $Path | Out-Null
-  }
-  Get-Item -LiteralPath $Path
+  if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path | Out-Null }
+  return (Resolve-Path -LiteralPath $Path).Path
 }
 
 function New-StampedPath {
@@ -12,9 +15,9 @@ function New-StampedPath {
     [Parameter(Mandatory)][string]$Prefix,
     [string]$Ext = 'csv'
   )
-  Ensure-Dir -Path $BaseDir | Out-Null
-  $stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
-  Join-Path $BaseDir ("{0}_{1}.{2}" -f $Prefix,$stamp,$Ext)
+  $ts = Get-Date -Format 'yyyyMMdd_HHmm'
+  $name = '{0}_{1}.{2}' -f $Prefix,$ts,$Ext
+  Join-Path (Ensure-Dir $BaseDir) $name
 }
 
 function Write-CsvSafe {
@@ -22,8 +25,7 @@ function Write-CsvSafe {
     [Parameter(Mandatory)][object[]]$Rows,
     [Parameter(Mandatory)][string]$Path
   )
-  $Rows | Export-Csv -Path $Path -NoTypeInformation -Force -Encoding UTF8
-  $Path
+  $Rows | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
 }
 
 function Convert-CsvToHtml {
@@ -32,43 +34,88 @@ function Convert-CsvToHtml {
     [Parameter(Mandatory)][string]$HtmlPath,
     [string]$Title = 'Report'
   )
-  $dt = Import-Csv $CsvPath
-  $html = @"
-<html>
-<head><meta charset="utf-8"><title>$Title</title>
-<style>body{font-family:Segoe UI,Arial;} table{border-collapse:collapse} th,td{border:1px solid #ddd;padding:6px}</style>
-</head>
-<body><h2>$Title</h2>
-$($dt | ConvertTo-Html -Fragment)
-</body></html>
-"@
-  $html | Set-Content -Path $HtmlPath -Encoding UTF8
+  $data = Import-Csv -Path $CsvPath
+  $html = $data | ConvertTo-Html -Title $Title -PreContent "<h2>$Title</h2>"
+  $html | Out-File -FilePath $HtmlPath -Encoding UTF8
 }
 
-# ---- Azure helpers (thin wrappers you already use in your ADF scan) ----
 function Connect-ScAz {
   param(
     [Parameter(Mandatory)][string]$TenantId,
     [Parameter(Mandatory)][string]$ClientId,
     [Parameter(Mandatory)][string]$ClientSecret
   )
-  $sec = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
-  $creds = New-Object System.Management.Automation.PSCredential($ClientId,$sec)
-  Connect-AzAccount -ServicePrincipal -Tenant $TenantId -Credential $creds | Out-Null
-  $true
-}
-
-function Get-ScSubscriptions {
-  param(
-    [Parameter(Mandatory)][string]$AdhGroup,
-    [Parameter(Mandatory)][ValidateSet('nonprd','prd')][string]$Environment
-  )
-  # Replace with your real resolver. For now, use all accessible subs filtered by naming convention.
-  (Get-AzSubscription | Where-Object { $_.Name -match "^$AdhGroup.*$Environment" })
+  try {
+    $sec = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($ClientId,$sec)
+    Connect-AzAccount -ServicePrincipal -Tenant $TenantId -Credential $cred -ErrorAction Stop | Out-Null
+    return $true
+  } catch {
+    Write-Error "Azure login failed: $($_.Exception.Message)"
+    return $false
+  }
 }
 
 function Set-ScContext {
-  param([Parameter(Mandatory)]$Subscription)
-  Set-AzContext -SubscriptionId $Subscription.Id | Out-Null
+  param([Parameter(Mandatory)][object]$Subscription)
+  if ($Subscription -is [string]) {
+    Set-AzContext -SubscriptionId $Subscription | Out-Null
+  } else {
+    Set-AzContext -SubscriptionId $Subscription.Id | Out-Null
+  }
 }
-Export-ModuleMember -Function *-*
+
+# ------------ Subscription Resolution ------------
+# Rules:
+# - KTK => dev_azure_20401_ADHPlatform
+# - Others => name contains adh_group and matches env tokens
+function Resolve-ScSubscriptions {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$AdhGroup,
+    [ValidateSet('nonprd','prd')][string]$Environment = 'nonprd'
+  )
+
+  $all = Get-AzSubscription -ErrorAction Stop
+
+  if ($AdhGroup -ieq 'KTK') {
+    $target = 'dev_azure_20401_ADHPlatform'
+    $hit = $all | Where-Object { $_.Name -ieq $target }
+    if (-not $hit) {
+      Write-Warning "Expected subscription '$target' not found for KTK."
+      return @()
+    }
+    return ,$hit   # single-item array
+  }
+
+  # Environment tokens
+  $nonprdTokens = @('dev','test','tst','qa','uat','nonprd','nonproduction','sandbox')
+  $prdTokens    = @('prod','production','prd')
+
+  $tokens = if ($Environment -eq 'prd') { $prdTokens } else { $nonprdTokens }
+
+  $regex = [string]::Join('|', ($tokens | ForEach-Object {[regex]::Escape($_)}))
+  $adh   = [regex]::Escape($AdhGroup)
+
+  $hits = $all | Where-Object {
+    $_.Name -match "(?i)$regex" -and $_.Name -match "(?i)$adh"
+  }
+
+  if (-not $hits) {
+    Write-Warning "No subscriptions matched adh_group='$AdhGroup' environment='$Environment'."
+  }
+
+  # deterministic order
+  $hits | Sort-Object Name
+}
+
+# Back-compat alias (some scripts used this)
+function Get-ScSubscriptions {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$AdhGroup,
+    [ValidateSet('nonprd','prd')][string]$Environment = 'nonprd'
+  )
+  Resolve-ScSubscriptions -AdhGroup $AdhGroup -Environment $Environment
+}
+Export-ModuleMember -Function *-Sc*,Ensure-Dir,New-StampedPath,Write-CsvSafe,Convert-CsvToHtml
