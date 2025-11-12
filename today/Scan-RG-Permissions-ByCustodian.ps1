@@ -1,81 +1,78 @@
-#requires -Modules Az.Accounts,Az.Resources
 param(
   [Parameter(Mandatory)][string]$TenantId,
   [Parameter(Mandatory)][string]$ClientId,
   [Parameter(Mandatory)][string]$ClientSecret,
-  [Parameter()][string]$ProdCsvPath,
-  [Parameter()][string]$NonProdCsvPath,
+  [string]$ProdCsvPath,
+  [string]$NonProdCsvPath,
   [Parameter(Mandatory)][string]$adh_group,
   [ValidateSet('nonprd','prd')][string]$adh_subscription_type='nonprd',
   [Parameter(Mandatory)][string]$OutputDir,
   [string]$BranchName=''
 )
 
-# --- import shared helpers (Ensure-Dir, Write-CsvSafe, Convert-CsvToHtml, Get-ScSubscriptions, Set-ScContext, Connect-ScAz) ---
-Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
+# Import helper
+Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force
 
 Ensure-Dir -Path $OutputDir | Out-Null
 
-# Select the correct CSV for the chosen environment
+# Determine CSV path
 $csvPath = if ($adh_subscription_type -eq 'prd') { $ProdCsvPath } else { $NonProdCsvPath }
 if (-not (Test-Path -LiteralPath $csvPath)) {
   throw "CSV not found: $csvPath"
 }
 
-# Azure login
-Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
+$inputRows = Import-Csv -Path $csvPath
+if (-not $inputRows -or $inputRows.Count -eq 0) {
+  throw "CSV is empty or has no valid rows: $csvPath"
+}
 
-# Read input rows
-$input = Import-Csv -Path $csvPath
+Write-Host "✅ Loaded $($inputRows.Count) rows from CSV: $csvPath"
 
-# Resolve subscriptions for the ADH group + environment
+# Authenticate
+$connected = Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
+if (-not $connected) {
+  throw "❌ Azure connection failed."
+}
+
+# Get subscriptions
 $subs = Get-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+if (-not $subs -or $subs.Count -eq 0) {
+  throw "❌ No subscriptions found for $adh_group ($adh_subscription_type)"
+}
 
-$rows = @()
+Write-Host "✅ Found $($subs.Count) subscriptions for $adh_group ($adh_subscription_type)"
+
+# Prepare results
+$result = @()
 
 foreach ($sub in $subs) {
-  Set-ScContext -Subscription $sub
+  foreach ($row in $inputRows) {
+    $rgName = $row.resource_group_name -replace '<Custodian>', $adh_group
+    $aadGrp = $row.ad_group_name -replace '<Custodian>', $adh_group
+    $role   = $row.role_definition_name
 
-  foreach ($r in $input) {
-    # Replace placeholder with actual group (KTK, VTK, etc.)
-    $resolvedRg  = ($r.resource_group_name  -replace '<Custodian>', $adh_group)
-    $resolvedAad = ($r.ad_group_name        -replace '<Custodian>', $adh_group)
-    $roleName    = $r.role_definition_name
-
-    # Look up current role assignments (RG scope) for the resolved AAD group
-    $scope = "/subscriptions/$($sub.Id)/resourceGroups/$resolvedRg"
-    try {
-      $assignments = Get-AzRoleAssignment -Scope $scope -ErrorAction Stop | Where-Object {
-        $_.DisplayName -eq $resolvedAad -and $_.RoleDefinitionName -eq $roleName
-      }
-      $perm = if ($assignments) { 'Present' } else { 'Missing' }
-      $detail = if ($assignments) { ($assignments | Select-Object -First 1).ObjectId } else { '' }
-      $rgExists = (Get-AzResourceGroup -Name $resolvedRg -ErrorAction SilentlyContinue) -ne $null
-      $rgStatus = if ($rgExists) { 'Exists' } else { 'NotFound' }
-    }
-    catch {
-      $perm = 'Error'
-      $rgStatus = 'Unknown'
-      $detail = $_.Exception.Message
-    }
-
-    $rows += [pscustomobject]@{
-      SubscriptionName    = $sub.Name
-      SubscriptionId      = $sub.Id
-      Environment         = $adh_subscription_type
-      InputResourceGroup  = $r.resource_group_name
-      ScannedResourceGroup= $resolvedRg
-      RoleDefinition      = $roleName
-      InputAdGroup        = $r.ad_group_name
-      ResolvedAdGroup     = $resolvedAad
-      RGStatus            = $rgStatus
-      PermissionStatus    = $perm
-      Details             = $detail
+    $result += [pscustomobject]@{
+      SubscriptionName   = $sub.Name
+      SubscriptionId     = $sub.Id
+      Environment        = $adh_subscription_type
+      InputResourceGroup = $row.resource_group_name
+      ScannedResourceGroup = $rgName
+      InputAdGroup       = $row.ad_group_name
+      ResolvedAdGroup    = $aadGrp
+      RoleDefinition     = $role
+      RGStatus           = 'Pending'
+      PermissionStatus   = 'Pending'
+      Details            = ''
     }
   }
 }
 
-# Write CSV + HTML
+if (-not $result -or $result.Count -eq 0) {
+  throw "❌ No results generated — verify subscription and CSV inputs."
+}
+
 $csvOut = New-StampedPath -BaseDir $OutputDir -Prefix ("rg_permissions_{0}_{1}" -f $adh_group,$adh_subscription_type) -Ext 'csv'
-Write-CsvSafe -Rows $rows -Path $csvOut
-Convert-CsvToHtml -CsvPath $csvOut -HtmlPath ([IO.Path]::ChangeExtension($csvOut,'html')) -Title "RG Permissions ($adh_group / $adh_subscription_type) $BranchName"
+Write-CsvSafe -Rows $result -Path $csvOut
+Convert-CsvToHtml -CsvPath $csvOut -HtmlPath ([System.IO.Path]::ChangeExtension($csvOut,'html')) -Title "RG Permissions ($adh_group / $adh_subscription_type) $BranchName"
+
+Write-Host "✅ RG Permissions Scan Completed. Output: $csvOut"
