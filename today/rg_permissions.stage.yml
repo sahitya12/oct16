@@ -1,3 +1,4 @@
+# sanitychecks/.azure-pipelines/stages/rg_permissions.stage.yml
 parameters:
   - name: adh_group
     type: string
@@ -17,6 +18,10 @@ stages:
 - stage: rg_permissions
   displayName: "RG Permissions (ByCustodian)"
   condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
+
+  variables:
+  - group: modernization_tfstate_backend_details   # <-- ensure THIS is your group name
+
   jobs:
   - job: scan_rg_permissions
     displayName: "Scan RG Permissions: ${{ parameters.adh_group }} (${{ parameters.adh_subscription_type }})"
@@ -29,19 +34,17 @@ stages:
     - checkout: self
       clean: true
 
-    # Optional: prove the CSVs exist where we point the script
+    # sanity check the secret variables are actually present (without printing them)
     - task: PowerShell@2
-      displayName: "Debug: check CSVs"
+      displayName: "Validate RG Permissions inputs"
       inputs:
         targetType: inline
         pwsh: true
         script: |
-          $prod = "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
-          $nonp = "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
-          Write-Host "ProdCsvPath    = $prod"
-          Write-Host "NonProdCsvPath = $nonp"
-          if (-not (Test-Path -LiteralPath $prod)) { Write-Error "prod_permissions.csv not found at $prod" }
-          if (-not (Test-Path -LiteralPath $nonp)) { Write-Error "nonprod_permissions.csv not found at $nonp" }
+          if ([string]::IsNullOrWhiteSpace('$(tenant_id)')) { throw "tenant_id is missing (add variable group or variable)" }
+          if ([string]::IsNullOrWhiteSpace('$(backend_client_id)')) { throw "backend_client_id is missing" }
+          if ([string]::IsNullOrWhiteSpace('$(backend_client_secret)')) { throw "backend_client_secret is missing" }
+          Write-Host "Inputs look OK."
 
     - task: PowerShell@2
       displayName: "Run RG Permissions Scan"
@@ -49,15 +52,15 @@ stages:
         targetType: filePath
         filePath: "$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1"
         arguments: >
-          -TenantId "$(tenant_id)"
-          -ClientId "$(backend_client_id)"
-          -ClientSecret "$(backend_client_secret)"
-          -adh_group "${{ parameters.adh_group }}"
-          -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-          -ProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
-          -NonProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
-          -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
-          -BranchName "$(Build.SourceBranchName)"
+          -TenantId '$(tenant_id)'
+          -ClientId '$(backend_client_id)'
+          -ClientSecret '$(backend_client_secret)'
+          -adh_group '${{ parameters.adh_group }}'
+          -adh_subscription_type '${{ parameters.adh_subscription_type }}'
+          -ProdCsvPath '$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv'
+          -NonProdCsvPath '$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv'
+          -OutputDir '$(Build.ArtifactStagingDirectory)/rg-permissions'
+          -BranchName '$(Build.SourceBranchName)'
         pwsh: true
 
     - task: PublishBuildArtifacts@1
