@@ -32,8 +32,10 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
-$subNames = $subs | ForEach-Object { $_.Name }
-Write-Host "DEBUG: Resolved adh_group='$adh_group' env='$adh_subscription_type' -> subscriptions: $($subNames -join ', ')"
+# PowerShell 5–compatible way to join subscription names
+$subNames = ($subs | Select-Object -ExpandProperty Name) -join ', '
+
+Write-Host "DEBUG: Resolved adh_group='$adh_group' env='$adh_subscription_type' -> subscriptions: $subNames"
 
 $overview = @()
 $lsRows   = @()
@@ -49,7 +51,7 @@ foreach ($sub in $subs) {
     $dfs = Get-AzDataFactoryV2 -ErrorAction SilentlyContinue
 
     $adfNamesString = if ($dfs) {
-        $dfs | ForEach-Object { $_.Name } -join ', '
+        ($dfs | Select-Object -ExpandProperty Name) -join ', '
     } else {
         '<none>'
     }
