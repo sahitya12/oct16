@@ -1,5 +1,3 @@
-# sanitychecks/scripts/Scan-DataFactory.ps1
-
 param(
     [Parameter(Mandatory)][string]$TenantId,
     [Parameter(Mandatory)][string]$ClientId,
@@ -10,41 +8,46 @@ param(
     [string]$BranchName = ''
 )
 
-# Import required modules
 Import-Module Az.Accounts, Az.Resources, Az.DataFactory -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
-# Ensure output directory exists and normalize path
-$OutputDir = Ensure-Dir $OutputDir
+Write-Host "DEBUG: TenantId=$TenantId"
+Write-Host "DEBUG: ClientId=$ClientId"
+Write-Host "DEBUG: adh_group=$adh_group"
+Write-Host "DEBUG: adh_subscription_type=$adh_subscription_type"
+Write-Host "DEBUG: OutputDir=$OutputDir"
+Write-Host "DEBUG: BranchName=$BranchName"
 
-# Connect using service principal
+Ensure-Dir -Path $OutputDir | Out-Null
+
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
 }
 
-# -------------------------------------------------
-# NEW: Use shared helper to resolve subscriptions
-# (replaces the old switch($adh_group.ToUpper()) {...})
-# -------------------------------------------------
+# Use the shared subscription resolver from Common.psm1
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
 $overview = @()
 $lsRows   = @()
 $irRows   = @()
 
-$allowedEnvs = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev', 'tst', 'stg') }
-$adfNames = $allowedEnvs | ForEach-Object { "ADH-$adh_group-ADF-$_" }
+# Non-prd: dev/tst/stg workspaces; prd: only prd
+$allowedEnvs = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev','tst','stg') }
+$adfNames    = $allowedEnvs | ForEach-Object { "ADH-$adh_group-ADF-$_" }
 
 foreach ($sub in $subs) {
+
     Set-ScContext -Subscription $sub
 
     $dfs = Get-AzDataFactoryV2 -ErrorAction SilentlyContinue |
            Where-Object { $adfNames -contains $_.Name }
 
-    Write-Host ("DEBUG: Scanning subscription {0}; Found DataFactories: {1}" -f `
-        $sub.Name, ($dfs | ForEach-Object { $_.Name } -join ', '))
+    Write-Host ("DEBUG: Scanning subscription {0}; ADFs: {1}" -f
+        $sub.Name, ($dfs | ForEach-Object Name -join ', '))
 
     foreach ($df in $dfs) {
+
         # Overview row
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
@@ -56,9 +59,11 @@ foreach ($sub in $subs) {
         }
 
         # Linked services
-        $ls = Get-AzDataFactoryV2LinkedService -ResourceGroupName $df.ResourceGroupName `
-                                               -DataFactoryName $df.Name `
-                                               -ErrorAction SilentlyContinue
+        $ls = Get-AzDataFactoryV2LinkedService `
+                -ResourceGroupName $df.ResourceGroupName `
+                -DataFactoryName   $df.Name `
+                -ErrorAction SilentlyContinue
+
         foreach ($l in $ls) {
             $lsRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
@@ -70,24 +75,35 @@ foreach ($sub in $subs) {
         }
 
         # Integration runtimes
-        $irs = Get-AzDataFactoryV2IntegrationRuntime -ResourceGroupName $df.ResourceGroupName `
-                                                     -DataFactoryName $df.Name `
-                                                     -ErrorAction SilentlyContinue
+        $irs = Get-AzDataFactoryV2IntegrationRuntime `
+                 -ResourceGroupName $df.ResourceGroupName `
+                 -DataFactoryName   $df.Name `
+                 -ErrorAction SilentlyContinue
+
         foreach ($ir in $irs) {
+
+            $computeDesc = $null
+            if ($ir.Properties.AdditionalProperties -and
+                $ir.Properties.AdditionalProperties.ClusterSize) {
+                $computeDesc = $ir.Properties.AdditionalProperties.ClusterSize
+            } elseif ($ir.Properties.Description) {
+                $computeDesc = $ir.Properties.Description
+            }
+
             $irRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $df.ResourceGroupName
                 DataFactory      = $df.Name
                 IRName           = $ir.Name
                 IRType           = $ir.Properties.Type
-                ComputeDesc      = ($ir.Properties.AdditionalProperties.ClusterSize ?? $ir.Properties.Description)
+                ComputeDesc      = $computeDesc
                 State            = $ir.Properties.State
             }
         }
     }
 }
 
-# If no overview rows at all, emit "Exists = No" rows per subscription
+# If no ADF at all, still emit one "Exists = No" row per sub
 if (-not $overview) {
     foreach ($sub in $subs) {
         $overview += [pscustomobject]@{
@@ -101,7 +117,7 @@ if (-not $overview) {
     }
 }
 
-# If no linked services, still output placeholder rows
+# Ensure we always have at least one LS / IR row (for empty subscriptions)
 if (-not $lsRows) {
     foreach ($sub in $subs) {
         $lsRows += [pscustomobject]@{
@@ -114,7 +130,6 @@ if (-not $lsRows) {
     }
 }
 
-# If no IRs, still output placeholder rows
 if (-not $irRows) {
     foreach ($sub in $subs) {
         $irRows += [pscustomobject]@{
@@ -129,19 +144,18 @@ if (-not $irRows) {
     }
 }
 
-# ------------ Outputs --------------
-
-# Overview CSV + HTML
+# -------- Output files --------
 $csv1 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_overview_{0}_{1}" -f $adh_group, $adh_subscription_type)
 Write-CsvSafe -Rows $overview -Path $csv1
-Convert-CsvToHtml -CsvPath $csv1 `
-                  -HtmlPath ($csv1 -replace '\.csv$','.html') `
-                  -Title "ADF Overview ($adh_group / $adh_subscription_type) $BranchName"
+Convert-CsvToHtml -CsvPath $csv1 -HtmlPath ($csv1 -replace '\.csv$','.html') -Title "ADF Overview ($adh_group / $adh_subscription_type) $BranchName"
 
-# Linked Services CSV
 $csv2 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_linkedservices_{0}_{1}" -f $adh_group, $adh_subscription_type)
 Write-CsvSafe -Rows $lsRows -Path $csv2
 
-# Integration Runtimes CSV
 $csv3 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_integrationruntimes_{0}_{1}" -f $adh_group, $adh_subscription_type)
 Write-CsvSafe -Rows $irRows -Path $csv3
+
+Write-Host "ADF scan completed." -ForegroundColor Green
+Write-Host "Overview CSV : $csv1"
+Write-Host "Linked Svc   : $csv2"
+Write-Host "IRs          : $csv3"
