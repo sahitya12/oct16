@@ -91,8 +91,8 @@ foreach ($sub in $subs) {
 
   foreach ($r in $rows) {
 
-    # These header names must exist in your INPUT CSV:
-    # ResourceGroupName, ContainerName, AccessPath, Identity, PermissionType
+    # INPUT CSV must have:
+    #   ResourceGroupName, ContainerName, AccessPath, Identity, PermissionType
     $rgNameRaw    = $r.ResourceGroupName
     $contRaw      = $r.ContainerName
     $accessPath   = $r.AccessPath
@@ -104,7 +104,7 @@ foreach ($sub in $subs) {
     $cont          = ($contRaw      -replace '<Cust>',      $adh_group.ToLower())
     $identityName  = ($identityName -replace '<Custodian>', $adh_group)
 
-    # Storage account naming pattern (same as your earlier script)
+    # Storage account naming pattern as you used earlier
     $saName = "adh$($adh_group.ToLower())adls$($adh_subscription_type.ToLower())"
 
     # --------------------------------
