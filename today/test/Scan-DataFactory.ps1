@@ -1,3 +1,5 @@
+# sanitychecks/scripts/Scan-DataFactory.ps1
+
 param(
     [Parameter(Mandatory)][string]$TenantId,
     [Parameter(Mandatory)][string]$ClientId,
@@ -11,12 +13,12 @@ param(
 Import-Module Az.Accounts, Az.Resources, Az.DataFactory -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
-Write-Host "DEBUG: TenantId=$TenantId"
-Write-Host "DEBUG: ClientId=$ClientId"
-Write-Host "DEBUG: adh_group=$adh_group"
-Write-Host "DEBUG: adh_subscription_type=$adh_subscription_type"
-Write-Host "DEBUG: OutputDir=$OutputDir"
-Write-Host "DEBUG: BranchName=$BranchName"
+Write-Host "DEBUG: TenantId              = $TenantId"
+Write-Host "DEBUG: ClientId              = $ClientId"
+Write-Host "DEBUG: adh_group             = $adh_group"
+Write-Host "DEBUG: adh_subscription_type = $adh_subscription_type"
+Write-Host "DEBUG: OutputDir             = $OutputDir"
+Write-Host "DEBUG: BranchName            = $BranchName"
 
 Ensure-Dir -Path $OutputDir | Out-Null
 
@@ -24,7 +26,9 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
     throw "Azure connection failed."
 }
 
-# Use the shared subscription resolver from Common.psm1
+# ----------------------------------------------------------------------
+# Resolve subscription from adh_group + environment
+# ----------------------------------------------------------------------
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
@@ -32,23 +36,26 @@ $overview = @()
 $lsRows   = @()
 $irRows   = @()
 
-# Non-prd: dev/tst/stg workspaces; prd: only prd
-$allowedEnvs = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev','tst','stg') }
-$adfNames    = $allowedEnvs | ForEach-Object { "ADH-$adh_group-ADF-$_" }
-
 foreach ($sub in $subs) {
+
+    Write-Host "DEBUG: Resolved adh_group='$adh_group' env='$adh_subscription_type' -> subscription '$($sub.Name)'"
 
     Set-ScContext -Subscription $sub
 
-    $dfs = Get-AzDataFactoryV2 -ErrorAction SilentlyContinue |
-           Where-Object { $adfNames -contains $_.Name }
+    # Get ALL data factories in this subscription
+    $dfs = Get-AzDataFactoryV2 -ErrorAction SilentlyContinue
 
-    Write-Host ("DEBUG: Scanning subscription {0}; ADFs: {1}" -f
+    Write-Host ("DEBUG: Scanning subscription {0}; ADFs found: {1}" -f `
         $sub.Name, ($dfs | ForEach-Object Name -join ', '))
+
+    if (-not $dfs) {
+        Write-Host "DEBUG: No DataFactories found in $($sub.Name)"
+        continue
+    }
 
     foreach ($df in $dfs) {
 
-        # Overview row
+        # ----------------- Overview row -----------------
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -58,7 +65,7 @@ foreach ($sub in $subs) {
             Location         = $df.Location
         }
 
-        # Linked services
+        # ----------------- Linked services --------------
         $ls = Get-AzDataFactoryV2LinkedService `
                 -ResourceGroupName $df.ResourceGroupName `
                 -DataFactoryName   $df.Name `
@@ -74,7 +81,7 @@ foreach ($sub in $subs) {
             }
         }
 
-        # Integration runtimes
+        # ----------------- Integration runtimes ---------
         $irs = Get-AzDataFactoryV2IntegrationRuntime `
                  -ResourceGroupName $df.ResourceGroupName `
                  -DataFactoryName   $df.Name `
@@ -86,7 +93,8 @@ foreach ($sub in $subs) {
             if ($ir.Properties.AdditionalProperties -and
                 $ir.Properties.AdditionalProperties.ClusterSize) {
                 $computeDesc = $ir.Properties.AdditionalProperties.ClusterSize
-            } elseif ($ir.Properties.Description) {
+            }
+            elseif ($ir.Properties.Description) {
                 $computeDesc = $ir.Properties.Description
             }
 
@@ -103,7 +111,9 @@ foreach ($sub in $subs) {
     }
 }
 
-# If no ADF at all, still emit one "Exists = No" row per sub
+# ----------------------------------------------------------------------
+# If no ADFs were found at all, still emit one "Exists = No" per sub
+# ----------------------------------------------------------------------
 if (-not $overview) {
     foreach ($sub in $subs) {
         $overview += [pscustomobject]@{
@@ -117,7 +127,7 @@ if (-not $overview) {
     }
 }
 
-# Ensure we always have at least one LS / IR row (for empty subscriptions)
+# Ensure LS / IR CSVs always have at least one row
 if (-not $lsRows) {
     foreach ($sub in $subs) {
         $lsRows += [pscustomobject]@{
@@ -144,7 +154,9 @@ if (-not $irRows) {
     }
 }
 
-# -------- Output files --------
+# ----------------------------------------------------------------------
+# Output CSV + HTML
+# ----------------------------------------------------------------------
 $csv1 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_overview_{0}_{1}" -f $adh_group, $adh_subscription_type)
 Write-CsvSafe -Rows $overview -Path $csv1
 Convert-CsvToHtml -CsvPath $csv1 -HtmlPath ($csv1 -replace '\.csv$','.html') -Title "ADF Overview ($adh_group / $adh_subscription_type) $BranchName"
