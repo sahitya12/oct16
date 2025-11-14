@@ -39,7 +39,7 @@ stages:
           -ClientSecret "$(backend_client_secret)"
           -adh_group "${{ parameters.adh_group }}"
           -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-          -InputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_acl_matrix.csv"
+          -InputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv"
           -OutputDir "$(Build.ArtifactStagingDirectory)/adls-acl"
           -BranchName "$(Build.SourceBranchName)"
 
