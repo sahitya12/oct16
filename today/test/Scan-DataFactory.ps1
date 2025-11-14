@@ -34,7 +34,6 @@ if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
 # PowerShell 5–compatible way to join subscription names
 $subNames = ($subs | Select-Object -ExpandProperty Name) -join ', '
-
 Write-Host "DEBUG: Resolved adh_group='$adh_group' env='$adh_subscription_type' -> subscriptions: $subNames"
 
 $overview = @()
@@ -50,18 +49,12 @@ foreach ($sub in $subs) {
     # Get ALL data factories in this subscription
     $dfs = Get-AzDataFactoryV2 -ErrorAction SilentlyContinue
 
-    $adfNamesString = if ($dfs) {
-        ($dfs | Select-Object -ExpandProperty Name) -join ', '
-    } else {
-        '<none>'
-    }
-
-    Write-Host ("DEBUG: Scanning subscription {0}; ADFs found: {1}" -f `
-        $sub.Name, $adfNamesString)
-
-    if (-not $dfs) {
+    $adfCount = @($dfs).Count
+    if ($adfCount -eq 0) {
         Write-Host "DEBUG: No DataFactories found in $($sub.Name)"
         continue
+    } else {
+        Write-Host "DEBUG: Found $adfCount DataFactory instance(s) in $($sub.Name)"
     }
 
     foreach ($df in $dfs) {
