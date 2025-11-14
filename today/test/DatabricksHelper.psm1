@@ -13,7 +13,7 @@ function Resolve-DbSubscriptions {
 
     Import-Module Az.Accounts -ErrorAction Stop
 
-    $g = $AdhGroup.Trim().ToUpperInvariant()
+    $g       = $AdhGroup.Trim().ToUpperInvariant()
     $allSubs = Get-AzSubscription
 
     switch ($g) {
@@ -58,7 +58,7 @@ function Get-DbWorkspaceNames {
         [ValidateSet('nonprd','prd')][string]$Environment = 'nonprd'
     )
 
-    $g = $AdhGroup.Trim().ToUpperInvariant()
+    $g    = $AdhGroup.Trim().ToUpperInvariant()
     $base = "ADH_$g"
 
     if ($Environment -eq 'prd') {
@@ -95,7 +95,7 @@ function Invoke-DbApi {
         [Parameter(Mandatory)][string]$DatabricksPat
     )
 
-    $uri = "$WorkspaceUrl/api/2.0/$Path"
+    $uri     = "$WorkspaceUrl/api/2.0/$Path"
     $headers = @{ Authorization = "Bearer $DatabricksPat" }
 
     if ($Body -ne $null) {
@@ -113,18 +113,16 @@ function Get-DbWorkspacePermissions {
         [Parameter(Mandatory)][string]$WorkspaceUrl,
         [Parameter(Mandatory)][string]$DatabricksPat
     )
-
     Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path 'permissions/workspace' -Body $null -DatabricksPat $DatabricksPat
 }
 
-# Clusters
+# Clusters (not used for validation right now, but kept for possible future use)
 function Get-DbClusters {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
         [Parameter(Mandatory)][string]$DatabricksPat
     )
-
     Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path 'clusters/list' -Body $null -DatabricksPat $DatabricksPat
 }
 
@@ -135,7 +133,6 @@ function Get-DbClusterPermissions {
         [Parameter(Mandatory)][string]$ClusterId,
         [Parameter(Mandatory)][string]$DatabricksPat
     )
-
     $path = "permissions/clusters/$ClusterId"
     Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path $path -Body $null -DatabricksPat $DatabricksPat
 }
@@ -147,7 +144,6 @@ function Get-DbWarehouses {
         [Parameter(Mandatory)][string]$WorkspaceUrl,
         [Parameter(Mandatory)][string]$DatabricksPat
     )
-
     Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path 'sql/warehouses' -Body $null -DatabricksPat $DatabricksPat
 }
 
@@ -158,12 +154,20 @@ function Get-DbWarehousePermissions {
         [Parameter(Mandatory)][string]$WarehouseId,
         [Parameter(Mandatory)][string]$DatabricksPat
     )
-
     $path = "permissions/sql/warehouses/$WarehouseId"
     Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path $path -Body $null -DatabricksPat $DatabricksPat
 }
 
-# Unity Catalog – catalogs
+# Unity Catalog – catalog list + permissions
+function Get-DbCatalogsList {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceUrl,
+        [Parameter(Mandatory)][string]$DatabricksPat
+    )
+    Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path 'unity-catalog/catalogs' -Body $null -DatabricksPat $DatabricksPat
+}
+
 function Get-DbCatalogPermissions {
     [CmdletBinding()]
     param(
@@ -171,22 +175,18 @@ function Get-DbCatalogPermissions {
         [Parameter(Mandatory)][string]$CatalogName,
         [Parameter(Mandatory)][string]$DatabricksPat
     )
-
     $path = "unity-catalog/permissions/catalogs/$CatalogName"
     Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path $path -Body $null -DatabricksPat $DatabricksPat
 }
 
-# External locations
-function Get-DbExternalLocation {
+# External locations list + permissions
+function Get-DbExternalLocationsList {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
-        [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$DatabricksPat
     )
-
-    $path = "unity-catalog/external-locations/$Name"
-    Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path $path -Body $null -DatabricksPat $DatabricksPat
+    Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path 'unity-catalog/external-locations' -Body $null -DatabricksPat $DatabricksPat
 }
 
 function Get-DbExternalLocationPermissions {
@@ -196,21 +196,8 @@ function Get-DbExternalLocationPermissions {
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$DatabricksPat
     )
-
     $path = "unity-catalog/permissions/external-locations/$Name"
     Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path $path -Body $null -DatabricksPat $DatabricksPat
-}
-
-# Admin / workspace settings (generic)
-function Get-DbWorkspaceSettings {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$WorkspaceUrl,
-        [Parameter(Mandatory)][string]$DatabricksPat
-    )
-
-    # Adjust path/keys to your environment as needed
-    Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path 'workspace-conf/get-status' -Body $null -DatabricksPat $DatabricksPat
 }
 
 Export-ModuleMember -Function *
