@@ -9,6 +9,20 @@ param(
   [string]$BranchName = ''
 )
 
+<#
+Expected CSV columns (like your adls_permissions.csv):
+
+ResourceGroupName,StorageAccountName,ContainerName,Identity,AccessPath,PermissionType,Type,Scope,...
+
+Examples:
+  ResourceGroupName = ADH_<Custodian>_ADLS
+  StorageAccountName = adh<Cust>adlsnonprd
+  ContainerName = dev
+  Identity = ADH_Platform_ADO_Configuration_SPN
+  AccessPath = /catalog/operations
+  PermissionType = r-x
+#>
+
 Import-Module Az.Accounts, Az.Resources, Az.Storage -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
@@ -91,21 +105,21 @@ foreach ($sub in $subs) {
 
   foreach ($r in $rows) {
 
-    # INPUT CSV must have:
-    #   ResourceGroupName, ContainerName, AccessPath, Identity, PermissionType
-    $rgNameRaw    = $r.ResourceGroupName
-    $contRaw      = $r.ContainerName
-    $accessPath   = $r.AccessPath
-    $identityName = $r.Identity
-    $permType     = $r.PermissionType   # e.g. r-x, rwx
+    # Map columns from CSV
+    $rgNameRaw        = $r.ResourceGroupName
+    $saNameRaw        = $r.StorageAccountName
+    $contRaw          = $r.ContainerName
+    $accessPath       = $r.AccessPath
+    $identityNameRaw  = $r.Identity
+    $permType         = $r.PermissionType   # e.g. r-x, rwx
+    $ruleType         = $r.Type
+    $ruleScope        = $r.Scope
 
-    # Expand placeholders if present
-    $rgName        = ($rgNameRaw    -replace '<Custodian>', $adh_group)
-    $cont          = ($contRaw      -replace '<Cust>',      $adh_group.ToLower())
-    $identityName  = ($identityName -replace '<Custodian>', $adh_group)
-
-    # Storage account naming pattern as you used earlier
-    $saName = "adh$($adh_group.ToLower())adls$($adh_subscription_type.ToLower())"
+    # Expand placeholders
+    $rgName       = ($rgNameRaw       -replace '<Custodian>', $adh_group)
+    $saName       = ($saNameRaw       -replace '<Cust>',      $adh_group.ToLower()) -replace '<Custodian>', $adh_group
+    $cont         = ($contRaw         -replace '<Cust>',      $adh_group.ToLower())
+    $identityName = ($identityNameRaw -replace '<Custodian>', $adh_group)
 
     # --------------------------------
     # 1. Storage Account existence
@@ -122,6 +136,8 @@ foreach ($sub in $subs) {
         AccessPath       = $accessPath
         Identity         = $identityName
         PermissionType   = $permType
+        Type             = $ruleType
+        Scope            = $ruleScope
         Check            = 'StorageAccount'
         Status           = 'ERROR'
         Notes            = "Storage Account error: $($_.Exception.Message)"
@@ -146,6 +162,8 @@ foreach ($sub in $subs) {
         AccessPath       = $accessPath
         Identity         = $identityName
         PermissionType   = $permType
+        Type             = $ruleType
+        Scope            = $ruleScope
         Check            = 'Container'
         Status           = 'ERROR'
         Notes            = "Container fetch error: $($_.Exception.Message)"
@@ -162,6 +180,8 @@ foreach ($sub in $subs) {
         AccessPath       = $accessPath
         Identity         = $identityName
         PermissionType   = $permType
+        Type             = $ruleType
+        Scope            = $ruleScope
         Check            = 'Container'
         Status           = 'MISSING'
         Notes            = "Container not found"
@@ -186,6 +206,8 @@ foreach ($sub in $subs) {
           AccessPath       = $accessPath
           Identity         = $identityName
           PermissionType   = $permType
+          Type             = $ruleType
+          Scope            = $ruleScope
           Check            = 'ACL'
           Status           = 'ERROR'
           Notes            = "Identity '$identityName' not found in Entra ID"
@@ -242,6 +264,8 @@ foreach ($sub in $subs) {
         AccessPath       = $accessPath
         Identity         = $identityName
         PermissionType   = $permType
+        Type             = $ruleType
+        Scope            = $ruleScope
         Check            = 'ACL'
         Status           = $permStatus
         Notes            = $permNotes
@@ -258,6 +282,8 @@ foreach ($sub in $subs) {
         AccessPath       = $accessPath
         Identity         = $identityName
         PermissionType   = $permType
+        Type             = $ruleType
+        Scope            = $ruleScope
         Check            = 'ACL'
         Status           = 'SKIPPED'
         Notes            = 'Missing AccessPath, Identity or PermissionType'
@@ -275,6 +301,8 @@ if (-not $out) {
     AccessPath       = ''
     Identity         = ''
     PermissionType   = ''
+    Type             = ''
+    Scope            = ''
     Check            = ''
     Status           = 'NO_RESULTS'
     Notes            = 'Nothing matched in scan'
