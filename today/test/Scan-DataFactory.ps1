@@ -1,12 +1,12 @@
 # sanitychecks/scripts/Scan-DataFactory.ps1
 
 param(
-    [Parameter(Mandatory)][string]$TenantId,
-    [Parameter(Mandatory)][string]$ClientId,
-    [Parameter(Mandatory)][string]$ClientSecret,
-    [Parameter(Mandatory)][string]$adh_group,
+    [Parameter(Mandatory = $true)][string]$TenantId,
+    [Parameter(Mandatory = $true)][string]$ClientId,
+    [Parameter(Mandatory = $true)][string]$ClientSecret,
+    [Parameter(Mandatory = $true)][string]$adh_group,
     [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
-    [Parameter(Mandatory)][string]$OutputDir,
+    [Parameter(Mandatory = $true)][string]$OutputDir,
     [string]$BranchName = ''
 )
 
@@ -32,21 +32,30 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
+$subNames = $subs | ForEach-Object { $_.Name }
+Write-Host "DEBUG: Resolved adh_group='$adh_group' env='$adh_subscription_type' -> subscriptions: $($subNames -join ', ')"
+
 $overview = @()
 $lsRows   = @()
 $irRows   = @()
 
 foreach ($sub in $subs) {
 
-    Write-Host "DEBUG: Resolved adh_group='$adh_group' env='$adh_subscription_type' -> subscription '$($sub.Name)'"
+    Write-Host "DEBUG: Processing subscription $($sub.Name)"
 
     Set-ScContext -Subscription $sub
 
     # Get ALL data factories in this subscription
     $dfs = Get-AzDataFactoryV2 -ErrorAction SilentlyContinue
 
+    $adfNamesString = if ($dfs) {
+        $dfs | ForEach-Object { $_.Name } -join ', '
+    } else {
+        '<none>'
+    }
+
     Write-Host ("DEBUG: Scanning subscription {0}; ADFs found: {1}" -f `
-        $sub.Name, ($dfs | ForEach-Object Name -join ', '))
+        $sub.Name, $adfNamesString)
 
     if (-not $dfs) {
         Write-Host "DEBUG: No DataFactories found in $($sub.Name)"
