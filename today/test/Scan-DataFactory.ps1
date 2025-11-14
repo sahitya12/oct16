@@ -32,7 +32,6 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
-# PowerShell 5–compatible way to join subscription names
 $subNames = ($subs | Select-Object -ExpandProperty Name) -join ', '
 Write-Host "DEBUG: Resolved adh_group='$adh_group' env='$adh_subscription_type' -> subscriptions: $subNames"
 
@@ -59,37 +58,72 @@ foreach ($sub in $subs) {
 
     foreach ($df in $dfs) {
 
+        # ----------------- Determine a safe DataFactory name -------------
+        $dfName = $null
+
+        if ($df.PSObject.Properties.Match('DataFactoryName').Count -gt 0 -and
+            -not [string]::IsNullOrWhiteSpace($df.DataFactoryName)) {
+            $dfName = $df.DataFactoryName
+        }
+        elseif ($df.PSObject.Properties.Match('FactoryName').Count -gt 0 -and
+                -not [string]::IsNullOrWhiteSpace($df.FactoryName)) {
+            $dfName = $df.FactoryName
+        }
+        else {
+            # fall back to Name if it exists
+            if ($df.PSObject.Properties.Match('Name').Count -gt 0) {
+                $dfName = $df.Name
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($dfName)) {
+            Write-Warning "DEBUG: DataFactory object in subscription '$($sub.Name)' has no detectable name. Skipping. Raw object: `n$($df | Out-String)"
+            continue
+        }
+
         # ----------------- Overview row -----------------
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
             ResourceGroup    = $df.ResourceGroupName
-            DataFactory      = $df.Name
+            DataFactory      = $dfName
             Exists           = 'Yes'
             Location         = $df.Location
         }
 
         # ----------------- Linked services --------------
-        $ls = Get-AzDataFactoryV2LinkedService `
-                -ResourceGroupName $df.ResourceGroupName `
-                -DataFactoryName   $df.Name `
-                -ErrorAction SilentlyContinue
+        try {
+            $ls = Get-AzDataFactoryV2LinkedService `
+                    -ResourceGroupName $df.ResourceGroupName `
+                    -DataFactoryName   $dfName `
+                    -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "DEBUG: Failed to query Linked Services for ADF '$dfName' in RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
+            $ls = @()
+        }
 
         foreach ($l in $ls) {
             $lsRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $df.ResourceGroupName
-                DataFactory      = $df.Name
+                DataFactory      = $dfName
                 LinkedService    = $l.Name
                 Type             = $l.Properties.Type
             }
         }
 
         # ----------------- Integration runtimes ---------
-        $irs = Get-AzDataFactoryV2IntegrationRuntime `
-                 -ResourceGroupName $df.ResourceGroupName `
-                 -DataFactoryName   $df.Name `
-                 -ErrorAction SilentlyContinue
+        try {
+            $irs = Get-AzDataFactoryV2IntegrationRuntime `
+                     -ResourceGroupName $df.ResourceGroupName `
+                     -DataFactoryName   $dfName `
+                     -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "DEBUG: Failed to query Integration Runtimes for ADF '$dfName' in RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
+            $irs = @()
+        }
 
         foreach ($ir in $irs) {
 
@@ -105,7 +139,7 @@ foreach ($sub in $subs) {
             $irRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $df.ResourceGroupName
-                DataFactory      = $df.Name
+                DataFactory      = $dfName
                 IRName           = $ir.Name
                 IRType           = $ir.Properties.Type
                 ComputeDesc      = $computeDesc
