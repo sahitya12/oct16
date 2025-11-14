@@ -1,0 +1,51 @@
+# stages/adls.stage.yml
+
+parameters:
+- name: adh_group
+  type: string
+- name: adh_subscription_type
+  type: string
+  default: nonprd
+  values:
+  - nonprd
+  - prd
+- name: poolName
+  type: string
+- name: agentName
+  type: string
+
+stages:
+- stage: ADLS
+  displayName: "ADLS ACL Validation (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
+  jobs:
+  - job: scan_adls
+    displayName: "Scan ADLS ACLs"
+    pool:
+      name: ${{ parameters.poolName }}
+      demands:
+        - Agent.Name -equals ${{ parameters.agentName }}
+
+    steps:
+    - checkout: self
+
+    - task: PowerShell@2
+      displayName: "Run ADLS ACL validation"
+      inputs:
+        filePath: 'sanitychecks/scripts/Scan-ADLS-Acls.ps1'
+        pwsh: true
+        arguments: >
+          -TenantId "$(tenant_id)"
+          -ClientId "$(backend_client_id)"
+          -ClientSecret "$(backend_client_secret)"
+          -adh_group "${{ parameters.adh_group }}"
+          -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+          -InputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_acl_matrix.csv"
+          -OutputDir "$(Build.ArtifactStagingDirectory)/adls-acl"
+          -BranchName "$(Build.SourceBranchName)"
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish ADLS ACL results"
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/adls-acl'
+        ArtifactName: 'adls-acl'
+        publishLocation: 'Container'
