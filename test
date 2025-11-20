@@ -22,11 +22,14 @@ Import-Module (Join-Path $PSScriptRoot 'DatabricksHelper.psm1') -Force -ErrorAct
 # -------------------------------------------------------
 $OutputDir = Ensure-Dir -Path $OutputDir
 
+# Login with pipeline SPN (used only to talk to Azure / KV)
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
 }
 
-# Build Custodian value
+# Build Custodian
+# - If adh_sub_group is null/empty -> Custodian = adh_group
+# - Else                        -> Custodian = adh_group_adh_sub_group
 $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 } else {
@@ -36,7 +39,7 @@ $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
 # Environments
 $envsToCheck = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev', 'tst', 'stg') }
 
-# Subscriptions
+# Subscriptions to scan (your helper)
 $subs = Resolve-DbSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 
 # -------------------------------------------------------
@@ -55,29 +58,62 @@ $extLocPermResults    = @()
 # Main Loop
 # -------------------------------------------------------
 foreach ($sub in $subs) {
+
     Set-ScContext -Subscription $sub
 
     foreach ($env in $envsToCheck) {
-        $keyVaultNameInfra = "ADH-$Custodian-Infra-KV-$env"
-        $DatabricksPat = $null
-        $workspaceUrl  = $null
-        $workspaceId   = $null
+
+        # Key Vaults
+        $keyVaultNameInfra = "ADH-$Custodian-Infra-KV-$env"  # PAT + workspace URL/ID
+        $keyVaultNameCust  = "ADH-$Custodian-KV-$env"        # Gen_SPN client ID + secret
+
+        $DatabricksPat        = $null
+        $workspaceUrl         = $null
+        $workspaceId          = $null
+        $DbSpnClientId        = $null
+        $DbSpnClientSecret    = $null
 
         # ---------------------------------------------------
-        # 1. PAT from Key Vault
+        # 0. Gen_SPN client ID & secret from ADH-<Custodian>-KV-<env>
+        #    Secret names:
+        #       ADH_<Custodian>_Gen_SPN_<env>
+        #       ADH_<Custodian>_Gen_SPN_<env>-Secret
         # ---------------------------------------------------
-        $patSecretName = "SPN-TOKEN-CUSTODIAN-GEN"
+        $genSpnBaseName = "ADH_{0}_Gen_SPN_{1}" -f $Custodian, $env
+
         try {
-            $tokenSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $patSecretName -ErrorAction Stop
-            $DatabricksPat = $tokenSecret.SecretValueText
-            Write-Host "INFO: Retrieved PAT from '$keyVaultNameInfra' ($env)" -ForegroundColor Cyan
+            $genSpnIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameCust -Name $genSpnBaseName -ErrorAction Stop
+            $DbSpnClientId  = $genSpnIdSecret.SecretValueText
+            Write-Host "INFO: Retrieved Gen_SPN ClientId from '$keyVaultNameCust' ($env) name '$genSpnBaseName'" -ForegroundColor Cyan
         } catch {
-            Write-Warning "Failed to retrieve PAT from '$keyVaultNameInfra' ($env): $_"
+            Write-Warning "Failed to retrieve Gen_SPN ClientId '$genSpnBaseName' from '$keyVaultNameCust' ($env): $_"
+        }
+
+        try {
+            $genSpnSecretName = $genSpnBaseName + "-Secret"
+            $genSpnSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameCust -Name $genSpnSecretName -ErrorAction Stop
+            $DbSpnClientSecret = $genSpnSecret.SecretValueText
+            Write-Host ("INFO: Retrieved Gen_SPN ClientSecret from '{0}' ({1}) name '{2}' (len={3})" -f $keyVaultNameCust, $env, $genSpnSecretName, $DbSpnClientSecret.Length) -ForegroundColor Cyan
+        } catch {
+            Write-Warning "Failed to retrieve Gen_SPN ClientSecret '$genSpnSecretName' from '$keyVaultNameCust' ($env): $_"
         }
 
         # ---------------------------------------------------
-        # 2. Workspace URL and ID from Key Vault
-        #    Try both spellings: WORKSPACE and WORKSAPCE
+        # 1. PAT from ADH-<Custodian>-Infra-KV-<env>
+        #    Secret: SPN-TOKEN-CUSTODIAN-GEN
+        # ---------------------------------------------------
+        $patSecretName = "SPN-TOKEN-CUSTODIAN-GEN"
+        try {
+            $tokenSecret   = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $patSecretName -ErrorAction Stop
+            $DatabricksPat = $tokenSecret.SecretValueText
+            Write-Host "INFO: Retrieved Databricks PAT from '$keyVaultNameInfra' ($env)" -ForegroundColor Cyan
+        } catch {
+            Write-Warning "Failed to retrieve PAT '$patSecretName' from '$keyVaultNameInfra' ($env): $_"
+        }
+
+        # ---------------------------------------------------
+        # 2. Workspace URL and ID from ADH-<Custodian>-Infra-KV-<env>
+        #    Support both WORKSPACE and WORKSAPCE spellings
         # ---------------------------------------------------
         $urlSecretNameTidy   = "DATABRICKS-WORKSPACE-URL"
         $urlSecretNameTypos  = "DATABRICKS-WORKSAPCE-URL"
@@ -86,14 +122,12 @@ foreach ($sub in $subs) {
 
         # URL
         try {
-            # correct spelling
             $wsUrlSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTidy -ErrorAction Stop
             $workspaceUrl = $wsUrlSecret.SecretValueText
             Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTidy' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
         } catch {
             Write-Warning "Failed to retrieve $urlSecretNameTidy from '$keyVaultNameInfra' ($env): $_"
             try {
-                # fallback to typo spelling
                 $wsUrlSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTypos -ErrorAction Stop
                 $workspaceUrl = $wsUrlSecret.SecretValueText
                 Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTypos' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
@@ -122,7 +156,6 @@ foreach ($sub in $subs) {
         # 3. Handle URL not found / empty
         # ---------------------------------------------------
         if ($null -eq $workspaceUrl) {
-            # No secret found with either name
             $workspaceResults += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 SubscriptionId   = $sub.Id
@@ -132,7 +165,9 @@ foreach ($sub in $subs) {
                 WorkspaceUrl     = ''
                 State            = 'UrlSecretNotFound'
                 Location         = ''
-                KeyVaultName     = $keyVaultNameInfra
+                KeyVaultNameInfra= $keyVaultNameInfra
+                KeyVaultNameCust = $keyVaultNameCust
+                GenSpnClientId   = $DbSpnClientId
                 adh_group        = $adh_group
                 adh_sub_group    = $adh_sub_group
                 BranchName       = $BranchName
@@ -142,7 +177,6 @@ foreach ($sub in $subs) {
         }
 
         if ([string]::IsNullOrWhiteSpace($workspaceUrl)) {
-            # Secret exists but empty value
             $workspaceResults += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 SubscriptionId   = $sub.Id
@@ -152,7 +186,9 @@ foreach ($sub in $subs) {
                 WorkspaceUrl     = ''
                 State            = 'EmptyUrlInKeyVault'
                 Location         = ''
-                KeyVaultName     = $keyVaultNameInfra
+                KeyVaultNameInfra= $keyVaultNameInfra
+                KeyVaultNameCust = $keyVaultNameCust
+                GenSpnClientId   = $DbSpnClientId
                 adh_group        = $adh_group
                 adh_sub_group    = $adh_sub_group
                 BranchName       = $BranchName
@@ -161,7 +197,7 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # Non-empty URL → configured
+        # Non-empty URL → configured, we also record Gen_SPN client ID
         $workspaceResults += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -171,7 +207,9 @@ foreach ($sub in $subs) {
             WorkspaceUrl     = $workspaceUrl
             State            = 'ConfiguredInKeyVault'
             Location         = ''
-            KeyVaultName     = $keyVaultNameInfra
+            KeyVaultNameInfra= $keyVaultNameInfra
+            KeyVaultNameCust = $keyVaultNameCust
+            GenSpnClientId   = $DbSpnClientId
             adh_group        = $adh_group
             adh_sub_group    = $adh_sub_group
             BranchName       = $BranchName
@@ -348,7 +386,7 @@ foreach ($sub in $subs) {
 }
 
 # -------------------------------------------------------
-# Export Data
+# Export Data (no '*' in filenames)
 # -------------------------------------------------------
 $csvWs       = $null
 $csvWsPerm   = $null
