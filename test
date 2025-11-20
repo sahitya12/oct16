@@ -20,37 +20,27 @@ Import-Module (Join-Path $PSScriptRoot 'DatabricksHelper.psm1') -Force -ErrorAct
 # -------------------------------------------------------
 # Prep
 # -------------------------------------------------------
-# Ensure output folder
 $OutputDir = Ensure-Dir -Path $OutputDir
 
-# Authenticate to Azure
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
 }
 
-# Build Custodian
-# If adh_sub_group is null/empty -> Custodian = adh_group
-# Else -> Custodian = adh_group_adh_sub_group
+# Build Custodian value
 $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 } else {
     "${adh_group}_${adh_sub_group}"
 }
 
-# Environments to check based on subscription type
-# nonprd => dev, tst, stg
-# prd    => prd
-$envsToCheck = if ($adh_subscription_type -eq 'prd') {
-    @('prd')
-} else {
-    @('dev', 'tst', 'stg')
-}
+# Environments
+$envsToCheck = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev', 'tst', 'stg') }
 
-# Resolve subscriptions for this adh_group / env type
+# Subscriptions
 $subs = Resolve-DbSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 
 # -------------------------------------------------------
-# Result containers
+# Results
 # -------------------------------------------------------
 $workspaceResults     = @()
 $workspacePermResults = @()
@@ -62,63 +52,77 @@ $extLocResults        = @()
 $extLocPermResults    = @()
 
 # -------------------------------------------------------
-# Main loop
+# Main Loop
 # -------------------------------------------------------
 foreach ($sub in $subs) {
-
-    # Set subscription context
     Set-ScContext -Subscription $sub
 
     foreach ($env in $envsToCheck) {
-
-        # Key Vault per env: ADH-<Custodian>-Infra-KV-<env>
         $keyVaultNameInfra = "ADH-$Custodian-Infra-KV-$env"
         $DatabricksPat = $null
         $workspaceUrl  = $null
         $workspaceId   = $null
 
-        # --------------------------------------------------------------------
-        # 1. Get Databricks PAT from KV (SPN-TOKEN-CUSTODIAN-GEN)
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
+        # 1. PAT from Key Vault
+        # ---------------------------------------------------
         $patSecretName = "SPN-TOKEN-CUSTODIAN-GEN"
         try {
             $tokenSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $patSecretName -ErrorAction Stop
             $DatabricksPat = $tokenSecret.SecretValueText
-            Write-Host "Retrieved Databricks PAT from Key Vault: $keyVaultNameInfra" -ForegroundColor Cyan
-        }
-        catch {
-            Write-Warning "Failed to retrieve Databricks PAT from '$keyVaultNameInfra' (env '$env'): $_"
+            Write-Host "INFO: Retrieved PAT from '$keyVaultNameInfra' ($env)" -ForegroundColor Cyan
+        } catch {
+            Write-Warning "Failed to retrieve PAT from '$keyVaultNameInfra' ($env): $_"
         }
 
-        # --------------------------------------------------------------------
-        # 2. Get Workspace URL & ID from KV
-        #    Secrets:
-        #       DATABRICKS-WORKSAPCE-URL
-        #       DATABRICKS-WORKSAPCE-ID
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
+        # 2. Workspace URL and ID from Key Vault
+        #    Try both spellings: WORKSPACE and WORKSAPCE
+        # ---------------------------------------------------
+        $urlSecretNameTidy   = "DATABRICKS-WORKSPACE-URL"
+        $urlSecretNameTypos  = "DATABRICKS-WORKSAPCE-URL"
+        $idSecretNameTidy    = "DATABRICKS-WORKSPACE-ID"
+        $idSecretNameTypos   = "DATABRICKS-WORKSAPCE-ID"
+
+        # URL
         try {
-            $wsUrlSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name 'DATABRICKS-WORKSAPCE-URL' -ErrorAction Stop
+            # correct spelling
+            $wsUrlSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTidy -ErrorAction Stop
             $workspaceUrl = $wsUrlSecret.SecretValueText
-        }
-        catch {
-            Write-Warning "Failed to retrieve DATABRICKS-WORKSAPCE-URL from '$keyVaultNameInfra' (env '$env'): $_"
+            Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTidy' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
+        } catch {
+            Write-Warning "Failed to retrieve $urlSecretNameTidy from '$keyVaultNameInfra' ($env): $_"
+            try {
+                # fallback to typo spelling
+                $wsUrlSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTypos -ErrorAction Stop
+                $workspaceUrl = $wsUrlSecret.SecretValueText
+                Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTypos' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
+            } catch {
+                Write-Warning "Failed to retrieve $urlSecretNameTypos from '$keyVaultNameInfra' ($env) as well: $_"
+            }
         }
 
+        # ID
         try {
-            $wsIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name 'DATABRICKS-WORKSAPCE-ID' -ErrorAction Stop
+            $wsIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $idSecretNameTidy -ErrorAction Stop
             $workspaceId = $wsIdSecret.SecretValueText
-        }
-        catch {
-            Write-Warning "Failed to retrieve DATABRICKS-WORKSAPCE-ID from '$keyVaultNameInfra' (env '$env'): $_"
+        } catch {
+            Write-Warning "Failed to retrieve $idSecretNameTidy from '$keyVaultNameInfra' ($env): $_"
+            try {
+                $wsIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $idSecretNameTypos -ErrorAction Stop
+                $workspaceId = $wsIdSecret.SecretValueText
+            } catch {
+                Write-Warning "Failed to retrieve $idSecretNameTypos from '$keyVaultNameInfra' ($env) as well: $_"
+            }
         }
 
-        # Logical workspace name for reporting
         $workspaceName = "ADH_${Custodian}_${env}"
 
-        # --------------------------------------------------------------------
-        # 3. Record workspace entry even if URL is missing
-        # --------------------------------------------------------------------
-        if ([string]::IsNullOrWhiteSpace($workspaceUrl)) {
+        # ---------------------------------------------------
+        # 3. Handle URL not found / empty
+        # ---------------------------------------------------
+        if ($null -eq $workspaceUrl) {
+            # No secret found with either name
             $workspaceResults += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 SubscriptionId   = $sub.Id
@@ -126,19 +130,38 @@ foreach ($sub in $subs) {
                 WorkspaceName    = $workspaceName
                 WorkspaceId      = $workspaceId
                 WorkspaceUrl     = ''
-                State            = 'MissingUrlInKeyVault'
+                State            = 'UrlSecretNotFound'
                 Location         = ''
                 KeyVaultName     = $keyVaultNameInfra
                 adh_group        = $adh_group
                 adh_sub_group    = $adh_sub_group
                 BranchName       = $BranchName
             }
-
-            Write-Warning "Workspace URL is empty for Custodian '$Custodian', env '$env' in '$keyVaultNameInfra' – skipping Databricks API calls."
+            Write-Warning "Workspace URL secret not found for Custodian '$Custodian', env '$env' in '$keyVaultNameInfra' – skipping Databricks API calls."
             continue
         }
 
-        # URL exists – mark as configured
+        if ([string]::IsNullOrWhiteSpace($workspaceUrl)) {
+            # Secret exists but empty value
+            $workspaceResults += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                SubscriptionId   = $sub.Id
+                Env              = $env
+                WorkspaceName    = $workspaceName
+                WorkspaceId      = $workspaceId
+                WorkspaceUrl     = ''
+                State            = 'EmptyUrlInKeyVault'
+                Location         = ''
+                KeyVaultName     = $keyVaultNameInfra
+                adh_group        = $adh_group
+                adh_sub_group    = $adh_sub_group
+                BranchName       = $BranchName
+            }
+            Write-Warning "Workspace URL is empty/whitespace for Custodian '$Custodian', env '$env' in '$keyVaultNameInfra' – skipping Databricks API calls."
+            continue
+        }
+
+        # Non-empty URL → configured
         $workspaceResults += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -159,25 +182,16 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
         # 4. Workspace Permissions
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
         try {
             $perm = Get-DbWorkspacePermissions -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
-
             foreach ($ace in $perm.access_control_list) {
-
                 $principalName = $ace.user_name ?? $ace.group_name ?? $ace.service_principal_name
-                $principalType = if ($ace.user_name) {
-                    'user'
-                }
-                elseif ($ace.group_name) {
-                    'group'
-                }
-                else {
-                    'service_principal'
-                }
-
+                $principalType = if ($ace.user_name) { 'user' }
+                                 elseif ($ace.group_name) { 'group' }
+                                 else { 'service_principal' }
                 foreach ($p in $ace.all_permissions) {
                     $workspacePermResults += [pscustomobject]@{
                         SubscriptionName = $sub.Name
@@ -193,17 +207,15 @@ foreach ($sub in $subs) {
                     }
                 }
             }
-        }
-        catch {
+        } catch {
             Write-Warning "Failed to fetch workspace permissions for '$workspaceName': $_"
         }
 
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
         # 5. SQL Warehouses & Permissions
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
         try {
             $whs = Get-DbWarehouses -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
-
             foreach ($wh in $whs.warehouses) {
                 $sqlWhResults += [pscustomobject]@{
                     SubscriptionName = $sub.Name
@@ -219,22 +231,13 @@ foreach ($sub in $subs) {
                     adh_group        = $adh_group
                     adh_sub_group    = $adh_sub_group
                 }
-
                 try {
                     $permWh = Get-DbWarehousePermissions -WorkspaceUrl $workspaceUrl -WarehouseId $wh.id -DatabricksPat $DatabricksPat
-
                     foreach ($ace in $permWh.access_control_list) {
                         $principalName = $ace.user_name ?? $ace.group_name ?? $ace.service_principal_name
-                        $principalType = if ($ace.user_name) {
-                            'user'
-                        }
-                        elseif ($ace.group_name) {
-                            'group'
-                        }
-                        else {
-                            'service_principal'
-                        }
-
+                        $principalType = if ($ace.user_name) { 'user' }
+                                         elseif ($ace.group_name) { 'group' }
+                                         else { 'service_principal' }
                         foreach ($p in $ace.all_permissions) {
                             $sqlWhPermResults += [pscustomobject]@{
                                 SubscriptionName = $sub.Name
@@ -252,22 +255,19 @@ foreach ($sub in $subs) {
                             }
                         }
                     }
-                }
-                catch {
+                } catch {
                     Write-Warning "Failed to fetch warehouse permissions for '$($wh.name)': $_"
                 }
             }
-        }
-        catch {
+        } catch {
             Write-Warning "Failed to list SQL warehouses for '$workspaceName': $_"
         }
 
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
         # 6. Catalogs & Permissions
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
         try {
             $cats = Get-DbCatalogsList -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
-
             foreach ($cat in $cats.catalogs) {
                 $catalogListResults += [pscustomobject]@{
                     SubscriptionName = $sub.Name
@@ -281,10 +281,8 @@ foreach ($sub in $subs) {
                     adh_group        = $adh_group
                     adh_sub_group    = $adh_sub_group
                 }
-
                 try {
                     $permCat = Get-DbCatalogPermissions -WorkspaceUrl $workspaceUrl -CatalogName $cat.name -DatabricksPat $DatabricksPat
-
                     foreach ($entry in $permCat.privilege_assignments) {
                         $catalogPermResults += [pscustomobject]@{
                             SubscriptionName = $sub.Name
@@ -298,22 +296,19 @@ foreach ($sub in $subs) {
                             adh_sub_group    = $adh_sub_group
                         }
                     }
-                }
-                catch {
+                } catch {
                     Write-Warning "Failed to fetch catalog permissions for '$($cat.name)': $_"
                 }
             }
-        }
-        catch {
+        } catch {
             Write-Warning "Failed to list catalogs for '$workspaceName': $_"
         }
 
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
         # 7. External Locations & Permissions
-        # --------------------------------------------------------------------
+        # ---------------------------------------------------
         try {
             $extLocs = Get-DbExternalLocationsList -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
-
             foreach ($loc in $extLocs.external_locations) {
                 $extLocResults += [pscustomobject]@{
                     SubscriptionName = $sub.Name
@@ -327,46 +322,42 @@ foreach ($sub in $subs) {
                     adh_group        = $adh_group
                     adh_sub_group    = $adh_sub_group
                 }
-
                 try {
                     $permLoc = Get-DbExternalLocationPermissions -WorkspaceUrl $workspaceUrl -Name $loc.name -DatabricksPat $DatabricksPat
-
                     foreach ($entry in $permLoc.privilege_assignments) {
                         $extLocPermResults += [pscustomobject]@{
-                            SubscriptionName = $sub.Name
-                            SubscriptionId   = $sub.Id
-                            Env              = $env
-                            WorkspaceName    = $workspaceName
-                            ExternalLocation = $loc.name
-                            PrincipalName    = $entry.principal
-                            Privileges       = ($entry.privileges -join ',')
-                            adh_group        = $adh_group
-                            adh_sub_group    = $adh_sub_group
+                            SubscriptionName  = $sub.Name
+                            SubscriptionId    = $sub.Id
+                            Env               = $env
+                            WorkspaceName     = $workspaceName
+                            ExternalLocation  = $loc.name
+                            PrincipalName     = $entry.principal
+                            Privileges        = ($entry.privileges -join ',')
+                            adh_group         = $adh_group
+                            adh_sub_group     = $adh_sub_group
                         }
                     }
-                }
-                catch {
+                } catch {
                     Write-Warning "Failed to fetch external location permissions for '$($loc.name)': $_"
                 }
             }
-        }
-        catch {
+        } catch {
             Write-Warning "Failed to list external locations for '$workspaceName': $_"
         }
     }
 }
 
 # -------------------------------------------------------
-# Export CSV / HTML – with safe file names (no *)
+# Export Data
 # -------------------------------------------------------
-$csvWs = $null
-$csvWsPerm = $null
-$csvWh = $null
-$csvWhPerm = $null
-$csvCatList = $null
-$csvCatPerm = $null
-$csvExt = $null
-$csvExtPerm = $null
+$csvWs       = $null
+$csvWsPerm   = $null
+$csvWh       = $null
+$csvWhPerm   = $null
+$csvCatList  = $null
+$csvCatPerm  = $null
+$csvExt      = $null
+$csvExtPerm  = $null
 
 if ($workspaceResults.Count -gt 0) {
     $csvWs = New-StampedPath -BaseDir $OutputDir -Prefix ("db_ws_{0}_{1}" -f $adh_group, $adh_subscription_type)
