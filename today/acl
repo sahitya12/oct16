@@ -1,1 +1,17 @@
 az storage fs access set-recursive --acl "user:<GUID_Terraform_SPN>:r-x,user:<GUID_ADO_SPN>:r-x,group:<GUID_Analysts>:r-x,group:<GUID_DataOps>:r-x,group:<GUID_Platform_Admins>:rwx,group:<GUID_Developers>:r-x,group:<GUID_QA_Testers>:r-x,group:<GUID_Leads>:r-x" --account-name adhnnhhadlsnonprd --filesystem tst --path "adh_nhh/operations/ingestion" --auth-mode login
+
+ADH_Platform_Terraform_configuration_SPN → <GUID_Terraform_SPN> → r-x
+
+ADH_Platform_ADO_Configuration_SPN → <GUID_ADO_SPN> → r-x
+
+paz_app_access_ADH_NHH_Analysts → <GUID_Analysts> → r-x
+
+paz_app_access_ADH_Data_Operations → <GUID_DataOps> → r-x
+
+paz_app_access_ADH_Platform_Admins → <GUID_Platform_Admins> → rwx
+
+paz_app_access_ADH_NHH_Developers → <GUID_Developers> → r-x
+
+paz_app_access_ADH_NHH_QA_Testers → <GUID_QA_Testers> → r-x
+
+paz_app_access_ADH_NHH_Leads → <GUID_Leads> → r-x
