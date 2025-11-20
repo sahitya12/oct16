@@ -1,0 +1,401 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$TenantId,
+    [Parameter(Mandatory)][string]$ClientId,
+    [Parameter(Mandatory)][string]$ClientSecret,
+    [Parameter(Mandatory)][string]$adh_group,
+    [string]$adh_sub_group = '',
+    [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
+    [Parameter(Mandatory)][string]$OutputDir,
+    [string]$BranchName = ''
+)
+
+# Import modules
+Import-Module Az.Accounts, Az.Resources, Az.Databricks, Az.KeyVault -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'DatabricksHelper.psm1') -Force -ErrorAction Stop
+
+# Ensure output folder
+$OutputDir = Ensure-Dir -Path $OutputDir
+
+# Authenticate to Azure
+if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
+    throw "Azure connection failed."
+}
+
+# Build Custodian: adh_group OR adh_group_adh_sub_group
+$Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+    $adh_group
+} else {
+    "${adh_group}_${adh_sub_group}"
+}
+
+# Environments to check
+# nonprd => dev, tst, stg
+# prd    => prd
+$envsToCheck = if ($adh_subscription_type -eq 'prd') {
+    @('prd')
+} else {
+    @('dev', 'tst', 'stg')
+}
+
+# Resolve subscriptions for this adh_group / env type
+$subs = Resolve-DbSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+
+# Result containers
+$workspaceResults   = @()
+$workspacePermResults = @()
+$sqlWhResults       = @()
+$sqlWhPermResults   = @()
+$catalogListResults = @()
+$catalogPermResults = @()
+$extLocResults      = @()
+$extLocPermResults  = @()
+
+foreach ($sub in $subs) {
+
+    # Set subscription context
+    Set-ScContext -Subscription $sub
+
+    foreach ($env in $envsToCheck) {
+
+        # Key Vault per env
+        $keyVaultNameInfra = "ADH-$Custodian-Infra-KV-$env"
+        $DatabricksPat = $null
+        $workspaceUrl  = $null
+        $workspaceId   = $null
+
+        # Get PAT from KV (optional but needed for Databricks API calls)
+        $patSecretName = "SPN-TOKEN-CUSTODIAN-GEN"
+        try {
+            $tokenSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $patSecretName -ErrorAction Stop
+            $DatabricksPat = $tokenSecret.SecretValueText
+            Write-Host "Retrieved Databricks PAT from Key Vault: $keyVaultNameInfra" -ForegroundColor Cyan
+        }
+        catch {
+            Write-Warning "Failed to retrieve Databricks PAT from '$keyVaultNameInfra' (env '$env'): $_"
+        }
+
+        # Get Workspace URL & ID from KV
+        try {
+            $wsUrlSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name 'DATABRICKS-WORKSAPCE-URL' -ErrorAction Stop
+            $workspaceUrl = $wsUrlSecret.SecretValueText
+        }
+        catch {
+            Write-Warning "Failed to retrieve DATABRICKS-WORKSAPCE-URL from '$keyVaultNameInfra' (env '$env'): $_"
+        }
+
+        try {
+            $wsIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name 'DATABRICKS-WORKSAPCE-ID' -ErrorAction Stop
+            $workspaceId = $wsIdSecret.SecretValueText
+        }
+        catch {
+            Write-Warning "Failed to retrieve DATABRICKS-WORKSAPCE-ID from '$keyVaultNameInfra' (env '$env'): $_"
+        }
+
+        # If no URL, we cannot call Databricks APIs – but still record that it's missing
+        if ([string]::IsNullOrWhiteSpace($workspaceUrl)) {
+            $workspaceResults += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                SubscriptionId   = $sub.Id
+                Env              = $env
+                WorkspaceName    = "ADH_${Custodian}_${env}"
+                WorkspaceId      = $workspaceId
+                WorkspaceUrl     = ''
+                State            = 'MissingUrlInKeyVault'
+                Location         = ''
+                KeyVaultName     = $keyVaultNameInfra
+                adh_group        = $adh_group
+                adh_sub_group    = $adh_sub_group
+                BranchName       = $BranchName
+            }
+            Write-Warning "Workspace URL is empty for Custodian '$Custodian', env '$env' in '$keyVaultNameInfra' – skipping Databricks API calls."
+            continue
+        }
+
+        # Derive a logical workspace name (for reporting)
+        $workspaceName = "ADH_${Custodian}_${env}"
+
+        # Record workspace entry
+        $workspaceResults += [pscustomobject]@{
+            SubscriptionName = $sub.Name
+            SubscriptionId   = $sub.Id
+            Env              = $env
+            WorkspaceName    = $workspaceName
+            WorkspaceId      = $workspaceId
+            WorkspaceUrl     = $workspaceUrl
+            State            = 'ConfiguredInKeyVault'
+            Location         = ''              # Not available from KV; leave blank or extend if you store it
+            KeyVaultName     = $keyVaultNameInfra
+            adh_group        = $adh_group
+            adh_sub_group    = $adh_sub_group
+            BranchName       = $BranchName
+        }
+
+        if (-not $DatabricksPat) {
+            Write-Warning "No Databricks PAT available for Custodian '$Custodian', env '$env' – skipping Databricks API calls."
+            continue
+        }
+
+        #
+        # Workspace permissions
+        #
+        try {
+            $perm = Get-DbWorkspacePermissions -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
+
+            foreach ($ace in $perm.access_control_list) {
+
+                $principalName = $ace.user_name ?? $ace.group_name ?? $ace.service_principal_name
+                $principalType = if ($ace.user_name) {
+                    'user'
+                }
+                elseif ($ace.group_name) {
+                    'group'
+                }
+                else {
+                    'service_principal'
+                }
+
+                foreach ($p in $ace.all_permissions) {
+                    $workspacePermResults += [pscustomobject]@{
+                        SubscriptionName = $sub.Name
+                        SubscriptionId   = $sub.Id
+                        Env              = $env
+                        WorkspaceName    = $workspaceName
+                        PrincipalType    = $principalType
+                        PrincipalName    = $principalName
+                        PermissionLevel  = $p.permission_level
+                        Inherited        = $p.inherited
+                        adh_group        = $adh_group
+                        adh_sub_group    = $adh_sub_group
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Warning "Failed to fetch workspace permissions for '$workspaceName': $_"
+        }
+
+        #
+        # SQL Warehouses and permissions
+        #
+        try {
+            $whs = Get-DbWarehouses -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
+
+            foreach ($wh in $whs.warehouses) {
+                $sqlWhResults += [pscustomobject]@{
+                    SubscriptionName = $sub.Name
+                    SubscriptionId   = $sub.Id
+                    Env              = $env
+                    WorkspaceName    = $workspaceName
+                    WarehouseId      = $wh.id
+                    WarehouseName    = $wh.name
+                    ClusterSize      = $wh.cluster_size
+                    State            = $wh.state
+                    AutoStopMinutes  = $wh.auto_stop_mins
+                    Tags             = ($wh.tags | ConvertTo-Json -Compress)
+                    adh_group        = $adh_group
+                    adh_sub_group    = $adh_sub_group
+                }
+
+                try {
+                    $permWh = Get-DbWarehousePermissions -WorkspaceUrl $workspaceUrl -WarehouseId $wh.id -DatabricksPat $DatabricksPat
+
+                    foreach ($ace in $permWh.access_control_list) {
+                        $principalName = $ace.user_name ?? $ace.group_name ?? $ace.service_principal_name
+                        $principalType = if ($ace.user_name) {
+                            'user'
+                        }
+                        elseif ($ace.group_name) {
+                            'group'
+                        }
+                        else {
+                            'service_principal'
+                        }
+
+                        foreach ($p in $ace.all_permissions) {
+                            $sqlWhPermResults += [pscustomobject]@{
+                                SubscriptionName = $sub.Name
+                                SubscriptionId   = $sub.Id
+                                Env              = $env
+                                WorkspaceName    = $workspaceName
+                                WarehouseId      = $wh.id
+                                WarehouseName    = $wh.name
+                                PrincipalType    = $principalType
+                                PrincipalName    = $principalName
+                                PermissionLevel  = $p.permission_level
+                                Inherited        = $p.inherited
+                                adh_group        = $adh_group
+                                adh_sub_group    = $adh_sub_group
+                            }
+                        }
+                    }
+                }
+                catch {
+                    Write-Warning "Failed to fetch warehouse permissions for '$($wh.name)': $_"
+                }
+            }
+        }
+        catch {
+            Write-Warning "Failed to list SQL warehouses for '$workspaceName': $_"
+        }
+
+        #
+        # Catalogs and permissions
+        #
+        try {
+            $cats = Get-DbCatalogsList -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
+
+            foreach ($cat in $cats.catalogs) {
+                $catalogListResults += [pscustomobject]@{
+                    SubscriptionName = $sub.Name
+                    SubscriptionId   = $sub.Id
+                    Env              = $env
+                    WorkspaceName    = $workspaceName
+                    CatalogName      = $cat.name
+                    CatalogType      = $cat.catalog_type
+                    Comment          = $cat.comment
+                    Properties       = ($cat.properties | ConvertTo-Json -Compress)
+                    adh_group        = $adh_group
+                    adh_sub_group    = $adh_sub_group
+                }
+
+                try {
+                    $permCat = Get-DbCatalogPermissions -WorkspaceUrl $workspaceUrl -CatalogName $cat.name -DatabricksPat $DatabricksPat
+
+                    foreach ($entry in $permCat.privilege_assignments) {
+                        $catalogPermResults += [pscustomobject]@{
+                            SubscriptionName = $sub.Name
+                            SubscriptionId   = $sub.Id
+                            Env              = $env
+                            WorkspaceName    = $workspaceName
+                            CatalogName      = $cat.name
+                            PrincipalName    = $entry.principal
+                            Privileges       = ($entry.privileges -join ',')
+                            adh_group        = $adh_group
+                            adh_sub_group    = $adh_sub_group
+                        }
+                    }
+                }
+                catch {
+                    Write-Warning "Failed to fetch catalog permissions for '$($cat.name)': $_"
+                }
+            }
+        }
+        catch {
+            Write-Warning "Failed to list catalogs for '$workspaceName': $_"
+        }
+
+        #
+        # External Locations and permissions
+        #
+        try {
+            $extLocs = Get-DbExternalLocationsList -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
+
+            foreach ($loc in $extLocs.external_locations) {
+                $extLocResults += [pscustomobject]@{
+                    SubscriptionName = $sub.Name
+                    SubscriptionId   = $sub.Id
+                    Env              = $env
+                    WorkspaceName    = $workspaceName
+                    ExternalLocation = $loc.name
+                    Url              = $loc.url
+                    CredentialName   = $loc.credential_name
+                    Comment          = $loc.comment
+                    adh_group        = $adh_group
+                    adh_sub_group    = $adh_sub_group
+                }
+
+                try {
+                    $permLoc = Get-DbExternalLocationPermissions -WorkspaceUrl $workspaceUrl -Name $loc.name -DatabricksPat $DatabricksPat
+
+                    foreach ($entry in $permLoc.privilege_assignments) {
+                        $extLocPermResults += [pscustomobject]@{
+                            SubscriptionName = $sub.Name
+                            SubscriptionId   = $sub.Id
+                            Env              = $env
+                            WorkspaceName    = $workspaceName
+                            ExternalLocation = $loc.name
+                            PrincipalName    = $entry.principal
+                            Privileges       = ($entry.privileges -join ',')
+                            adh_group        = $adh_group
+                            adh_sub_group    = $adh_sub_group
+                        }
+                    }
+                }
+                catch {
+                    Write-Warning "Failed to fetch external location permissions for '$($loc.name)': $_"
+                }
+            }
+        }
+        catch {
+            Write-Warning "Failed to list external locations for '$workspaceName': $_"
+        }
+    }
+}
+
+#
+# Export data to CSV and HTML (only if we have rows)
+#
+$csvWs = $null
+$csvWsPerm = $null
+$csvWh = $null
+$csvWhPerm = $null
+$csvCatList = $null
+$csvCatPerm = $null
+$csvExt = $null
+$csvExtPerm = $null
+
+if ($workspaceResults.Count -gt 0) {
+    $csvWs = New-StampedPath -BaseDir $OutputDir -Prefix ("db_ws*{0}*{1}" -f $adh_group, $adh_subscription_type)
+    Write-CsvSafe -Rows $workspaceResults -Path $csvWs
+    Convert-CsvToHtml -CsvPath $csvWs -HtmlPath ($csvWs -replace '.csv$', '.html') -Title "Databricks Workspaces ($adh_group / $adh_subscription_type) $BranchName"
+} else {
+    Write-Warning "No workspace results collected – skipping workspace CSV export."
+}
+
+if ($workspacePermResults.Count -gt 0) {
+    $csvWsPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_ws_perms*{0}*{1}" -f $adh_group, $adh_subscription_type)
+    Write-CsvSafe -Rows $workspacePermResults -Path $csvWsPerm
+}
+
+if ($sqlWhResults.Count -gt 0) {
+    $csvWh = New-StampedPath -BaseDir $OutputDir -Prefix ("db_sqlwh*{0}*{1}" -f $adh_group, $adh_subscription_type)
+    Write-CsvSafe -Rows $sqlWhResults -Path $csvWh
+}
+
+if ($sqlWhPermResults.Count -gt 0) {
+    $csvWhPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_sqlwh_perms*{0}*{1}" -f $adh_group, $adh_subscription_type)
+    Write-CsvSafe -Rows $sqlWhPermResults -Path $csvWhPerm
+}
+
+if ($catalogListResults.Count -gt 0) {
+    $csvCatList = New-StampedPath -BaseDir $OutputDir -Prefix ("db_catalogs*{0}*{1}" -f $adh_group, $adh_subscription_type)
+    Write-CsvSafe -Rows $catalogListResults -Path $csvCatList
+}
+
+if ($catalogPermResults.Count -gt 0) {
+    $csvCatPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_catalog_perms*{0}*{1}" -f $adh_group, $adh_subscription_type)
+    Write-CsvSafe -Rows $catalogPermResults -Path $csvCatPerm
+}
+
+if ($extLocResults.Count -gt 0) {
+    $csvExt = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc*{0}*{1}" -f $adh_group, $adh_subscription_type)
+    Write-CsvSafe -Rows $extLocResults -Path $csvExt
+}
+
+if ($extLocPermResults.Count -gt 0) {
+    $csvExtPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc_perms*{0}_{1}" -f $adh_group, $adh_subscription_type)
+    Write-CsvSafe -Rows $extLocPermResults -Path $csvExtPerm
+}
+
+Write-Host "Databricks inventory scan completed." -ForegroundColor Green
+
+if ($csvWs)      { Write-Host "Workspace CSV           : $csvWs" }
+if ($csvWsPerm)  { Write-Host "Workspace perms CSV     : $csvWsPerm" }
+if ($csvWh)      { Write-Host "SQL Warehouses CSV      : $csvWh" }
+if ($csvWhPerm)  { Write-Host "SQL Warehouse perms CSV : $csvWhPerm" }
+if ($csvCatList) { Write-Host "Catalog list CSV        : $csvCatList" }
+if ($csvCatPerm) { Write-Host "Catalog perms CSV       : $csvCatPerm" }
+if ($csvExt)     { Write-Host "External locations CSV  : $csvExt" }
+if ($csvExtPerm) { Write-Host "Ext loc perms CSV       : $csvExtPerm" }
