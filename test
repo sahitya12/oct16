@@ -28,8 +28,6 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # Build Custodian
-# - If adh_sub_group is null/empty -> Custodian = adh_group
-# - Else                        -> Custodian = adh_group_adh_sub_group
 $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 } else {
@@ -39,7 +37,7 @@ $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
 # Environments
 $envsToCheck = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev', 'tst', 'stg') }
 
-# Subscriptions to scan (your helper)
+# Subscriptions to scan
 $subs = Resolve-DbSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 
 # -------------------------------------------------------
@@ -70,8 +68,13 @@ foreach ($sub in $subs) {
         $DatabricksPat        = $null
         $workspaceUrl         = $null
         $workspaceId          = $null
+        $workspaceState       = $null
+        $workspaceSource      = $null
         $DbSpnClientId        = $null
         $DbSpnClientSecret    = $null
+
+        # Logical workspace name (as used in Azure)
+        $workspaceName = "ADH_${Custodian}_${env}"
 
         # ---------------------------------------------------
         # 0. Gen_SPN client ID & secret from ADH-<Custodian>-KV-<env>
@@ -84,18 +87,18 @@ foreach ($sub in $subs) {
         try {
             $genSpnIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameCust -Name $genSpnBaseName -ErrorAction Stop
             $DbSpnClientId  = $genSpnIdSecret.SecretValueText
-            Write-Host "INFO: Retrieved Gen_SPN ClientId from '$keyVaultNameCust' ($env) name '$genSpnBaseName'" -ForegroundColor Cyan
+            Write-Host "INFO: Gen_SPN ClientId from '$keyVaultNameCust' ($env) name '$genSpnBaseName'" -ForegroundColor Cyan
         } catch {
-            Write-Warning "Failed to retrieve Gen_SPN ClientId '$genSpnBaseName' from '$keyVaultNameCust' ($env): $_"
+            Write-Warning "Gen_SPN ClientId '$genSpnBaseName' not found in '$keyVaultNameCust' ($env): $_"
         }
 
         try {
             $genSpnSecretName = $genSpnBaseName + "-Secret"
             $genSpnSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameCust -Name $genSpnSecretName -ErrorAction Stop
             $DbSpnClientSecret = $genSpnSecret.SecretValueText
-            Write-Host ("INFO: Retrieved Gen_SPN ClientSecret from '{0}' ({1}) name '{2}' (len={3})" -f $keyVaultNameCust, $env, $genSpnSecretName, $DbSpnClientSecret.Length) -ForegroundColor Cyan
+            Write-Host ("INFO: Gen_SPN ClientSecret from '{0}' ({1}) name '{2}' (len={3})" -f $keyVaultNameCust, $env, $genSpnSecretName, $DbSpnClientSecret.Length) -ForegroundColor Cyan
         } catch {
-            Write-Warning "Failed to retrieve Gen_SPN ClientSecret '$genSpnSecretName' from '$keyVaultNameCust' ($env): $_"
+            Write-Warning "Gen_SPN ClientSecret '$genSpnSecretName' not found in '$keyVaultNameCust' ($env): $_"
         }
 
         # ---------------------------------------------------
@@ -106,9 +109,9 @@ foreach ($sub in $subs) {
         try {
             $tokenSecret   = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $patSecretName -ErrorAction Stop
             $DatabricksPat = $tokenSecret.SecretValueText
-            Write-Host "INFO: Retrieved Databricks PAT from '$keyVaultNameInfra' ($env)" -ForegroundColor Cyan
+            Write-Host "INFO: Databricks PAT from '$keyVaultNameInfra' ($env)" -ForegroundColor Cyan
         } catch {
-            Write-Warning "Failed to retrieve PAT '$patSecretName' from '$keyVaultNameInfra' ($env): $_"
+            Write-Warning "PAT '$patSecretName' not found in '$keyVaultNameInfra' ($env): $_"
         }
 
         # ---------------------------------------------------
@@ -120,108 +123,146 @@ foreach ($sub in $subs) {
         $idSecretNameTidy    = "DATABRICKS-WORKSPACE-ID"
         $idSecretNameTypos   = "DATABRICKS-WORKSAPCE-ID"
 
-        # URL
+        # URL from KV
         try {
             $wsUrlSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTidy -ErrorAction Stop
             $workspaceUrl = $wsUrlSecret.SecretValueText
-            Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTidy' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
+            if ($workspaceUrl -ne $null) {
+                Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTidy' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
+            }
+            $workspaceSource = 'KeyVault'
         } catch {
-            Write-Warning "Failed to retrieve $urlSecretNameTidy from '$keyVaultNameInfra' ($env): $_"
+            Write-Warning "URL secret '$urlSecretNameTidy' not found in '$keyVaultNameInfra' ($env): $_"
             try {
                 $wsUrlSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTypos -ErrorAction Stop
                 $workspaceUrl = $wsUrlSecret.SecretValueText
-                Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTypos' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
+                if ($workspaceUrl -ne $null) {
+                    Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTypos' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
+                }
+                $workspaceSource = 'KeyVault'
             } catch {
-                Write-Warning "Failed to retrieve $urlSecretNameTypos from '$keyVaultNameInfra' ($env) as well: $_"
+                Write-Warning "URL secret '$urlSecretNameTypos' not found in '$keyVaultNameInfra' ($env) as well: $_"
             }
         }
 
-        # ID
+        # ID from KV
         try {
             $wsIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $idSecretNameTidy -ErrorAction Stop
             $workspaceId = $wsIdSecret.SecretValueText
         } catch {
-            Write-Warning "Failed to retrieve $idSecretNameTidy from '$keyVaultNameInfra' ($env): $_"
+            Write-Warning "ID secret '$idSecretNameTidy' not found in '$keyVaultNameInfra' ($env): $_"
             try {
                 $wsIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $idSecretNameTypos -ErrorAction Stop
                 $workspaceId = $wsIdSecret.SecretValueText
             } catch {
-                Write-Warning "Failed to retrieve $idSecretNameTypos from '$keyVaultNameInfra' ($env) as well: $_"
+                Write-Warning "ID secret '$idSecretNameTypos' not found in '$keyVaultNameInfra' ($env) as well: $_"
             }
         }
 
-        $workspaceName = "ADH_${Custodian}_${env}"
+        # ---------------------------------------------------
+        # 3. Fallback: if URL missing/empty in KV, try Get-AzDatabricksWorkspace
+        # ---------------------------------------------------
+        if ($null -eq $workspaceUrl -or [string]::IsNullOrWhiteSpace($workspaceUrl)) {
+            Write-Host "INFO: Workspace URL not usable from KV for '$workspaceName' ($env). Trying Get-AzDatabricksWorkspace..." -ForegroundColor DarkYellow
+            try {
+                $azWorkspaces = Get-AzDatabricksWorkspace -ErrorAction Stop
+                $wsFromAz = $azWorkspaces | Where-Object { $_.Name -eq $workspaceName }
+
+                if ($wsFromAz) {
+                    $workspaceUrl = $wsFromAz.WorkspaceUrl
+                    if (-not $workspaceId) {
+                        $workspaceId = $wsFromAz.Id
+                    }
+                    $workspaceSource = 'WorkspaceResource'
+                    Write-Host "INFO: Workspace URL resolved from Azure resource for '$workspaceName' ($env): [$workspaceUrl]" -ForegroundColor Green
+                } else {
+                    Write-Warning "Databricks workspace resource '$workspaceName' not found in subscription '$($sub.Name)'."
+                }
+            } catch {
+                Write-Warning "Get-AzDatabricksWorkspace failed in subscription '$($sub.Name)' ($env): $_"
+            }
+        }
 
         # ---------------------------------------------------
-        # 3. Handle URL not found / empty
+        # 4. Decide final state for URL
         # ---------------------------------------------------
         if ($null -eq $workspaceUrl) {
+            $workspaceState = 'UrlNotFoundAnywhere'
             $workspaceResults += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                SubscriptionId   = $sub.Id
-                Env              = $env
-                WorkspaceName    = $workspaceName
-                WorkspaceId      = $workspaceId
-                WorkspaceUrl     = ''
-                State            = 'UrlSecretNotFound'
-                Location         = ''
-                KeyVaultNameInfra= $keyVaultNameInfra
-                KeyVaultNameCust = $keyVaultNameCust
-                GenSpnClientId   = $DbSpnClientId
-                adh_group        = $adh_group
-                adh_sub_group    = $adh_sub_group
-                BranchName       = $BranchName
+                SubscriptionName   = $sub.Name
+                SubscriptionId     = $sub.Id
+                Env                = $env
+                WorkspaceName      = $workspaceName
+                WorkspaceId        = $workspaceId
+                WorkspaceUrl       = ''
+                State              = $workspaceState
+                WorkspaceSource    = $workspaceSource
+                KeyVaultNameInfra  = $keyVaultNameInfra
+                KeyVaultNameCust   = $keyVaultNameCust
+                GenSpnClientId     = $DbSpnClientId
+                adh_group          = $adh_group
+                adh_sub_group      = $adh_sub_group
+                BranchName         = $BranchName
             }
-            Write-Warning "Workspace URL secret not found for Custodian '$Custodian', env '$env' in '$keyVaultNameInfra' – skipping Databricks API calls."
+            Write-Warning "Workspace URL not found in KV or Azure for '$workspaceName' ($env) – skipping Databricks API calls."
             continue
         }
 
         if ([string]::IsNullOrWhiteSpace($workspaceUrl)) {
+            $workspaceState = 'EmptyUrlInKeyVault'
             $workspaceResults += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                SubscriptionId   = $sub.Id
-                Env              = $env
-                WorkspaceName    = $workspaceName
-                WorkspaceId      = $workspaceId
-                WorkspaceUrl     = ''
-                State            = 'EmptyUrlInKeyVault'
-                Location         = ''
-                KeyVaultNameInfra= $keyVaultNameInfra
-                KeyVaultNameCust = $keyVaultNameCust
-                GenSpnClientId   = $DbSpnClientId
-                adh_group        = $adh_group
-                adh_sub_group    = $adh_sub_group
-                BranchName       = $BranchName
+                SubscriptionName   = $sub.Name
+                SubscriptionId     = $sub.Id
+                Env                = $env
+                WorkspaceName      = $workspaceName
+                WorkspaceId        = $workspaceId
+                WorkspaceUrl       = ''
+                State              = $workspaceState
+                WorkspaceSource    = $workspaceSource
+                KeyVaultNameInfra  = $keyVaultNameInfra
+                KeyVaultNameCust   = $keyVaultNameCust
+                GenSpnClientId     = $DbSpnClientId
+                adh_group          = $adh_group
+                adh_sub_group      = $adh_sub_group
+                BranchName         = $BranchName
             }
-            Write-Warning "Workspace URL is empty/whitespace for Custodian '$Custodian', env '$env' in '$keyVaultNameInfra' – skipping Databricks API calls."
+            Write-Warning "Workspace URL is empty/whitespace for '$workspaceName' ($env) – skipping Databricks API calls."
             continue
         }
 
-        # Non-empty URL → configured, we also record Gen_SPN client ID
+        # Non-empty URL => configured (from either KV or resource)
+        if ($workspaceSource -eq 'KeyVault') {
+            $workspaceState = 'ConfiguredFromKeyVault'
+        } elseif ($workspaceSource -eq 'WorkspaceResource') {
+            $workspaceState = 'ConfiguredFromWorkspaceResource'
+        } else {
+            $workspaceState = 'Configured'
+        }
+
         $workspaceResults += [pscustomobject]@{
-            SubscriptionName = $sub.Name
-            SubscriptionId   = $sub.Id
-            Env              = $env
-            WorkspaceName    = $workspaceName
-            WorkspaceId      = $workspaceId
-            WorkspaceUrl     = $workspaceUrl
-            State            = 'ConfiguredInKeyVault'
-            Location         = ''
-            KeyVaultNameInfra= $keyVaultNameInfra
-            KeyVaultNameCust = $keyVaultNameCust
-            GenSpnClientId   = $DbSpnClientId
-            adh_group        = $adh_group
-            adh_sub_group    = $adh_sub_group
-            BranchName       = $BranchName
+            SubscriptionName   = $sub.Name
+            SubscriptionId     = $sub.Id
+            Env                = $env
+            WorkspaceName      = $workspaceName
+            WorkspaceId        = $workspaceId
+            WorkspaceUrl       = $workspaceUrl
+            State              = $workspaceState
+            WorkspaceSource    = $workspaceSource
+            KeyVaultNameInfra  = $keyVaultNameInfra
+            KeyVaultNameCust   = $keyVaultNameCust
+            GenSpnClientId     = $DbSpnClientId
+            adh_group          = $adh_group
+            adh_sub_group      = $adh_sub_group
+            BranchName         = $BranchName
         }
 
         if (-not $DatabricksPat) {
-            Write-Warning "No Databricks PAT available for Custodian '$Custodian', env '$env' – skipping Databricks API calls."
+            Write-Warning "No Databricks PAT available for '$workspaceName' ($env) – skipping Databricks API calls."
             continue
         }
 
         # ---------------------------------------------------
-        # 4. Workspace Permissions
+        # 5. Workspace Permissions
         # ---------------------------------------------------
         try {
             $perm = Get-DbWorkspacePermissions -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
@@ -246,11 +287,11 @@ foreach ($sub in $subs) {
                 }
             }
         } catch {
-            Write-Warning "Failed to fetch workspace permissions for '$workspaceName': $_"
+            Write-Warning "Failed to fetch workspace permissions for '$workspaceName' ($env): $_"
         }
 
         # ---------------------------------------------------
-        # 5. SQL Warehouses & Permissions
+        # 6. SQL Warehouses & Permissions
         # ---------------------------------------------------
         try {
             $whs = Get-DbWarehouses -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
@@ -294,15 +335,15 @@ foreach ($sub in $subs) {
                         }
                     }
                 } catch {
-                    Write-Warning "Failed to fetch warehouse permissions for '$($wh.name)': $_"
+                    Write-Warning "Failed to fetch warehouse permissions for '$($wh.name)' ($env): $_"
                 }
             }
         } catch {
-            Write-Warning "Failed to list SQL warehouses for '$workspaceName': $_"
+            Write-Warning "Failed to list SQL warehouses for '$workspaceName' ($env): $_"
         }
 
         # ---------------------------------------------------
-        # 6. Catalogs & Permissions
+        # 7. Catalogs & Permissions
         # ---------------------------------------------------
         try {
             $cats = Get-DbCatalogsList -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
@@ -335,15 +376,15 @@ foreach ($sub in $subs) {
                         }
                     }
                 } catch {
-                    Write-Warning "Failed to fetch catalog permissions for '$($cat.name)': $_"
+                    Write-Warning "Failed to fetch catalog permissions for '$($cat.name)' ($env): $_"
                 }
             }
         } catch {
-            Write-Warning "Failed to list catalogs for '$workspaceName': $_"
+            Write-Warning "Failed to list catalogs for '$workspaceName' ($env): $_"
         }
 
         # ---------------------------------------------------
-        # 7. External Locations & Permissions
+        # 8. External Locations & Permissions
         # ---------------------------------------------------
         try {
             $extLocs = Get-DbExternalLocationsList -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
@@ -376,11 +417,11 @@ foreach ($sub in $subs) {
                         }
                     }
                 } catch {
-                    Write-Warning "Failed to fetch external location permissions for '$($loc.name)': $_"
+                    Write-Warning "Failed to fetch external location permissions for '$($loc.name)' ($env): $_"
                 }
             }
         } catch {
-            Write-Warning "Failed to list external locations for '$workspaceName': $_"
+            Write-Warning "Failed to list external locations for '$workspaceName' ($env): $_"
         }
     }
 }
