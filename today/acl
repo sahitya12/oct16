@@ -15,3 +15,6 @@ paz_app_access_ADH_NHH_Developers → <GUID_Developers> → r-x
 paz_app_access_ADH_NHH_QA_Testers → <GUID_QA_Testers> → r-x
 
 paz_app_access_ADH_NHH_Leads → <GUID_Leads> → r-x
+
+
+az storage fs access set-recursive --acl "user:<GUID_Terraform_SPN>:r-x,user:<GUID_ADO_SPN>:r-x,group:<GUID_Analysts>:r-x,group:<GUID_DataOps>:r-x,group:<GUID_Platform_Admins>:rwx,group:<GUID_Developers>:r-x,group:<GUID_QA_Testers>:r-x,group:<GUID_Leads>:r-x" --account-name adhnnhhadlsnonprd --filesystem tst --path "adh_nhh/operations/ingestion" --auth-mode login
