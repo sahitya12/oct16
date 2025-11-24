@@ -1,0 +1,198 @@
+trigger: none
+pr: none
+
+parameters:
+- name: adh_group
+  type: string
+  default: ''
+
+- name: adh_sub_group          # NEW – optional, but NOT used in agentName
+  type: string
+  default: ''
+
+- name: adh_subscription_type
+  type: string
+  default: nonprd
+  values: [nonprd, prd]
+
+- name: poolSuffix
+  type: string
+  default: '_agent1'
+  values: ['_agent1','_agent2','_agent3']
+
+- name: poolName
+  type: string
+  default: 'Self-Hosted-Pool'
+
+
+variables:
+# NOTE: adh_sub_group is intentionally NOT part of the agent name
+# Example: KTK_nonprd_agent1
+- name: agentName
+  value: ${{ format('{0}_{1}{2}', parameters.adh_group, parameters.adh_subscription_type, parameters.poolSuffix) }}
+
+
+stages:
+# -------------------------------------------------------
+# 1. Agent diagnostics
+# -------------------------------------------------------
+- stage: agent_injection_check
+  displayName: "Agent Parameter Injection and Diagnostics"
+  jobs:
+    - job: test_param_injection
+      displayName: "PowerShell Parameter and Environment Check"
+      pool:
+        name: ${{ parameters.poolName }}
+        demands:
+          - Agent.Name -equals ${{ variables.agentName }}
+
+      steps:
+        - checkout: self
+
+        # Diagnostic 1: Test for global parameter injection
+        - task: PowerShell@2
+          displayName: "Test Minimal PowerShell Script"
+          inputs:
+            targetType: 'inline'
+            pwsh: true
+            script: |
+              Write-Host "If this runs, agent is not injecting unwanted parameters."
+
+        # Diagnostic 2: List environment variables
+        - task: PowerShell@2
+          displayName: "List Environment Variables"
+          inputs:
+            targetType: 'inline'
+            pwsh: true
+            script: |
+              Write-Host "=== Agent Environment Variables ==="
+              Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize
+
+        # Diagnostic 3: List all possible profile/init scripts
+        - task: PowerShell@2
+          displayName: "List Profile and Init Scripts"
+          inputs:
+            targetType: 'inline'
+            pwsh: true
+            script: |
+              $paths = @(
+                "$env:USERPROFILE\Documents\WindowsPowerShell\profile.ps1",
+                "$env:USERPROFILE\Documents\PowerShell\profile.ps1",
+                "C:\agent\profile.ps1",
+                "C:\agent\init.ps1"
+              )
+              foreach ($path in $paths) {
+                if (Test-Path $path) {
+                  Write-Host "=== Found: $path ==="
+                  Get-Content $path
+                  Write-Host ""
+                }
+              }
+
+
+# -------------------------------------------------------
+# 2. RG Permissions
+# -------------------------------------------------------
+- template: stages/rg_permissions.stage.yml
+  parameters:
+    adh_group: ${{ parameters.adh_group }}
+    adh_sub_group: ${{ parameters.adh_sub_group }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ variables.agentName }}
+
+
+# -------------------------------------------------------
+# 3. RG Tags
+# -------------------------------------------------------
+- template: stages/rg_tags.stage.yml
+  parameters:
+    adh_group: ${{ parameters.adh_group }}
+    adh_sub_group: ${{ parameters.adh_sub_group }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ variables.agentName }}
+
+
+# -------------------------------------------------------
+# 4. Key Vault Secrets
+# -------------------------------------------------------
+- template: stages/kv_secrets.stage.yml
+  parameters:
+    adh_group: ${{ parameters.adh_group }}
+    adh_sub_group: ${{ parameters.adh_sub_group }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ variables.agentName }}
+
+
+# -------------------------------------------------------
+# 5. Key Vault Permissions
+# -------------------------------------------------------
+- template: stages/kv_permissions.stage.yml
+  parameters:
+    adh_group: ${{ parameters.adh_group }}
+    adh_sub_group: ${{ parameters.adh_sub_group }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ variables.agentName }}
+
+
+# -------------------------------------------------------
+# 6. Key Vault Firewall
+# -------------------------------------------------------
+- template: stages/kv_firewall.stage.yml
+  parameters:
+    adh_group: ${{ parameters.adh_group }}
+    adh_sub_group: ${{ parameters.adh_sub_group }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ variables.agentName }}
+
+
+# -------------------------------------------------------
+# 7. VNet / Network
+# -------------------------------------------------------
+- template: stages/vnet.stage.yml
+  parameters:
+    adh_group: ${{ parameters.adh_group }}
+    adh_sub_group: ${{ parameters.adh_sub_group }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ variables.agentName }}
+
+
+# -------------------------------------------------------
+# 8. Data Factory
+# -------------------------------------------------------
+- template: stages/adf.stage.yml
+  parameters:
+    adh_group: ${{ parameters.adh_group }}
+    adh_sub_group: ${{ parameters.adh_sub_group }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ variables.agentName }}
+
+
+# -------------------------------------------------------
+# 9. ADLS Validation
+# -------------------------------------------------------
+- template: stages/adls.stage.yml
+  parameters:
+    adh_group: ${{ parameters.adh_group }}
+    adh_sub_group: ${{ parameters.adh_sub_group }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ variables.agentName }}
+
+
+# -------------------------------------------------------
+# 10. Databricks Scan
+# -------------------------------------------------------
+- template: stages/databricks.stage.yml
+  parameters:
+    adh_group: ${{ parameters.adh_group }}
+    adh_sub_group: ${{ parameters.adh_sub_group }}
+    adh_subscription_type: ${{ parameters.adh_subscription_type }}
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ variables.agentName }}
