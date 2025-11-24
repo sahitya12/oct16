@@ -9,16 +9,19 @@ param(
     [string]$BranchName = ''
 )
 
+# -------------------------------------------------------
+# Imports & basic setup
+# -------------------------------------------------------
 Import-Module Az.Accounts, Az.Resources, Az.Storage -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
-Write-Host "DEBUG: TenantId=$TenantId"
-Write-Host "DEBUG: ClientId=$ClientId"
-Write-Host "DEBUG: adh_group=$adh_group"
-Write-Host "DEBUG: adh_subscription_type=$adh_subscription_type"
-Write-Host "DEBUG: InputCsvPath=$InputCsvPath"
-Write-Host "DEBUG: OutputDir=$OutputDir"
-Write-Host "DEBUG: BranchName=$BranchName"
+Write-Host "DEBUG: TenantId              = $TenantId"
+Write-Host "DEBUG: ClientId              = $ClientId"
+Write-Host "DEBUG: adh_group             = $adh_group"
+Write-Host "DEBUG: adh_subscription_type = $adh_subscription_type"
+Write-Host "DEBUG: InputCsvPath          = $InputCsvPath"
+Write-Host "DEBUG: OutputDir             = $OutputDir"
+Write-Host "DEBUG: BranchName            = $BranchName"
 
 Ensure-Dir -Path $OutputDir | Out-Null
 
@@ -32,13 +35,16 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
     throw "Azure connection failed."
 }
 
-# ----------------------------------------------------------------------
-# Get pipeline SPN objectId (used for temporary RBAC on Storage Accounts)
-# ----------------------------------------------------------------------
+# -------------------------------------------------------
+# Pipeline SPN objectId (for temporary RBAC on Storage)
+# -------------------------------------------------------
 $pipelineSp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
 $pipelineSpObjectId = $pipelineSp.Id
 Write-Host "Pipeline SPN ObjectId: $pipelineSpObjectId"
 
+# -------------------------------------------------------
+# Identity resolution cache
+# -------------------------------------------------------
 $script:IdentityCache = @{}
 
 function Resolve-IdentityObjectId {
@@ -50,11 +56,13 @@ function Resolve-IdentityObjectId {
 
     $id = $null
 
+    # 1) Try Entra group
     try {
         $grp = Get-AzADGroup -DisplayName $IdentityName -ErrorAction Stop
         if ($grp -and $grp.Id) { $id = $grp.Id }
     } catch {}
 
+    # 2) Try SPN by display name
     if (-not $id) {
         try {
             $sp = Get-AzADServicePrincipal -DisplayName $IdentityName -ErrorAction Stop
@@ -62,6 +70,7 @@ function Resolve-IdentityObjectId {
         } catch {}
     }
 
+    # 3) Try SPN by search string (prefix match)
     if (-not $id) {
         try {
             $sp2 = Get-AzADServicePrincipal -SearchString $IdentityName -ErrorAction Stop
@@ -69,9 +78,10 @@ function Resolve-IdentityObjectId {
         } catch {}
     }
 
+    # 4) If it's already a GUID, accept as-is
     if (-not $id) {
-        $guidRef = [ref]([Guid]::Empty)
-        if ([Guid]::TryParse($IdentityName, $guidRef)) {
+        $tmpGuid = [Guid]::Empty
+        if ([Guid]::TryParse($IdentityName, [ref]$tmpGuid)) {
             $id = $IdentityName
         }
     }
@@ -80,8 +90,10 @@ function Resolve-IdentityObjectId {
     return $id
 }
 
-# Helper: does an actual permission satisfy an expected one?
-# e.g. expected r-x is OK with actual rwx (superset)
+# -------------------------------------------------------
+# Permission comparison helper
+# -------------------------------------------------------
+# Check if actual permissions satisfy expected (e.g. rwx >= r-x)
 function Test-PermissionMatch {
     param(
         [Parameter(Mandatory = $true)][string]$Actual,
@@ -99,6 +111,8 @@ function Test-PermissionMatch {
     for ($i = 0; $i -lt 3; $i++) {
         $e = $Expected[$i]
         $a = $Actual[$i]
+
+        # if expected wants r/w/x, actual must have it
         if ($e -ne '-' -and $a -ne $e) {
             return $false
         }
@@ -106,26 +120,35 @@ function Test-PermissionMatch {
     return $true
 }
 
-$out = @()
+# -------------------------------------------------------
+# Main logic
+# -------------------------------------------------------
+$out  = @()
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
 foreach ($sub in $subs) {
+
     Set-ScContext -Subscription $sub
     Write-Host "Processing subscription: $($sub.Name) [$($sub.Id)]"
 
-    # track which storage accounts we gave temporary role on (per subscription)
+    # track Storage scopes where we temporarily add RBAC
     $assignedScopes = @()
 
     foreach ($r in $rows) {
 
+        # ------------------------------
+        # Expand placeholders from CSV
+        # ------------------------------
         $rgName       = ($r.ResourceGroupName  -replace '<Custodian>', $adh_group)
         $saName       = ($r.StorageAccountName -replace '<Cust>', $adh_group.ToLower()) -replace '<Custodian>', $adh_group
         $cont         = ($r.ContainerName      -replace '<Cust>', $adh_group.ToLower())
         $identityName = ($r.Identity           -replace '<Custodian>', $adh_group)
         $permType     = $r.PermissionType
 
-        # ---- storage account ----
+        # ------------------------------
+        # Locate Storage Account
+        # ------------------------------
         try {
             $sa = Get-AzStorageAccount -ResourceGroupName $rgName -Name $saName -ErrorAction Stop
         } catch {
@@ -143,18 +166,24 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # ---- temporary RBAC: Storage Blob Data Owner on that Storage Account ----
+        # ------------------------------
+        # Temp RBAC: Storage Blob Data Owner on this SA
+        # ------------------------------
         $scope = $sa.Id
         if ($assignedScopes -notcontains $scope) {
             try {
-                New-AzRoleAssignment -ObjectId $pipelineSpObjectId `
-                                     -RoleDefinitionName 'Storage Blob Data Owner' `
-                                     -Scope $scope `
-                                     -ErrorAction Stop | Out-Null
+                New-AzRoleAssignment `
+                    -ObjectId          $pipelineSpObjectId `
+                    -RoleDefinitionName 'Storage Blob Data Owner' `
+                    -Scope            $scope `
+                    -ErrorAction      Stop | Out-Null
+
                 Write-Host "Assigned Storage Blob Data Owner on $scope to pipeline SPN."
             } catch {
                 if ($_.Exception.Message -notmatch 'The role assignment already exists') {
                     Write-Warning "Failed to assign Storage Blob Data Owner on $scope: $($_.Exception.Message)"
+                } else {
+                    Write-Host "Storage Blob Data Owner already exists on $scope for pipeline SPN."
                 }
             }
             $assignedScopes += $scope
@@ -162,7 +191,9 @@ foreach ($sub in $subs) {
 
         $ctx = $sa.Context
 
-        # ---- container ----
+        # ------------------------------
+        # Container
+        # ------------------------------
         try {
             $container = Get-AzStorageContainer -Name $cont -Context $ctx -ErrorAction Stop
         } catch {
@@ -180,11 +211,14 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # ---- AccessPath / folder handling ----
+        # ------------------------------
+        # Access path / folder logic
+        # ------------------------------
         $accessPathRaw = $r.AccessPath
-        $accessPath = $accessPathRaw -replace '<Custodian>', $adh_group
-        $accessPath = $accessPath  -replace '<Cust>', $adh_group.ToLower()
+        $accessPath    = $accessPathRaw -replace '<Custodian>', $adh_group
+        $accessPath    = $accessPath    -replace '<Cust>',      $adh_group.ToLower()
 
+        # catalog shortcut -> /adh_<cust>
         if ($accessPath -match '^/?catalog') {
             if ($adh_group -eq 'KTK') {
                 $accessPath = $accessPath -replace '^/?catalog', '/adh_ktk'
@@ -193,6 +227,7 @@ foreach ($sub in $subs) {
             }
         }
 
+        # normalise slashes
         $accessPath = $accessPath -replace '/+', '/'
 
         $pathsToCheck = @()
@@ -202,8 +237,12 @@ foreach ($sub in $subs) {
             $pathsToCheck += $accessPath.TrimStart("/")
         }
 
+        # ------------------------------
+        # ACL check for each path
+        # ------------------------------
         foreach ($folderPath in $pathsToCheck) {
 
+            # resolve identity to objectId
             $objectId = Resolve-IdentityObjectId -IdentityName $identityName
             if (-not $objectId) {
                 $out += [pscustomobject]@{
@@ -221,14 +260,18 @@ foreach ($sub in $subs) {
             }
 
             try {
-                $params = @{ FileSystem = $cont; Context = $ctx; ErrorAction = 'Stop' }
+                $params = @{
+                    FileSystem = $cont
+                    Context    = $ctx
+                    ErrorAction = 'Stop'
+                }
                 if (-not [string]::IsNullOrWhiteSpace($folderPath)) {
                     $params['Path'] = $folderPath
                 }
 
                 $item = Get-AzDataLakeGen2Item @params
 
-                # Acl is a string like: "user::rwx,group::r-x,other::---,user:<guid>:r-x,mask::rwx"
+                # Acl example: "user::rwx,group::r-x,other::---,user:<guid>:r-x,mask::rwx"
                 $aclEntries = @()
                 if ($item.Acl) {
                     $aclEntries = $item.Acl -split ','
@@ -237,8 +280,8 @@ foreach ($sub in $subs) {
                 $parsedAcl = $aclEntries | ForEach-Object {
                     $parts = $_.Split(':')
                     [pscustomobject]@{
-                        Type        = $parts[0]              # user / group / other / mask
-                        Id          = if ($parts.Count -ge 3) { $parts[1] } else { '' }
+                        Type        = $parts[0]              # user/group/other/mask
+                        Id          = (if ($parts.Count -ge 3) { $parts[1] } else { '' })
                         Permissions = $parts[$parts.Count-1] # rwx/r-x/---
                     }
                 }
@@ -274,22 +317,27 @@ foreach ($sub in $subs) {
         }
     }
 
-    # ------------------------------------------------------------------
-    # Revoke temporary "Storage Blob Data Owner" assignments for this sub
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------
+    # Revoke temporary Storage Blob Data Owner assignments
+    # ---------------------------------------------------
     foreach ($scope in $assignedScopes | Select-Object -Unique) {
         try {
-            Remove-AzRoleAssignment -ObjectId $pipelineSpObjectId `
-                                    -RoleDefinitionName 'Storage Blob Data Owner' `
-                                    -Scope $scope `
-                                    -ErrorAction Stop | Out-Null
-            Write-Host "Revoked Storage Blob Data Owner on $scope from pipeline SPN."
+            Remove-AzRoleAssignment `
+                -ObjectId          $pipelineSpObjectId `
+                -RoleDefinitionName 'Storage Blob Data Owner' `
+                -Scope            $scope `
+                -ErrorAction      Stop | Out-Null
+
+            Write-Host "Removed Storage Blob Data Owner on $scope from pipeline SPN."
         } catch {
             Write-Warning "Failed to remove Storage Blob Data Owner on $scope: $($_.Exception.Message)"
         }
     }
 }
 
+# -------------------------------------------------------
+# Output
+# -------------------------------------------------------
 if (-not $out) {
     $out += [pscustomobject]@{
         SubscriptionName = ''
