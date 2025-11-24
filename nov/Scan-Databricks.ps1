@@ -2,13 +2,28 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string]$TenantId,
-    [Parameter(Mandatory)][string]$ClientId,
-    [Parameter(Mandatory)][string]$ClientSecret,
-    [Parameter(Mandatory)][string]$adh_group,
+    [Parameter(Mandatory)]
+    [string]$TenantId,
+
+    # Accept -ClientId and legacy -ApplicationId
+    [Parameter(Mandatory)]
+    [Alias('ApplicationId')]
+    [string]$ClientId,
+
+    [Parameter(Mandatory)]
+    [string]$ClientSecret,
+
+    [Parameter(Mandatory)]
+    [string]$adh_group,
+
     [string]$adh_sub_group = '',
-    [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
-    [Parameter(Mandatory)][string]$OutputDir,
+
+    [ValidateSet('nonprd','prd')]
+    [string]$adh_subscription_type = 'nonprd',
+
+    [Parameter(Mandatory)]
+    [string]$OutputDir,
+
     [string]$BranchName = ''
 )
 
@@ -20,7 +35,7 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'DatabricksHelper.psm1') -Force -ErrorAction Stop
 
 # -------------------------------------------------------
-# Prep: connect and basic derived values
+# Prep: connect & derived values
 # -------------------------------------------------------
 $OutputDir = Ensure-Dir -Path $OutputDir
 
@@ -28,7 +43,7 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
     throw "Azure connection failed."
 }
 
-# Get SPN object id (for info / future RBAC if needed)
+# Get SPN object id (info only)
 $sp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
 $spObjectId = $sp.Id
 Write-Host "INFO: Pipeline SPN ObjectId: $spObjectId" -ForegroundColor Cyan
@@ -42,7 +57,6 @@ $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     "${adh_group}_${adh_sub_group}"
 }
 
-# Environments and subscriptions
 $envsToCheck = Get-DbEnvsForType -Environment $adh_subscription_type
 $subs        = Resolve-DbSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 
@@ -51,9 +65,10 @@ Write-Host "INFO: Envs      = $($envsToCheck -join ', ')" -ForegroundColor Cyan
 Write-Host "INFO: Subs      = $($subs.Name -join ', ')" -ForegroundColor Cyan
 
 # -------------------------------------------------------
-# Get Databricks AAD access token using pipeline SPN
+# Databricks AAD token (pipeline SPN)
 # -------------------------------------------------------
-$databricksResourceId = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"  # Azure Databricks resource
+# Azure Databricks resource ID (multi-tenant app)
+$databricksResourceId = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
 $DatabricksToken = (Get-AzAccessToken -TenantId $TenantId `
                                       -ApplicationId $ClientId `
@@ -96,9 +111,11 @@ foreach ($sub in $subs) {
         $DbSpnClientId      = $null
         $DbSpnClientSecret  = $null
 
-        # ---------------------------------------------------
+        # -----------------------------------------------
         # Gen_SPN info from Custodian KV (for reporting)
-        # ---------------------------------------------------
+        #   Secret name: ADH_<Custodian>_Gen_SPN_<env>
+        #   Secret name for password: ADH_<Custodian>_Gen_SPN_<env>-Secret
+        # -----------------------------------------------
         $genSpnBaseName = "ADH_{0}_Gen_SPN_{1}" -f $Custodian, $env
 
         try {
@@ -118,12 +135,13 @@ foreach ($sub in $subs) {
             Write-Warning "Gen_SPN ClientSecret '$genSpnSecretName' not found in '$keyVaultNameCust' ($env): $_"
         }
 
-        # ---------------------------------------------------
+        # -----------------------------------------------
         # Workspace URL and ID from Infra KV
-        # Supports spelling variants:
-        #   DATABRICKS-WORKSPACE-URL / DATABRICKS-WORKSAPCE-URL
-        #   DATABRICKS-WORKSPACE-ID  / DATABRICKS-WORKSAPCE-ID
-        # ---------------------------------------------------
+        #   URL secret (tidy):      DATABRICKS-WORKSPACE-URL
+        #   URL secret (typo):      DATABRICKS-WORKSAPCE-URL
+        #   ID secret (tidy):       DATABRICKS-WORKSPACE-ID
+        #   ID secret (typo):       DATABRICKS-WORKSAPCE-ID
+        # -----------------------------------------------
         $urlSecretNameTidy   = "DATABRICKS-WORKSPACE-URL"
         $urlSecretNameTypos  = "DATABRICKS-WORKSAPCE-URL"
         $idSecretNameTidy    = "DATABRICKS-WORKSPACE-ID"
@@ -134,7 +152,7 @@ foreach ($sub in $subs) {
             $wsUrlSecret  = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTidy -ErrorAction Stop
             $workspaceUrl = $wsUrlSecret.SecretValueText
             if ($workspaceUrl) {
-                Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTidy' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
+                Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTidy' -> [$workspaceUrl]" -ForegroundColor Yellow
             }
         } catch {
             Write-Warning "URL secret '$urlSecretNameTidy' not found in '$keyVaultNameInfra' ($env): $_"
@@ -142,7 +160,7 @@ foreach ($sub in $subs) {
                 $wsUrlSecret  = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTypos -ErrorAction Stop
                 $workspaceUrl = $wsUrlSecret.SecretValueText
                 if ($workspaceUrl) {
-                    Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTypos' -> len=$($workspaceUrl.Length) value=[$workspaceUrl]" -ForegroundColor Yellow
+                    Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTypos' -> [$workspaceUrl]" -ForegroundColor Yellow
                 }
             } catch {
                 Write-Warning "URL secret '$urlSecretNameTypos' not found in '$keyVaultNameInfra' ($env) as well: $_"
@@ -163,9 +181,9 @@ foreach ($sub in $subs) {
             }
         }
 
-        # ---------------------------------------------------
-        # Decide URL state and record basic workspace row
-        # ---------------------------------------------------
+        # -----------------------------------------------
+        # Workspace state rows
+        # -----------------------------------------------
         if ($null -eq $workspaceUrl) {
             # Secret not found at all
             $workspaceResults += [pscustomobject]@{
@@ -188,7 +206,7 @@ foreach ($sub in $subs) {
         }
 
         if ([string]::IsNullOrWhiteSpace($workspaceUrl)) {
-            # Secret exists but empty or whitespace
+            # Secret exists but empty / whitespace
             $workspaceResults += [pscustomobject]@{
                 SubscriptionName   = $sub.Name
                 SubscriptionId     = $sub.Id
@@ -308,7 +326,7 @@ foreach ($sub in $subs) {
         }
 
         # ---------------------------------------------------
-        # Catalogs & Permissions (Unity Catalog)
+        # Catalogs & Permissions
         # ---------------------------------------------------
         try {
             $cats = Get-DbCatalogsList -WorkspaceUrl $workspaceUrl -AccessToken $DatabricksToken
@@ -350,7 +368,7 @@ foreach ($sub in $subs) {
         }
 
         # ---------------------------------------------------
-        # External Locations & Permissions (Unity Catalog)
+        # External Locations & Permissions
         # ---------------------------------------------------
         try {
             $extLocs = Get-DbExternalLocationsList -WorkspaceUrl $workspaceUrl -AccessToken $DatabricksToken
@@ -394,7 +412,7 @@ foreach ($sub in $subs) {
 }
 
 # -------------------------------------------------------
-# Export Data (no '*' in filenames)
+# Export Data
 # -------------------------------------------------------
 $csvWs       = $null
 $csvWsPerm   = $null
