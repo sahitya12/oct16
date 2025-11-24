@@ -41,18 +41,39 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 # ----------------------------------------------------------------------
 # Custodian / <Cust> helpers
 # ----------------------------------------------------------------------
-# Custodian = adh_group or adh_group_adh_sub_group
+# Custodian = adh_group OR adh_group_adh_sub_group
 $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 } else {
     "${adh_group}_${adh_sub_group}"
 }
 
-# <Cust> = lowercase of Custodian, without underscores
+# <Cust> = lowercase of Custodian, **without underscores**
 $custLower = $Custodian.ToLower() -replace '_',''
 
 Write-Host "DEBUG: Custodian = $Custodian"
 Write-Host "DEBUG: <Cust>    = $custLower"
+
+# ----------------------------------------------------------------------
+# Utility: robust column lookup (handles BOM / spaces / case)
+# ----------------------------------------------------------------------
+function Get-ColValue {
+    param(
+        [Parameter(Mandatory=$true)][psobject]$Row,
+        [Parameter(Mandatory=$true)][string]$Pattern   # e.g. 'ResourceGroupName'
+    )
+
+    # Find the first property whose name contains Pattern (case-insensitive)
+    $propName = $Row.PSObject.Properties.Name |
+        Where-Object { $_ -like "*$Pattern*" } |
+        Select-Object -First 1
+
+    if ($null -ne $propName -and $propName -ne '') {
+        return [string]$Row.$propName
+    }
+
+    return ''
+}
 
 # ----------------------------------------------------------------------
 # Identity cache + resolver
@@ -109,6 +130,10 @@ function Resolve-IdentityObjectId {
 # ----------------------------------------------------------------------
 $rows = Import-Csv -LiteralPath $InputCsvPath
 
+if ($rows.Count -gt 0) {
+    Write-Host "DEBUG: CSV columns = $($rows[0].PSObject.Properties.Name -join ', ')"
+}
+
 # Resolve subscriptions for this adh_group
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
@@ -124,16 +149,25 @@ foreach ($sub in $subs) {
     foreach ($r in $rows) {
 
         # ------------------------------------------------------------------
+        # Read raw values from CSV (robust to funny headers)
+        # ------------------------------------------------------------------
+        $rgRaw      = Get-ColValue -Row $r -Pattern 'ResourceGroupName'
+        $saRaw      = Get-ColValue -Row $r -Pattern 'StorageAccountName'
+        $contRaw    = Get-ColValue -Row $r -Pattern 'ContainerName'
+        $idenRaw    = Get-ColValue -Row $r -Pattern 'Identity'
+        $pathRaw    = Get-ColValue -Row $r -Pattern 'AccessPath'
+        $permType   = Get-ColValue -Row $r -Pattern 'PermissionType'
+
+        # ------------------------------------------------------------------
         # Placeholder substitution per row
         # ------------------------------------------------------------------
-        $rgName = ($r.ResourceGroupName   -replace '<Custodian>', $Custodian).Trim()
-        $saName = ($r.StorageAccountName  -replace '<Custodian>', $Custodian).Trim()
-        $saName = ($saName                 -replace '<Cust>',      $custLower).Trim()
-        $cont   = ($r.ContainerName       -replace '<Cust>',      $custLower).Trim()
-        $iden   = ($r.Identity            -replace '<Custodian>', $Custodian).Trim()
+        $rgName = ($rgRaw   -replace '<Custodian>', $Custodian).Trim()
+        $saName = ($saRaw   -replace '<Custodian>', $Custodian).Trim()
+        $saName = ($saName  -replace '<Cust>',      $custLower).Trim()
+        $cont   = ($contRaw -replace '<Cust>',      $custLower).Trim()
+        $iden   = ($idenRaw -replace '<Custodian>', $Custodian).Trim()
 
-        # AccessPath handling
-        $accessPath = ($r.AccessPath -replace '<Custodian>', $Custodian) -replace '<Cust>', $custLower
+        $accessPath = ($pathRaw -replace '<Custodian>', $Custodian) -replace '<Cust>', $custLower
         $accessPath = $accessPath.Trim()
 
         # /catalog → /adh_<adh_group_lower>...
@@ -147,11 +181,16 @@ foreach ($sub in $subs) {
         $folderForReport = if ([string]::IsNullOrWhiteSpace($accessPath)) { '/' } else { $accessPath }
 
         Write-Host "DEBUG Row:"
-        Write-Host "  RG      = $rgName"
-        Write-Host "  Storage = $saName"
-        Write-Host "  Cont    = $cont"
-        Write-Host "  Id      = $iden"
-        Write-Host "  Path    = $accessPath"
+        Write-Host "  RG(raw)   = $rgRaw"
+        Write-Host "  SA(raw)   = $saRaw"
+        Write-Host "  Cont(raw) = $contRaw"
+        Write-Host "  Id(raw)   = $idenRaw"
+        Write-Host "  Path(raw) = $pathRaw"
+        Write-Host "  RG        = $rgName"
+        Write-Host "  Storage   = $saName"
+        Write-Host "  Cont      = $cont"
+        Write-Host "  Id        = $iden"
+        Write-Host "  Path      = $accessPath"
 
         # If ResourceGroupName or StorageAccountName ended empty, mark ERROR and continue
         if ([string]::IsNullOrWhiteSpace($rgName) -or [string]::IsNullOrWhiteSpace($saName)) {
@@ -162,7 +201,7 @@ foreach ($sub in $subs) {
                 Container        = $cont
                 Folder           = $folderForReport
                 Identity         = $iden
-                Permission       = $r.PermissionType
+                Permission       = $permType
                 Status           = 'ERROR'
                 Notes            = 'After placeholder replacement ResourceGroupName or StorageAccountName is empty.'
             }
@@ -182,7 +221,7 @@ foreach ($sub in $subs) {
                 Container        = $cont
                 Folder           = $folderForReport
                 Identity         = $iden
-                Permission       = $r.PermissionType
+                Permission       = $permType
                 Status           = 'ERROR'
                 Notes            = "Storage account error: $($_.Exception.Message)"
             }
@@ -201,7 +240,7 @@ foreach ($sub in $subs) {
                 Container        = $cont
                 Folder           = $folderForReport
                 Identity         = $iden
-                Permission       = $r.PermissionType
+                Permission       = $permType
                 Status           = 'ERROR'
                 Notes            = "Container fetch error: $($_.Exception.Message)"
             }
@@ -220,7 +259,7 @@ foreach ($sub in $subs) {
                 Container        = $cont
                 Folder           = $folderForReport
                 Identity         = $iden
-                Permission       = $r.PermissionType
+                Permission       = $permType
                 Status           = 'ERROR'
                 Notes            = "Identity '$iden' not found in Entra ID"
             }
@@ -247,7 +286,6 @@ foreach ($sub in $subs) {
             # ACL entries are strings like:
             # user:<objectId>:rwx
             # group:<objectId>:r-x
-            $permType  = $r.PermissionType
             $matchEntry = $aclString | Where-Object {
                 ($_ -like "*$objectId*") -and ($_ -like "*$permType*")
             }
@@ -267,7 +305,7 @@ foreach ($sub in $subs) {
             Container        = $cont
             Folder           = $folderForReport
             Identity         = $iden
-            Permission       = $r.PermissionType
+            Permission       = $permType
             Status           = $status
             Notes            = $notes
         }
