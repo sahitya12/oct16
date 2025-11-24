@@ -82,7 +82,7 @@ function Get-DbEnvsForType {
 }
 
 # --------------------------
-# Databricks REST helpers (AAD token based)
+# Databricks REST helpers (AAD token)
 # --------------------------
 
 function Invoke-DbApi {
@@ -95,8 +95,17 @@ function Invoke-DbApi {
         [Parameter(Mandatory)][string]$AccessToken
     )
 
-    $uri     = "$WorkspaceUrl/api/2.0/$Path"
-    $headers = @{ Authorization = "Bearer $AccessToken" }
+    if ([string]::IsNullOrWhiteSpace($WorkspaceUrl)) {
+        throw "WorkspaceUrl is null or empty in Invoke-DbApi."
+    }
+
+    # Normalise URL (no trailing slash)
+    $baseUrl = $WorkspaceUrl.TrimEnd('/')
+
+    $uri     = "$baseUrl/api/2.0/$Path"
+    $headers = @{
+        Authorization = "Bearer $AccessToken"
+    }
 
     if ($Body -ne $null) {
         $json = $Body | ConvertTo-Json -Depth 10
@@ -116,7 +125,7 @@ function Get-DbWorkspacePermissions {
     Invoke-DbApi -WorkspaceUrl $WorkspaceUrl -Method GET -Path 'permissions/workspace' -Body $null -AccessToken $AccessToken
 }
 
-# Clusters (kept for future use)
+# (Clusters kept for future use)
 function Get-DbClusters {
     [CmdletBinding()]
     param(
