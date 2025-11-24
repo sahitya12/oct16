@@ -5,8 +5,13 @@ param(
     [Parameter(Mandatory)]
     [string]$TenantId,
 
+    # IMPORTANT:
+    # This parameter accepts BOTH -ClientId and -ApplicationId
+    # because of the Alias. So any caller passing -ApplicationId
+    # will still bind correctly and avoid NamedParameterNotFound.
     [Parameter(Mandatory)]
-    [string]$ClientId,          # ← only this, no ApplicationId
+    [Alias('ApplicationId')]
+    [string]$ClientId,
 
     [Parameter(Mandatory)]
     [string]$ClientSecret,
@@ -25,6 +30,12 @@ param(
     [string]$BranchName = ''
 )
 
+# Normalise to one variable
+$EffectiveClientId = $ClientId
+
+Write-Host "INFO : Using EffectiveClientId = $EffectiveClientId" -ForegroundColor Cyan
+Write-Host "DEBUG: Bound params = $($PSBoundParameters.Keys -join ', ')" -ForegroundColor Yellow
+
 # -------------------------------------------------------
 # Imports
 # -------------------------------------------------------
@@ -37,14 +48,12 @@ Import-Module (Join-Path $PSScriptRoot 'DatabricksHelper.psm1') -Force -ErrorAct
 # -------------------------------------------------------
 $OutputDir = Ensure-Dir -Path $OutputDir
 
-Write-Host "INFO: Using ClientId = $ClientId" -ForegroundColor Cyan
-
-if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
+if (-not (Connect-ScAz -TenantId $TenantId -ClientId $EffectiveClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
 }
 
 # Get SPN object id (info only)
-$sp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
+$sp = Get-AzADServicePrincipal -ApplicationId $EffectiveClientId -ErrorAction Stop
 $spObjectId = $sp.Id
 Write-Host "INFO: Pipeline SPN ObjectId: $spObjectId" -ForegroundColor Cyan
 
@@ -70,15 +79,17 @@ Write-Host "INFO: Subs      = $($subs.Name -join ', ')" -ForegroundColor Cyan
 # Azure Databricks resource ID (multi-tenant AAD app)
 $databricksResourceId = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
-$DatabricksToken = (Get-AzAccessToken -TenantId $TenantId `
-                                      -ApplicationId $ClientId `
-                                      -ResourceUrl $databricksResourceId).Token
+# We call this $DatabricksPat to stay compatible with DatabricksHelper.psm1,
+# but the value is actually an AAD access token.
+$DatabricksPat = (Get-AzAccessToken -TenantId $TenantId `
+                                   -ApplicationId $EffectiveClientId `
+                                   -ResourceUrl $databricksResourceId).Token
 
-if (-not $DatabricksToken) {
+if (-not $DatabricksPat) {
     throw "Failed to acquire Databricks AAD token for resource $databricksResourceId."
 }
 
-Write-Host "INFO: Databricks AAD token acquired (length: $($DatabricksToken.Length))" -ForegroundColor Cyan
+Write-Host "INFO: Databricks AAD token acquired (length: $($DatabricksPat.Length))" -ForegroundColor Cyan
 
 # -------------------------------------------------------
 # Result containers
@@ -113,8 +124,8 @@ foreach ($sub in $subs) {
 
         # -----------------------------------------------
         # Gen_SPN info from Custodian KV (for reporting)
-        #   Secret name: ADH_<Custodian>_Gen_SPN_<env>
-        #   Secret name for password: ADH_<Custodian>_Gen_SPN_<env>-Secret
+        #   Secret name:        ADH_<Custodian>_Gen_SPN_<env>
+        #   Secret name (pass): ADH_<Custodian>_Gen_SPN_<env>-Secret
         # -----------------------------------------------
         $genSpnBaseName = "ADH_{0}_Gen_SPN_{1}" -f $Custodian, $env
 
@@ -184,8 +195,8 @@ foreach ($sub in $subs) {
         # -----------------------------------------------
         # Workspace state rows
         # -----------------------------------------------
-        if ($null -eq $workspaceUrl) {
-            # Secret not found at all
+        if ($null -eq $wsUrlSecret) {
+            # Secret never found at all
             $workspaceResults += [pscustomobject]@{
                 SubscriptionName   = $sub.Name
                 SubscriptionId     = $sub.Id
@@ -247,7 +258,7 @@ foreach ($sub in $subs) {
         # Databricks Workspace Permissions
         # ---------------------------------------------------
         try {
-            $perm = Get-DbWorkspacePermissions -WorkspaceUrl $workspaceUrl -AccessToken $DatabricksToken
+            $perm = Get-DbWorkspacePermissions -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
             foreach ($ace in $perm.access_control_list) {
                 $principalName = $ace.user_name ?? $ace.group_name ?? $ace.service_principal_name
                 $principalType = if ($ace.user_name) { 'user' }
@@ -276,7 +287,7 @@ foreach ($sub in $subs) {
         # SQL Warehouses & Permissions
         # ---------------------------------------------------
         try {
-            $whs = Get-DbWarehouses -WorkspaceUrl $workspaceUrl -AccessToken $DatabricksToken
+            $whs = Get-DbWarehouses -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
             foreach ($wh in $whs.warehouses) {
                 $sqlWhResults += [pscustomobject]@{
                     SubscriptionName = $sub.Name
@@ -294,7 +305,7 @@ foreach ($sub in $subs) {
                 }
 
                 try {
-                    $permWh = Get-DbWarehousePermissions -WorkspaceUrl $workspaceUrl -WarehouseId $wh.id -AccessToken $DatabricksToken
+                    $permWh = Get-DbWarehousePermissions -WorkspaceUrl $workspaceUrl -WarehouseId $wh.id -DatabricksPat $DatabricksPat
                     foreach ($ace in $permWh.access_control_list) {
                         $principalName = $ace.user_name ?? $ace.group_name ?? $ace.service_principal_name
                         $principalType = if ($ace.user_name) { 'user' }
@@ -329,7 +340,7 @@ foreach ($sub in $subs) {
         # Catalogs & Permissions
         # ---------------------------------------------------
         try {
-            $cats = Get-DbCatalogsList -WorkspaceUrl $workspaceUrl -AccessToken $DatabricksToken
+            $cats = Get-DbCatalogsList -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
             foreach ($cat in $cats.catalogs) {
                 $catalogListResults += [pscustomobject]@{
                     SubscriptionName = $sub.Name
@@ -345,7 +356,7 @@ foreach ($sub in $subs) {
                 }
 
                 try {
-                    $permCat = Get-DbCatalogPermissions -WorkspaceUrl $workspaceUrl -CatalogName $cat.name -AccessToken $DatabricksToken
+                    $permCat = Get-DbCatalogPermissions -WorkspaceUrl $workspaceUrl -CatalogName $cat.name -DatabricksPat $DatabricksPat
                     foreach ($entry in $permCat.privilege_assignments) {
                         $catalogPermResults += [pscustomobject]@{
                             SubscriptionName = $sub.Name
@@ -371,7 +382,7 @@ foreach ($sub in $subs) {
         # External Locations & Permissions
         # ---------------------------------------------------
         try {
-            $extLocs = Get-DbExternalLocationsList -WorkspaceUrl $workspaceUrl -AccessToken $DatabricksToken
+            $extLocs = Get-DbExternalLocationsList -WorkspaceUrl $workspaceUrl -DatabricksPat $DatabricksPat
             foreach ($loc in $extLocs.external_locations) {
                 $extLocResults += [pscustomobject]@{
                     SubscriptionName = $sub.Name
@@ -387,7 +398,7 @@ foreach ($sub in $subs) {
                 }
 
                 try {
-                    $permLoc = Get-DbExternalLocationPermissions -WorkspaceUrl $workspaceUrl -Name $loc.name -AccessToken $DatabricksToken
+                    $permLoc = Get-DbExternalLocationPermissions -WorkspaceUrl $workspaceUrl -Name $loc.name -DatabricksPat $DatabricksPat
                     foreach ($entry in $permLoc.privilege_assignments) {
                         $extLocPermResults += [pscustomobject]@{
                             SubscriptionName  = $sub.Name
