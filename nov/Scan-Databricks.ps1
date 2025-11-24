@@ -5,10 +5,8 @@ param(
     [Parameter(Mandatory)]
     [string]$TenantId,
 
-    # Accept -ClientId and legacy -ApplicationId
     [Parameter(Mandatory)]
-    [Alias('ApplicationId')]
-    [string]$ClientId,
+    [string]$ClientId,          # ← only this, no ApplicationId
 
     [Parameter(Mandatory)]
     [string]$ClientSecret,
@@ -39,6 +37,8 @@ Import-Module (Join-Path $PSScriptRoot 'DatabricksHelper.psm1') -Force -ErrorAct
 # -------------------------------------------------------
 $OutputDir = Ensure-Dir -Path $OutputDir
 
+Write-Host "INFO: Using ClientId = $ClientId" -ForegroundColor Cyan
+
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
 }
@@ -67,7 +67,7 @@ Write-Host "INFO: Subs      = $($subs.Name -join ', ')" -ForegroundColor Cyan
 # -------------------------------------------------------
 # Databricks AAD token (pipeline SPN)
 # -------------------------------------------------------
-# Azure Databricks resource ID (multi-tenant app)
+# Azure Databricks resource ID (multi-tenant AAD app)
 $databricksResourceId = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
 $DatabricksToken = (Get-AzAccessToken -TenantId $TenantId `
@@ -137,10 +137,10 @@ foreach ($sub in $subs) {
 
         # -----------------------------------------------
         # Workspace URL and ID from Infra KV
-        #   URL secret (tidy):      DATABRICKS-WORKSPACE-URL
-        #   URL secret (typo):      DATABRICKS-WORKSAPCE-URL
-        #   ID secret (tidy):       DATABRICKS-WORKSPACE-ID
-        #   ID secret (typo):       DATABRICKS-WORKSAPCE-ID
+        #   URL secret (correct):  DATABRICKS-WORKSPACE-URL
+        #   URL secret (typo):     DATABRICKS-WORKSAPCE-URL
+        #   ID secret (correct):   DATABRICKS-WORKSPACE-ID
+        #   ID secret (typo):      DATABRICKS-WORKSAPCE-ID
         # -----------------------------------------------
         $urlSecretNameTidy   = "DATABRICKS-WORKSPACE-URL"
         $urlSecretNameTypos  = "DATABRICKS-WORKSAPCE-URL"
