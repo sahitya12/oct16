@@ -130,7 +130,7 @@ if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 foreach ($sub in $subs) {
 
     Set-ScContext -Subscription $sub
-    Write-Host "Processing subscription: $($sub.Name) [$($sub.Id)]"
+    Write-Host ("Processing subscription: {0} [{1}]" -f $sub.Name, $sub.Id)
 
     # track Storage scopes where we temporarily add RBAC
     $assignedScopes = @()
@@ -161,7 +161,7 @@ foreach ($sub in $subs) {
                 Identity         = $identityName
                 PermissionType   = $permType
                 Status           = 'ERROR'
-                Notes            = "Storage Account error: $($_.Exception.Message)"
+                Notes            = ("Storage Account error: {0}" -f $_.Exception.Message)
             }
             continue
         }
@@ -173,17 +173,17 @@ foreach ($sub in $subs) {
         if ($assignedScopes -notcontains $scope) {
             try {
                 New-AzRoleAssignment `
-                    -ObjectId          $pipelineSpObjectId `
+                    -ObjectId           $pipelineSpObjectId `
                     -RoleDefinitionName 'Storage Blob Data Owner' `
-                    -Scope            $scope `
-                    -ErrorAction      Stop | Out-Null
+                    -Scope             $scope `
+                    -ErrorAction       Stop | Out-Null
 
-                Write-Host "Assigned Storage Blob Data Owner on $scope to pipeline SPN."
+                Write-Host ("Assigned Storage Blob Data Owner on scope '{0}' to pipeline SPN." -f $scope)
             } catch {
                 if ($_.Exception.Message -notmatch 'The role assignment already exists') {
-                    Write-Warning "Failed to assign Storage Blob Data Owner on $scope: $($_.Exception.Message)"
+                    Write-Warning ("Failed to assign Storage Blob Data Owner on scope '{0}': {1}" -f $scope, $_.Exception.Message)
                 } else {
-                    Write-Host "Storage Blob Data Owner already exists on $scope for pipeline SPN."
+                    Write-Host ("Storage Blob Data Owner already exists on scope '{0}' for pipeline SPN." -f $scope)
                 }
             }
             $assignedScopes += $scope
@@ -206,7 +206,7 @@ foreach ($sub in $subs) {
                 Identity         = $identityName
                 PermissionType   = $permType
                 Status           = 'ERROR'
-                Notes            = "Container fetch error: $($_.Exception.Message)"
+                Notes            = ("Container fetch error: {0}" -f $_.Exception.Message)
             }
             continue
         }
@@ -223,7 +223,7 @@ foreach ($sub in $subs) {
             if ($adh_group -eq 'KTK') {
                 $accessPath = $accessPath -replace '^/?catalog', '/adh_ktk'
             } else {
-                $accessPath = $accessPath -replace '^/?catalog', "/adh_$($adh_group.ToLower())"
+                $accessPath = $accessPath -replace '^/?catalog', ("/adh_{0}" -f $adh_group.ToLower())
             }
         }
 
@@ -254,15 +254,15 @@ foreach ($sub in $subs) {
                     Identity         = $identityName
                     PermissionType   = $permType
                     Status           = 'ERROR'
-                    Notes            = "Identity '$identityName' not found in Entra ID"
+                    Notes            = ("Identity '{0}' not found in Entra ID" -f $identityName)
                 }
                 continue
             }
 
             try {
                 $params = @{
-                    FileSystem = $cont
-                    Context    = $ctx
+                    FileSystem  = $cont
+                    Context     = $ctx
                     ErrorAction = 'Stop'
                 }
                 if (-not [string]::IsNullOrWhiteSpace($folderPath)) {
@@ -300,7 +300,7 @@ foreach ($sub in $subs) {
 
             } catch {
                 $permStatus = 'ERROR'
-                $permNotes  = "ACL read error: $($_.Exception.Message)"
+                $permNotes  = ("ACL read error: {0}" -f $_.Exception.Message)
             }
 
             $out += [pscustomobject]@{
@@ -323,14 +323,14 @@ foreach ($sub in $subs) {
     foreach ($scope in $assignedScopes | Select-Object -Unique) {
         try {
             Remove-AzRoleAssignment `
-                -ObjectId          $pipelineSpObjectId `
+                -ObjectId           $pipelineSpObjectId `
                 -RoleDefinitionName 'Storage Blob Data Owner' `
-                -Scope            $scope `
-                -ErrorAction      Stop | Out-Null
+                -Scope             $scope `
+                -ErrorAction       Stop | Out-Null
 
-            Write-Host "Removed Storage Blob Data Owner on $scope from pipeline SPN."
+            Write-Host ("Removed Storage Blob Data Owner on scope '{0}' from pipeline SPN." -f $scope)
         } catch {
-            Write-Warning "Failed to remove Storage Blob Data Owner on $scope: $($_.Exception.Message)"
+            Write-Warning ("Failed to remove Storage Blob Data Owner on scope '{0}': {1}" -f $scope, $_.Exception.Message)
         }
     }
 }
@@ -356,7 +356,7 @@ $csvOut  = New-StampedPath -BaseDir $OutputDir -Prefix ("adls_validation_{0}_{1}
 Write-CsvSafe -Rows $out -Path $csvOut
 
 $htmlOut = $csvOut -replace '\.csv$','.html'
-Convert-CsvToHtml -CsvPath $csvOut -HtmlPath $htmlOut -Title "ADLS Validation ($adh_group / $adh_subscription_type) $BranchName"
+Convert-CsvToHtml -CsvPath $csvOut -HtmlPath $htmlOut -Title ("ADLS Validation ({0} / {1}) {2}" -f $adh_group, $adh_subscription_type, $BranchName)
 
 Write-Host "ADLS validation completed." -ForegroundColor Green
 Write-Host "CSV : $csvOut"
