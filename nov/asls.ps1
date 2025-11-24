@@ -41,39 +41,18 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 # ----------------------------------------------------------------------
 # Custodian / <Cust> helpers
 # ----------------------------------------------------------------------
-# Custodian = adh_group OR adh_group_adh_sub_group
+# Custodian = adh_group  OR adh_group_adh_sub_group
 $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 } else {
     "${adh_group}_${adh_sub_group}"
 }
 
-# <Cust> = lowercase of Custodian, **without underscores**
+# <Cust> = lowercase of Custodian, without underscores
 $custLower = $Custodian.ToLower() -replace '_',''
 
 Write-Host "DEBUG: Custodian = $Custodian"
 Write-Host "DEBUG: <Cust>    = $custLower"
-
-# ----------------------------------------------------------------------
-# Utility: robust column lookup (handles BOM / spaces / case)
-# ----------------------------------------------------------------------
-function Get-ColValue {
-    param(
-        [Parameter(Mandatory=$true)][psobject]$Row,
-        [Parameter(Mandatory=$true)][string]$Pattern   # e.g. 'ResourceGroupName'
-    )
-
-    # Find the first property whose name contains Pattern (case-insensitive)
-    $propName = $Row.PSObject.Properties.Name |
-        Where-Object { $_ -like "*$Pattern*" } |
-        Select-Object -First 1
-
-    if ($null -ne $propName -and $propName -ne '') {
-        return [string]$Row.$propName
-    }
-
-    return ''
-}
 
 # ----------------------------------------------------------------------
 # Identity cache + resolver
@@ -115,8 +94,8 @@ function Resolve-IdentityObjectId {
 
     # If a GUID directly
     if (-not $id) {
-        $guidRef = [ref]([Guid]::Empty)
-        if ([Guid]::TryParse($IdentityName, $guidRef)) {
+        $tmp = [ref]([Guid]::Empty)
+        if ([Guid]::TryParse($IdentityName, $tmp)) {
             $id = $IdentityName
         }
     }
@@ -130,10 +109,6 @@ function Resolve-IdentityObjectId {
 # ----------------------------------------------------------------------
 $rows = Import-Csv -LiteralPath $InputCsvPath
 
-if ($rows.Count -gt 0) {
-    Write-Host "DEBUG: CSV columns = $($rows[0].PSObject.Properties.Name -join ', ')"
-}
-
 # Resolve subscriptions for this adh_group
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
@@ -142,21 +117,31 @@ $out = @()
 
 foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
-
     Write-Host ""
     Write-Host "=== Subscription: $($sub.Name) ===" -ForegroundColor Cyan
 
     foreach ($r in $rows) {
 
         # ------------------------------------------------------------------
-        # Read raw values from CSV (robust to funny headers)
+        # Robust column lookup (ResourceGroupName vs ResourceGroup etc.)
         # ------------------------------------------------------------------
-        $rgRaw      = Get-ColValue -Row $r -Pattern 'ResourceGroupName'
-        $saRaw      = Get-ColValue -Row $r -Pattern 'StorageAccountName'
-        $contRaw    = Get-ColValue -Row $r -Pattern 'ContainerName'
-        $idenRaw    = Get-ColValue -Row $r -Pattern 'Identity'
-        $pathRaw    = Get-ColValue -Row $r -Pattern 'AccessPath'
-        $permType   = Get-ColValue -Row $r -Pattern 'PermissionType'
+        $rgProp = $r.PSObject.Properties['ResourceGroupName']
+        if (-not $rgProp) { $rgProp = $r.PSObject.Properties['ResourceGroup'] }
+
+        $saProp = $r.PSObject.Properties['StorageAccountName']
+        if (-not $saProp) { $saProp = $r.PSObject.Properties['StorageAccount'] }
+
+        $contProp  = $r.PSObject.Properties['ContainerName']
+        $idenProp  = $r.PSObject.Properties['Identity']
+        $pathProp  = $r.PSObject.Properties['AccessPath']
+        $permProp  = $r.PSObject.Properties['PermissionType']
+
+        $rgRaw   = if ($rgProp)   { [string]$rgProp.Value }   else { '' }
+        $saRaw   = if ($saProp)   { [string]$saProp.Value }   else { '' }
+        $contRaw = if ($contProp) { [string]$contProp.Value } else { '' }
+        $idenRaw = if ($idenProp) { [string]$idenProp.Value } else { '' }
+        $pathRaw = if ($pathProp) { [string]$pathProp.Value } else { '' }
+        $permRaw = if ($permProp) { [string]$permProp.Value } else { '' }
 
         # ------------------------------------------------------------------
         # Placeholder substitution per row
@@ -172,27 +157,24 @@ foreach ($sub in $subs) {
 
         # /catalog → /adh_<adh_group_lower>...
         if ($accessPath -like '/catalog*') {
-            $suffix     = $accessPath.Substring(8)   # after "/catalog"
+            $suffix     = $accessPath.Substring(8)   # text after "/catalog"
             $adhLower   = $adh_group.ToLower()
             $accessPath = "/adh_${adhLower}${suffix}"
         }
 
-        # For report: show "/" instead of empty
         $folderForReport = if ([string]::IsNullOrWhiteSpace($accessPath)) { '/' } else { $accessPath }
 
         Write-Host "DEBUG Row:"
-        Write-Host "  RG(raw)   = $rgRaw"
-        Write-Host "  SA(raw)   = $saRaw"
-        Write-Host "  Cont(raw) = $contRaw"
-        Write-Host "  Id(raw)   = $idenRaw"
-        Write-Host "  Path(raw) = $pathRaw"
-        Write-Host "  RG        = $rgName"
-        Write-Host "  Storage   = $saName"
-        Write-Host "  Cont      = $cont"
-        Write-Host "  Id        = $iden"
-        Write-Host "  Path      = $accessPath"
+        Write-Host "  RG(raw)   = '$rgRaw'"
+        Write-Host "  RG(final) = '$rgName'"
+        Write-Host "  SA(raw)   = '$saRaw'"
+        Write-Host "  SA(final) = '$saName'"
+        Write-Host "  Cont      = '$cont'"
+        Write-Host "  Identity  = '$iden'"
+        Write-Host "  Path      = '$accessPath'"
+        Write-Host "  Perm      = '$permRaw'"
 
-        # If ResourceGroupName or StorageAccountName ended empty, mark ERROR and continue
+        # If after substitution RG or SA is still empty -> do NOT call Get-AzStorageAccount
         if ([string]::IsNullOrWhiteSpace($rgName) -or [string]::IsNullOrWhiteSpace($saName)) {
             $out += [pscustomobject]@{
                 SubscriptionName = $sub.Name
@@ -201,7 +183,7 @@ foreach ($sub in $subs) {
                 Container        = $cont
                 Folder           = $folderForReport
                 Identity         = $iden
-                Permission       = $permType
+                Permission       = $permRaw
                 Status           = 'ERROR'
                 Notes            = 'After placeholder replacement ResourceGroupName or StorageAccountName is empty.'
             }
@@ -212,6 +194,7 @@ foreach ($sub in $subs) {
         # Resolve storage account and container
         # ------------------------------------------------------------------
         try {
+            Write-Host "DEBUG: Calling Get-AzStorageAccount -ResourceGroupName '$rgName' -Name '$saName'"
             $sa = Get-AzStorageAccount -ResourceGroupName $rgName -Name $saName -ErrorAction Stop
         } catch {
             $out += [pscustomobject]@{
@@ -221,7 +204,7 @@ foreach ($sub in $subs) {
                 Container        = $cont
                 Folder           = $folderForReport
                 Identity         = $iden
-                Permission       = $permType
+                Permission       = $permRaw
                 Status           = 'ERROR'
                 Notes            = "Storage account error: $($_.Exception.Message)"
             }
@@ -240,7 +223,7 @@ foreach ($sub in $subs) {
                 Container        = $cont
                 Folder           = $folderForReport
                 Identity         = $iden
-                Permission       = $permType
+                Permission       = $permRaw
                 Status           = 'ERROR'
                 Notes            = "Container fetch error: $($_.Exception.Message)"
             }
@@ -259,7 +242,7 @@ foreach ($sub in $subs) {
                 Container        = $cont
                 Folder           = $folderForReport
                 Identity         = $iden
-                Permission       = $permType
+                Permission       = $permRaw
                 Status           = 'ERROR'
                 Notes            = "Identity '$iden' not found in Entra ID"
             }
@@ -283,9 +266,7 @@ foreach ($sub in $subs) {
             $item      = Get-AzDataLakeGen2Item @params
             $aclString = $item.Acl
 
-            # ACL entries are strings like:
-            # user:<objectId>:rwx
-            # group:<objectId>:r-x
+            $permType  = $permRaw
             $matchEntry = $aclString | Where-Object {
                 ($_ -like "*$objectId*") -and ($_ -like "*$permType*")
             }
@@ -305,7 +286,7 @@ foreach ($sub in $subs) {
             Container        = $cont
             Folder           = $folderForReport
             Identity         = $iden
-            Permission       = $permType
+            Permission       = $permRaw
             Status           = $status
             Notes            = $notes
         }
