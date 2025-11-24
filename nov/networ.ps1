@@ -114,24 +114,24 @@ foreach ($sub in $subs) {
   }
 
   # -------------------------------------------------------------------
-  # Filter VNets by adh_group in name (removed hard 'core' requirement)
+  # Filter VNets by adh_group AND (spoke|core) in name
+  #   e.g. ADH_KTK_Spoke_VNET_dev, ADH_KTK_Core_VNET_dev
   # -------------------------------------------------------------------
-  $adhPattern = [regex]::Escape($adh_group)
+  $adhPattern   = [regex]::Escape($adh_group)
+  $rolePattern  = '(?i)(spoke|core)'   # case-insensitive
 
   if ([string]::IsNullOrWhiteSpace($adh_group)) {
-    # If no adh_group specified, take all VNets
     $vnets = $vnetsAll
   } else {
-    $vnets = $vnetsAll | Where-Object { $_.Name -match $adhPattern }
+    $vnets = $vnetsAll | Where-Object {
+      $_.Name -match $adhPattern -and $_.Name -match $rolePattern
+    }
   }
 
-  Write-Host "Filtered VNets for adh_group '$adh_group' in sub '$($sub.Name)': $($vnets.Count)" -ForegroundColor Yellow
+  Write-Host "Filtered VNets for adh_group '$adh_group' (spoke/core) in sub '$($sub.Name)': $($vnets.Count)" -ForegroundColor Yellow
 
-  # Preload NSGs / RouteTables / NAT / Firewalls
-  $nsgs  = Get-AzNetworkSecurityGroup -ErrorAction SilentlyContinue
-  $rtabs = Get-AzRouteTable           -ErrorAction SilentlyContinue
-  $ngws  = Get-AzNatGateway           -ErrorAction SilentlyContinue
-  $azfws = Get-AzFirewall             -ErrorAction SilentlyContinue
+  # Preload Firewalls (we’ll get NSG/RT/NAT directly from subnet Ids)
+  $azfws = Get-AzFirewall -ErrorAction SilentlyContinue
 
   foreach ($v in $vnets) {
     # Topology row
@@ -141,7 +141,7 @@ foreach ($sub in $subs) {
       ResourceGroup    = $v.ResourceGroupName
       AddressSpace     = ($v.AddressSpace.AddressPrefixes -join ',')
       DnsServers       = ($v.DhcpOptions.DnsServers -join ',')
-      Subnets          = (($v.Subnets | ForEach-Object { $_.Name + '(' + $_.AddressPrefix + ')' }) -join ';')
+      Subnets          = (($v.Subnets | ForEach-Object { $_.Name + '(' + (($_.AddressPrefix) ? $_.AddressPrefix : ($_.AddressPrefixes -join ',')) + ')' }) -join ';')
     }
 
     # Peering info
@@ -160,21 +160,45 @@ foreach ($sub in $subs) {
       }
     }
 
-    # Subnets + NSG/RT/NAT
+    # Subnets + NSG/RT/NAT – read names directly from Ids
     foreach ($s in $v.Subnets) {
-      $nsg = if ($s.NetworkSecurityGroup) { $nsgs  | Where-Object { $_.Id -eq $s.NetworkSecurityGroup.Id } }
-      $rt  = if ($s.RouteTable)           { $rtabs | Where-Object { $_.Id -eq $s.RouteTable.Id } }
-      $ngw = if ($s.NatGateway)           { $ngws  | Where-Object { $_.Id -eq $s.NatGateway.Id } }
+
+      # AddressPrefix may be single or list depending on Az version
+      $addr = if ($s.AddressPrefix) {
+        $s.AddressPrefix
+      } elseif ($s.AddressPrefixes) {
+        $s.AddressPrefixes -join ','
+      } else {
+        ''
+      }
+
+      $nsgName = if ($s.NetworkSecurityGroup -and $s.NetworkSecurityGroup.Id) {
+        ($s.NetworkSecurityGroup.Id -split '/')[ -1 ]
+      } else {
+        ''
+      }
+
+      $rtName = if ($s.RouteTable -and $s.RouteTable.Id) {
+        ($s.RouteTable.Id -split '/')[ -1 ]
+      } else {
+        ''
+      }
+
+      $natName = if ($s.NatGateway -and $s.NatGateway.Id) {
+        ($s.NatGateway.Id -split '/')[ -1 ]
+      } else {
+        ''
+      }
 
       $subnetRows += [PSCustomObject]@{
         SubscriptionName = $sub.Name
         VNetName         = $v.Name
         ResourceGroup    = $v.ResourceGroupName
         Subnet           = $s.Name
-        AddressPrefix    = $s.AddressPrefix
-        NSG              = $nsg?.Name
-        NatGateway       = $ngw?.Name
-        RouteTable       = $rt?.Name
+        AddressPrefix    = $addr
+        NSG              = $nsgName
+        NatGateway       = $natName
+        RouteTable       = $rtName
       }
     }
   }
