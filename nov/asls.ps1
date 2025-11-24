@@ -70,7 +70,7 @@ function Resolve-IdentityObjectId {
         } catch {}
     }
 
-    # 3) Try SPN by search string (prefix match)
+    # 3) Try SPN by search string
     if (-not $id) {
         try {
             $sp2 = Get-AzADServicePrincipal -SearchString $IdentityName -ErrorAction Stop
@@ -93,7 +93,6 @@ function Resolve-IdentityObjectId {
 # -------------------------------------------------------
 # Permission comparison helper
 # -------------------------------------------------------
-# Check if actual permissions satisfy expected (e.g. rwx >= r-x)
 function Test-PermissionMatch {
     param(
         [Parameter(Mandatory = $true)][string]$Actual,
@@ -112,7 +111,6 @@ function Test-PermissionMatch {
         $e = $Expected[$i]
         $a = $Actual[$i]
 
-        # if expected wants r/w/x, actual must have it
         if ($e -ne '-' -and $a -ne $e) {
             return $false
         }
@@ -132,8 +130,7 @@ foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
     Write-Host ("Processing subscription: {0} [{1}]" -f $sub.Name, $sub.Id)
 
-    # track Storage scopes where we temporarily add RBAC
-    $assignedScopes = @()
+    $assignedScopes = @()   # where we add Storage Blob Data Owner
 
     foreach ($r in $rows) {
 
@@ -189,7 +186,30 @@ foreach ($sub in $subs) {
             $assignedScopes += $scope
         }
 
-        $ctx = $sa.Context
+        # ------------------------------
+        # Build **AAD** context for ADLS Gen2 ACL ops
+        # ------------------------------
+        try {
+            $ctx = New-AzStorageContext `
+                -StorageAccountName $sa.StorageAccountName `
+                -UseConnectedAccount `
+                -ErrorAction Stop
+
+            Write-Host ("Using OAuth context for account '{0}'" -f $sa.StorageAccountName)
+        } catch {
+            $out += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                ResourceGroup    = $rgName
+                Storage          = $saName
+                Container        = $cont
+                Folder           = ''
+                Identity         = $identityName
+                PermissionType   = $permType
+                Status           = 'ERROR'
+                Notes            = ("Failed to create OAuth storage context: {0}" -f $_.Exception.Message)
+            }
+            continue
+        }
 
         # ------------------------------
         # Container
@@ -218,7 +238,6 @@ foreach ($sub in $subs) {
         $accessPath    = $accessPathRaw -replace '<Custodian>', $adh_group
         $accessPath    = $accessPath    -replace '<Cust>',      $adh_group.ToLower()
 
-        # catalog shortcut -> /adh_<cust>
         if ($accessPath -match '^/?catalog') {
             if ($adh_group -eq 'KTK') {
                 $accessPath = $accessPath -replace '^/?catalog', '/adh_ktk'
@@ -227,7 +246,6 @@ foreach ($sub in $subs) {
             }
         }
 
-        # normalise slashes
         $accessPath = $accessPath -replace '/+', '/'
 
         $pathsToCheck = @()
@@ -242,7 +260,6 @@ foreach ($sub in $subs) {
         # ------------------------------
         foreach ($folderPath in $pathsToCheck) {
 
-            # resolve identity to objectId
             $objectId = Resolve-IdentityObjectId -IdentityName $identityName
             if (-not $objectId) {
                 $out += [pscustomobject]@{
@@ -271,7 +288,6 @@ foreach ($sub in $subs) {
 
                 $item = Get-AzDataLakeGen2Item @params
 
-                # Acl example: "user::rwx,group::r-x,other::---,user:<guid>:r-x,mask::rwx"
                 $aclEntries = @()
                 if ($item.Acl) {
                     $aclEntries = $item.Acl -split ','
@@ -280,9 +296,9 @@ foreach ($sub in $subs) {
                 $parsedAcl = $aclEntries | ForEach-Object {
                     $parts = $_.Split(':')
                     [pscustomobject]@{
-                        Type        = $parts[0]              # user/group/other/mask
+                        Type        = $parts[0]
                         Id          = (if ($parts.Count -ge 3) { $parts[1] } else { '' })
-                        Permissions = $parts[$parts.Count-1] # rwx/r-x/---
+                        Permissions = $parts[$parts.Count-1]
                     }
                 }
 
