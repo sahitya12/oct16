@@ -1,15 +1,12 @@
 # /sanitychecks/.azure-pipelines/stages/adls.stage.yml
+# JOBS TEMPLATE – no "stages:" here
 
 parameters:
-- name: stageName          # NEW – so the caller can choose a unique name
-  type: string
-  default: 'adls_validation'
-
 - name: adh_group
   type: string
   default: ''
 
-- name: adh_sub_group      # OPTIONAL – can be blank
+- name: adh_sub_group          # optional, can be blank
   type: string
   default: ''
 
@@ -28,29 +25,24 @@ parameters:
   type: string
   default: ''
 
-stages:
-- stage: ${{ parameters.stageName }}
-  displayName: "ADLS ACL Validation (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
-  condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
-
-  jobs:
-  - template: ../templates/job.powershell-with-az.yml
-    parameters:
-      displayName: 'ADLS ACL Validation'
-      variableGroup: modernization_tfstate_backend_details
-      scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-ADLS-Acls.ps1'
-      workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
-      arguments: >-
-        -TenantId "$(tenant_id)"
-        -ClientId "$(backend_client_id)"
-        -ClientSecret "$(backend_client_secret)"
-        -adh_group "${{ parameters.adh_group }}"
-        -adh_sub_group "${{ parameters.adh_sub_group }}"
-        -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-        -InputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv"
-        -OutputDir "$(Build.ArtifactStagingDirectory)/adls-acl"
-        -BranchName "$(Build.SourceBranchName)"
-      artifactName: 'adls-acl-results'
-      publishPath: '$(Build.ArtifactStagingDirectory)/adls-acl'
-      poolName: ${{ parameters.poolName }}
-      agentName: ${{ parameters.agentName }}
+jobs:
+- template: ../templates/job.powershell-with-az.yml
+  parameters:
+    displayName: 'ADLS ACL Validation'
+    variableGroup: modernization_tfstate_backend_details
+    scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-ADLS-Acls.ps1'
+    workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
+    arguments: >-
+      -TenantId "$(tenant_id)"
+      -ClientId "$(backend_client_id)"
+      -ClientSecret "$(backend_client_secret)"
+      -adh_group "${{ parameters.adh_group }}"
+      -adh_sub_group "${{ parameters.adh_sub_group }}"
+      -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+      -InputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv"
+      -OutputDir "$(Build.ArtifactStagingDirectory)/adls-acl"
+      -BranchName "$(Build.SourceBranchName)"
+    artifactName: 'adls-acl-results'
+    publishPath: '$(Build.ArtifactStagingDirectory)/adls-acl'
+    poolName: ${{ parameters.poolName }}
+    agentName: ${{ parameters.agentName }}
