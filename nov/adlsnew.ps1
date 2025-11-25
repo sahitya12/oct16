@@ -6,7 +6,7 @@ param(
     [string]$adh_sub_group = '',
     [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
 
-    # NOW OPTIONAL – script picks correct CSV if you leave this blank
+    # OPTIONAL – script will auto-pick CSV if left blank
     [string]$InputCsvPath = '',
 
     [Parameter(Mandatory = $true)][string]$OutputDir,
@@ -37,13 +37,14 @@ Ensure-Dir -Path $OutputDir | Out-Null
 # ----------------------------------------------------------------------
 $csvFileName = if ($adh_subscription_type -eq 'prd') {
     'adls_prd_permissions.csv'
-} else {
+}
+else {
     'adls_nonprd_permissions.csv'
 }
 
 # If InputCsvPath is blank, assume standard location: ..\inputs\<file>.csv
 if ([string]::IsNullOrWhiteSpace($InputCsvPath)) {
-    $inputsRoot  = Join-Path (Split-Path -Parent $PSScriptRoot) 'inputs'
+    $inputsRoot   = Join-Path (Split-Path -Parent $PSScriptRoot) 'inputs'
     $InputCsvPath = Join-Path $inputsRoot $csvFileName
 }
 else {
@@ -73,7 +74,8 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 # Custodian = adh_group or adh_group_adh_sub_group
 $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
-} else {
+}
+else {
     "${adh_group}_${adh_sub_group}"
 }
 
@@ -103,14 +105,16 @@ function Resolve-IdentityObjectId {
     try {
         $grp = Get-AzADGroup -DisplayName $IdentityName -ErrorAction Stop
         if ($grp -and $grp.Id) { $id = $grp.Id }
-    } catch {}
+    }
+    catch {}
 
     # Try SPN by display name
     if (-not $id) {
         try {
             $sp = Get-AzADServicePrincipal -DisplayName $IdentityName -ErrorAction Stop
             if ($sp -and $sp.Id) { $id = $sp.Id }
-        } catch {}
+        }
+        catch {}
     }
 
     # Try SPN by SearchString (looser)
@@ -118,7 +122,8 @@ function Resolve-IdentityObjectId {
         try {
             $sp2 = Get-AzADServicePrincipal -SearchString $IdentityName -ErrorAction Stop
             if ($sp2 -and $sp2.Count -ge 1) { $id = $sp2[0].Id }
-        } catch {}
+        }
+        catch {}
     }
 
     # If it is already a GUID
@@ -206,7 +211,8 @@ foreach ($sub in $subs) {
         # ------------------------------------------------------------------
         try {
             $sa = Get-AzStorageAccount -ResourceGroupName $rgName -Name $saName -ErrorAction Stop
-        } catch {
+        }
+        catch {
             $out += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $rgName
@@ -225,7 +231,8 @@ foreach ($sub in $subs) {
 
         try {
             $container = Get-AzStorageContainer -Name $cont -Context $ctx -ErrorAction Stop
-        } catch {
+        }
+        catch {
             $out += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $rgName
@@ -303,13 +310,16 @@ foreach ($sub in $subs) {
             $status = if ($hasMatch) { 'OK' } else { 'MISSING' }
             if ($matchEntry) {
                 $notes = 'ACL contains required permission'
-            } elseif ($ownerMatch -or $groupMatch) {
+            }
+            elseif ($ownerMatch -or $groupMatch) {
                 $notes = 'Identity matches Owner/Group with required permission mask'
-            } else {
+            }
+            else {
                 $notes = 'Permissions missing or mismatched'
             }
 
-        } catch {
+        }
+        catch {
             $status = 'ERROR'
             $notes  = "ACL read error: $($_.Exception.Message)"
         }
