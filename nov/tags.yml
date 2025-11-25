@@ -3,14 +3,17 @@ parameters:
     type: string
     default: ''
 
-  - name: adh_sub_group            # <-- Added (optional)
+  # OPTIONAL – can be left blank in the Run UI
+  - name: adh_sub_group
     type: string
     default: ''
 
   - name: adh_subscription_type
     type: string
     default: nonprd
-    values: [nonprd, prd]
+    values:
+      - nonprd
+      - prd
 
   - name: poolName
     type: string
@@ -23,7 +26,11 @@ parameters:
 
 stages:
 - stage: rg_tags
-  displayName: "RG Tags (${{ parameters.adh_group }}${{ parameters.adh_sub_group != '' && format('_{0}', parameters.adh_sub_group) || '' }} / ${{ parameters.adh_subscription_type }})"
+  displayName: >
+    RG Tags (${{ parameters.adh_group }}
+    ${{ if ne(parameters.adh_sub_group, '') }}_${{ parameters.adh_sub_group }}
+    / ${{ parameters.adh_subscription_type }})
+  # do not run if adh_group is empty
   condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
   jobs:
@@ -33,17 +40,15 @@ stages:
       variableGroup: modernization_tfstate_backend_details
       scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Tags.ps1'
       workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
-
       arguments: >-
         -TenantId "$(tenant_id)"
         -ClientId "$(backend_client_id)"
         -ClientSecret "$(backend_client_secret)"
         -adh_group "${{ parameters.adh_group }}"
-        -adh_sub_group "${{ parameters.adh_sub_group }}"            # <-- Added here
+        -adh_sub_group "${{ parameters.adh_sub_group }}"
         -adh_subscription_type "${{ parameters.adh_subscription_type }}"
         -OutputDir "$(Build.ArtifactStagingDirectory)/rg-tags"
         -BranchName "$(Build.SourceBranchName)"
-
       artifactName: 'rg-tags'
       publishPath: '$(Build.ArtifactStagingDirectory)/rg-tags'
       poolName: ${{ parameters.poolName }}
