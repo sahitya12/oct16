@@ -3,14 +3,16 @@ parameters:
     type: string
     default: ''
 
-  - name: adh_sub_group
+  - name: adh_sub_group       # OPTIONAL – can be left empty
     type: string
     default: ''
 
   - name: adh_subscription_type
     type: string
     default: nonprd
-    values: [nonprd, prd]
+    values:
+      - nonprd
+      - prd
 
   - name: poolName
     type: string
@@ -22,21 +24,15 @@ parameters:
 
 stages:
 - stage: rg_permissions
-  displayName: >
-    RG Permissions (
-      ${{ parameters.adh_group }}
-      ${{ if ne(parameters.adh_sub_group, '') }}_${{ parameters.adh_sub_group }}${{ end }}
-      / ${{ parameters.adh_subscription_type }}
-    )
-
+  # Keep displayName simple – don't try to do conditional concat here
+  displayName: ${{ format('RG Permissions ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) }}
   condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
   jobs:
   - template: ../templates/job.powershell-with-az.yml
     parameters:
-      displayName: 'RG Permissions Scan'
+      displayName: 'RG Permissions (ByCustodian)'
       variableGroup: modernization_tfstate_backend_details
-
       scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1'
       workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
 
