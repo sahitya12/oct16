@@ -1,54 +1,173 @@
-parameters:
-  - name: adh_group
-    type: string
-    default: ''
+param(
+    [Parameter(Mandatory)][string]$TenantId,
+    [Parameter(Mandatory)][string]$ClientId,
+    [Parameter(Mandatory)][string]$ClientSecret,
+    [Parameter(Mandatory)][string]$adh_group,
+    [string]$adh_sub_group = '',
+    [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
+    [Parameter(Mandatory)][string]$OutputDir,
+    [string]$BranchName = ''
+)
 
-  - name: adh_sub_group       # OPTIONAL – can be left empty
-    type: string
-    default: ''
+Import-Module Az.Accounts, Az.Resources -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
-  - name: adh_subscription_type
-    type: string
-    default: nonprd
-    values:
-      - nonprd
-      - prd
+Ensure-Dir -Path $OutputDir | Out-Null
 
-  - name: poolName
-    type: string
-    default: 'Self-Hosted-Pool'
+Write-Host "DEBUG: TenantId       = $TenantId"
+Write-Host "DEBUG: ClientId       = $ClientId"
+Write-Host "DEBUG: adh_group      = $adh_group"
+Write-Host "DEBUG: adh_sub_group  = $adh_sub_group"
+Write-Host "DEBUG: subscription   = $adh_subscription_type"
+Write-Host "DEBUG: OutputDir      = $OutputDir"
+Write-Host "DEBUG: BranchName     = $BranchName"
 
-  - name: agentName
-    type: string
-    default: ''
+# --------------------------------------------------------------------
+# Connect to Azure
+# --------------------------------------------------------------------
+if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
+    throw "Azure connection failed."
+}
 
-stages:
-- stage: rg_permissions
-  # Keep displayName simple – don't try to do conditional concat here
-  displayName: ${{ format('RG Permissions ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) }}
-  condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
+# --------------------------------------------------------------------
+# Build RG search patterns
+# --------------------------------------------------------------------
+$patterns = @("*$adh_group*")
 
-  jobs:
-  - template: ../templates/job.powershell-with-az.yml
-    parameters:
-      displayName: 'RG Permissions (ByCustodian)'
-      variableGroup: modernization_tfstate_backend_details
-      scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1'
-      workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
+if (-not [string]::IsNullOrWhiteSpace($adh_sub_group)) {
+    $patterns += "*${adh_group}_${adh_sub_group}*"
+}
 
-      arguments: >-
-        -TenantId "$(tenant_id)"
-        -ClientId "$(backend_client_id)"
-        -ClientSecret "$(backend_client_secret)"
-        -adh_group "${{ parameters.adh_group }}"
-        -adh_sub_group "${{ parameters.adh_sub_group }}"
-        -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-        -ProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
-        -NonProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
-        -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
-        -BranchName "$(Build.SourceBranchName)"
+Write-Host "DEBUG: RG patterns to search:"
+$patterns | ForEach-Object { Write-Host " - $_" }
 
-      artifactName: 'rg-permissions'
-      publishPath: '$(Build.ArtifactStagingDirectory)/rg-permissions'
-      poolName: ${{ parameters.poolName }}
-      agentName: ${{ parameters.agentName }}
+# --------------------------------------------------------------------
+# Resolve subscriptions
+# --------------------------------------------------------------------
+$subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
+
+# Collect unique tag keys
+$allTagKeys = [System.Collections.Generic.HashSet[string]]::new()
+$entries = @()
+
+foreach ($sub in $subs) {
+    Set-ScContext -Subscription $sub
+
+    Write-Host ""
+    Write-Host "=== Subscription: $($sub.Name) ===" -ForegroundColor Cyan
+
+    $rgs = Get-AzResourceGroup -ErrorAction SilentlyContinue
+
+    foreach ($rg in $rgs) {
+
+        # If RG does NOT match ANY of the required patterns, skip
+        if (-not ($patterns | ForEach-Object { $rg.ResourceGroupName -like $_ } | Where-Object { $_ })) {
+            continue
+        }
+
+        # --------------------------------------------
+        # RG tags
+        # --------------------------------------------
+        $rgTags = @{}
+        if ($rg.Tags) {
+            foreach ($key in $rg.Tags.Keys) {
+                $rgTags[$key] = $rg.Tags[$key]
+                $allTagKeys.Add($key) | Out-Null
+            }
+        }
+
+        # Record RG entry
+        $entries += [PSCustomObject]@{
+            Scope         = 'ResourceGroup'
+            ResourceGroup = $rg.ResourceGroupName
+            ResourceName  = ''
+            ResourceType  = ''
+            RgTags        = $rgTags
+            ResTags       = @{}
+        }
+
+        # --------------------------------------------
+        # Resource tags
+        # --------------------------------------------
+        $resources = Get-AzResource -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
+
+        foreach ($res in $resources) {
+            $resTags = @{}
+            if ($res.Tags) {
+                foreach ($k in $res.Tags.Keys) {
+                    $resTags[$k] = $res.Tags[$k]
+                    $allTagKeys.Add($k) | Out-Null
+                }
+            }
+
+            $entries += [PSCustomObject]@{
+                Scope         = 'Resource'
+                ResourceGroup = $rg.ResourceGroupName
+                ResourceName  = $res.Name
+                ResourceType  = $res.ResourceType
+                RgTags        = $rgTags
+                ResTags       = $resTags
+            }
+        }
+    }
+}
+
+# --------------------------------------------------------------------
+# Build final merged tag dataset
+# --------------------------------------------------------------------
+$rows = foreach ($item in $entries) {
+
+    $inheritedFlag = 'No'
+    if ($item.Scope -eq 'Resource') {
+        if (($item.ResTags.Count -eq 0) -and ($item.RgTags.Count -gt 0)) {
+            $inheritedFlag = 'Yes'
+        }
+    }
+
+    $obj = [ordered]@{
+        Scope          = $item.Scope
+        ResourceGroup  = $item.ResourceGroup
+        ResourceName   = $item.ResourceName
+        ResourceType   = $item.ResourceType
+        InheritedFromRG = $inheritedFlag
+    }
+
+    foreach ($tagKey in $allTagKeys) {
+        $value = $null
+        if ($item.ResTags.ContainsKey($tagKey)) {
+            $value = $item.ResTags[$tagKey]
+        }
+        elseif ($item.RgTags.ContainsKey($tagKey)) {
+            $value = $item.RgTags[$tagKey]
+        }
+        $obj[$tagKey] = $value
+    }
+
+    [PSCustomObject]$obj
+}
+
+if (-not $rows -or $rows.Count -eq 0) {
+    $rows = @(
+        [PSCustomObject]@{
+            Scope           = ''
+            ResourceGroup   = ''
+            ResourceName    = ''
+            ResourceType    = ''
+            InheritedFromRG = ''
+        }
+    )
+}
+
+# --------------------------------------------------------------------
+# Export CSV + HTML
+# --------------------------------------------------------------------
+$csvOut = New-StampedPath -BaseDir $OutputDir -Prefix ("rg_tags_{0}_{1}" -f $adh_group, $adh_subscription_type)
+Write-CsvSafe -Rows $rows -Path $csvOut
+
+$htmlOut = $csvOut -replace '\.csv$','.html'
+Convert-CsvToHtml -CsvPath $csvOut -HtmlPath $htmlOut -Title "RG & Resource Tags ($adh_group / $adh_subscription_type) $BranchName"
+
+Write-Host "RG Tag Scan Completed." -ForegroundColor Green
+Write-Host "CSV : $csvOut"
+Write-Host "HTML: $htmlOut"
