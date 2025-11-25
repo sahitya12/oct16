@@ -3,8 +3,7 @@ parameters:
     type: string
     default: ''
 
-  # OPTIONAL – can be left blank in the Run UI
-  - name: adh_sub_group
+  - name: adh_sub_group       # OPTIONAL – can stay empty
     type: string
     default: ''
 
@@ -26,11 +25,14 @@ parameters:
 
 stages:
 - stage: rg_tags
-  displayName: >
-    RG Tags (${{ parameters.adh_group }}
-    ${{ if ne(parameters.adh_sub_group, '') }}_${{ parameters.adh_sub_group }}
-    / ${{ parameters.adh_subscription_type }})
-  # do not run if adh_group is empty
+  # Dynamic displayName depending on adh_sub_group
+  ${{ if eq(parameters.adh_sub_group, '') }}:
+    displayName: ${{ format('RG Tags ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) }}
+
+  ${{ if ne(parameters.adh_sub_group, '') }}:
+    displayName: ${{ format('RG Tags ({0}_{1} / {2})', parameters.adh_group, parameters.adh_sub_group, parameters.adh_subscription_type) }}
+
+  # Only run if adh_group is set
   condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
   jobs:
