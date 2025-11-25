@@ -1,16 +1,20 @@
+# .azure-pipelines/stages/rg_permissions.stage.yml
+
 parameters:
   - name: adh_group
     type: string
     default: ''
 
-  - name: adh_sub_group
+  - name: adh_sub_group          # optional
     type: string
     default: ''
 
   - name: adh_subscription_type
     type: string
     default: nonprd
-    values: [nonprd, prd]
+    values:
+      - nonprd
+      - prd
 
   - name: poolName
     type: string
@@ -22,38 +26,64 @@ parameters:
 
 
 stages:
-- stage: rg_permissions
+# -------------------------------------------------------------------
+# Case 1: adh_sub_group IS provided  -> "SC_OPX"
+# -------------------------------------------------------------------
+- ${{ if ne(parameters.adh_sub_group, '') }}:
+  - stage: rg_permissions
+    displayName: "RG Permissions (${{ parameters.adh_group }}_${{ parameters.adh_sub_group }} / ${{ parameters.adh_subscription_type }})"
+    condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
-  # Dynamic Stage Name
-  displayName: >
-    ${{ parameters.adh_sub_group != '' 
-        && format('RG Permissions ({0}_{1} / {2})', parameters.adh_group, parameters.adh_sub_group, parameters.adh_subscription_type)
-        || format('RG Permissions ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type)
-    }}
+    jobs:
+    - template: ../templates/job.powershell-with-az.yml
+      parameters:
+        displayName: 'RG Permissions (ByCustodian)'
+        variableGroup: modernization_tfstate_backend_details
+        scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1'
+        workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
+        arguments: >-
+          -TenantId "$(tenant_id)"
+          -ClientId "$(backend_client_id)"
+          -ClientSecret "$(backend_client_secret)"
+          -adh_group "${{ parameters.adh_group }}"
+          -adh_sub_group "${{ parameters.adh_sub_group }}"
+          -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+          -ProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
+          -NonProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
+          -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
+          -BranchName "$(Build.SourceBranchName)"
+        artifactName: 'rg-permissions'
+        publishPath: '$(Build.ArtifactStagingDirectory)/rg-permissions'
+        poolName: ${{ parameters.poolName }}
+        agentName: ${{ parameters.agentName }}
 
-  condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
+# -------------------------------------------------------------------
+# Case 2: adh_sub_group is EMPTY -> just "SC"
+# -------------------------------------------------------------------
+- ${{ if eq(parameters.adh_sub_group, '') }}:
+  - stage: rg_permissions
+    displayName: "RG Permissions (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
+    condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
-  jobs:
-  - template: ../templates/job.powershell-with-az.yml
-    parameters:
-      displayName: 'RG Permissions'
-      variableGroup: modernization_tfstate_backend_details
-      scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1'
-      workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
-
-      arguments: >-
-        -TenantId "$(tenant_id)"
-        -ClientId "$(backend_client_id)"
-        -ClientSecret "$(backend_client_secret)"
-        -adh_group "${{ parameters.adh_group }}"
-        -adh_sub_group "${{ parameters.adh_sub_group }}"
-        -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-        -ProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
-        -NonProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
-        -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
-        -BranchName "$(Build.SourceBranchName)"
-
-      artifactName: 'rg-permissions'
-      publishPath: '$(Build.ArtifactStagingDirectory)/rg-permissions'
-      poolName: ${{ parameters.poolName }}
-      agentName: ${{ parameters.agentName }}
+    jobs:
+    - template: ../templates/job.powershell-with-az.yml
+      parameters:
+        displayName: 'RG Permissions (ByCustodian)'
+        variableGroup: modernization_tfstate_backend_details
+        scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1'
+        workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
+        arguments: >-
+          -TenantId "$(tenant_id)"
+          -ClientId "$(backend_client_id)"
+          -ClientSecret "$(backend_client_secret)"
+          -adh_group "${{ parameters.adh_group }}"
+          -adh_sub_group "${{ parameters.adh_sub_group }}"   # will be empty string
+          -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+          -ProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv"
+          -NonProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
+          -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
+          -BranchName "$(Build.SourceBranchName)"
+        artifactName: 'rg-permissions'
+        publishPath: '$(Build.ArtifactStagingDirectory)/rg-permissions'
+        poolName: ${{ parameters.poolName }}
+        agentName: ${{ parameters.agentName }}
