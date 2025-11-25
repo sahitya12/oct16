@@ -57,7 +57,7 @@ Write-Host "DEBUG: <Cust>    = $custLower"
 # ----------------------------------------------------------------------
 # Identity cache + resolver
 # ----------------------------------------------------------------------
-$script:IdentityCache = @{}
+$script:IdentityCache = @{ }
 
 function Resolve-IdentityObjectId {
     param(
@@ -131,14 +131,34 @@ foreach ($sub in $subs) {
         $cont   = ($r.ContainerName       -replace '<Cust>',      $custLower).Trim()
         $iden   = ($r.Identity            -replace '<Custodian>', $Custodian).Trim()
 
+        # ---------- ENV FILTER (only scan correct ADLS for env) ----------
+        # Assuming ADLS names like:
+        #   adh<cust>adlsnonprd  -> nonprod
+        #   adh<cust>adlsprd     -> prod
+        if ($adh_subscription_type -eq 'prd') {
+            # prd run -> skip *nonprd* accounts
+            if ($saName -match 'adlsnonprd$') {
+                Write-Host "SKIP (prd run): nonprod ADLS $saName" -ForegroundColor Yellow
+                continue
+            }
+        }
+        else {
+            # nonprd run -> skip *prd* accounts
+            if ($saName -match 'adlsprd$') {
+                Write-Host "SKIP (nonprd run): prod ADLS $saName" -ForegroundColor Yellow
+                continue
+            }
+        }
+        # ------------------------------------------------------------------
+
         # AccessPath handling
         $accessPath = ($r.AccessPath -replace '<Custodian>', $Custodian) -replace '<Cust>', $custLower
         $accessPath = $accessPath.Trim()
 
         # /catalog → /adh_<adh_group_lower>...
         if ($accessPath -like '/catalog*') {
-            $suffix     = $accessPath.Substring(8)   # after "/catalog"
-            $adhLower   = $adh_group.ToLower()
+            $suffix   = $accessPath.Substring(8)   # after "/catalog"
+            $adhLower = $adh_group.ToLower()
             $accessPath = "/adh_${adhLower}${suffix}"
         }
 
