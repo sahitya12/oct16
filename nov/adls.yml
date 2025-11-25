@@ -3,9 +3,9 @@ parameters:
   type: string
   default: ''
 
-- name: adh_sub_group        # OPTIONAL – can be left empty
+- name: adh_sub_group
   type: string
-  default: ''
+  default: ''          # OPTIONAL – can be left empty
 
 - name: adh_subscription_type
   type: string
@@ -22,20 +22,23 @@ parameters:
   type: string
   default: ''
 
+# OPTIONAL: allow changing stage name if ever needed
+- name: stageName
+  type: string
+  default: 'adls_validation'
+
 
 stages:
-- stage: adls_validation
+- stage: ${{ parameters.stageName }}
 
-  # Dynamic displayName depending on adh_sub_group
-  # When adh_sub_group is empty → "ADLS ACL Validation (KTK / nonprd)"
+  # DisplayName WITHOUT subgroup
   ${{ if eq(parameters.adh_sub_group, '') }}:
     displayName: ${{ format('ADLS ACL Validation ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) }}
 
-  # When adh_sub_group is set → "ADLS ACL Validation (KTK_PLT / nonprd)"
+  # DisplayName WITH subgroup
   ${{ if ne(parameters.adh_sub_group, '') }}:
     displayName: ${{ format('ADLS ACL Validation ({0}_{1} / {2})', parameters.adh_group, parameters.adh_sub_group, parameters.adh_subscription_type) }}
 
-  # Only run if adh_group is filled
   condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
   jobs:
