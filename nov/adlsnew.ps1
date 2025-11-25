@@ -13,7 +13,6 @@ param(
     [string]$BranchName = ''
 )
 
-
 Import-Module Az.Accounts, Az.Resources, Az.Storage -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
@@ -23,7 +22,6 @@ Write-Host "==== ADLS Validation START ====" -ForegroundColor Cyan
 Write-Host "adh_group       = $adh_group"
 Write-Host "adh_sub_group   = $adh_sub_group"
 Write-Host "subscription    = $adh_subscription_type"
-
 
 # ============================================================================
 # SELECT CSV FILE: adls_prd_permissions.csv OR adls_nonprd_permissions.csv
@@ -42,7 +40,6 @@ if ([string]::IsNullOrWhiteSpace($InputCsvPath)) {
 
 Write-Host "Using input CSV: $InputCsvPath"
 
-
 # ============================================================================
 # CONNECT TO AZURE
 # ============================================================================
@@ -51,22 +48,20 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # ============================================================================
-# CUSTODIAN LOGIC — Updated as per your requirement
+# CUSTODIAN LOGIC
 # ============================================================================
-
-# Identity = adh_group or adh_group_adh_sub_group
+# Identity custodian = adh_group  OR  adh_group_adh_sub_group
 $IdentityCustodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 } else {
     "${adh_group}_${adh_sub_group}"
 }
 
-# <Cust> = ALWAYS adh_group lower (WITHOUT subgroup)
+# <Cust> = ALWAYS adh_group lower (WITHOUT subgroup) for SA/container names
 $custLower = $adh_group.ToLower() -replace '_',''
 
 Write-Host "Identity Replacement Custodian = $IdentityCustodian"
 Write-Host "Lowercase Cust for SA/Containers = $custLower"
-
 
 # ============================================================================
 # LOAD CSV
@@ -75,7 +70,6 @@ $rows = Import-Csv -LiteralPath $InputCsvPath
 
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
-
 
 $out = @()
 
@@ -86,43 +80,53 @@ foreach ($sub in $subs) {
     foreach ($r in $rows) {
 
         # ===========================================================
-        # APPLY NEW PLACEHOLDER REPLACEMENT RULES
+        # PLACEHOLDER REPLACEMENT RULES
         # ===========================================================
-
         # ResourceGroupName: always adh_group
         $rgName = ($r.ResourceGroupName -replace '<Custodian>', $adh_group).Trim()
 
-        # StorageAccountName: only <Cust> → adh_group lower
+        # StorageAccountName: <Cust> -> adh_group lower, <Custodian> -> adh_group
         $saName = ($r.StorageAccountName -replace '<Cust>', $custLower).Trim()
-        $saName = ($saName -replace '<Custodian>', $adh_group).Trim()  # safety
+        $saName = ($saName -replace '<Custodian>', $adh_group).Trim()
 
-        # ContainerName: only <Cust> → adh_group lower
+        # ContainerName: <Cust> -> adh_group lower
         $cont = ($r.ContainerName -replace '<Cust>', $custLower).Trim()
 
-        # Identity: Use IdentityCustodian
+        # Identity: use IdentityCustodian
         $iden = ($r.Identity -replace '<Custodian>', $IdentityCustodian).Trim()
 
-        # AccessPath rules
+        # AccessPath base replacements
         $accessPath = $r.AccessPath.Trim()
         $accessPath = ($accessPath -replace '<Cust>', $custLower)
         $accessPath = ($accessPath -replace '<Custodian>', $IdentityCustodian)
 
-        # Catalog rules
+        # ====================== CATALOG RULES ======================
+        # You wanted:
+        # - If ONLY adh_group is passed:
+        #       "/catalog..." -> "/adh_<adh_group><suffix>"
+        # - If adh_sub_group is also passed:
+        #       "/catalog..." -> "/ash_<adh_group>_<adh_sub_group><suffix>"
         if ($accessPath -like "/catalog*") {
-            $suffix = $accessPath.Substring(8)
-            $accessPath = "/adh_${IdentityCustodian.ToLower()}$suffix"
+            $suffix = $accessPath.Substring(8)   # text after "/catalog"
+
+            if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+                # Example: /catalog/db1 -> /adh_sc/db1
+                $accessPath = "/adh_{0}{1}" -f $adh_group.ToLower(), $suffix
+            }
+            else {
+                # Example: /catalog/db1 -> /ash_sc_svs/db1
+                $accessPath = "/ash_{0}_{1}{2}" -f $adh_group.ToLower(), $adh_sub_group.ToLower(), $suffix
+            }
         }
+        # ==================== END CATALOG RULES ====================
 
-        # "/" → empty
+        # "/" → empty for Gen2 Path parameter
         $normalizedPath = if ($accessPath -eq '/') { '' } else { $accessPath }
-
         $folderForReport = if ($normalizedPath -eq '') { "/" } else { $normalizedPath }
-
 
         # ===========================================================
         # LOOKUP STORAGE/CONTAINER/ACL
         # ===========================================================
-
         try {
             $sa = Get-AzStorageAccount -ResourceGroupName $rgName -Name $saName -ErrorAction Stop
         }
@@ -144,7 +148,7 @@ foreach ($sub in $subs) {
         $ctx = $sa.Context
 
         try {
-            $container = Get-AzStorageContainer -Name $cont -Context $ctx -ErrorAction Stop
+            $null = Get-AzStorageContainer -Name $cont -Context $ctx -ErrorAction Stop
         }
         catch {
             $out += [pscustomobject]@{
@@ -161,17 +165,18 @@ foreach ($sub in $subs) {
             continue
         }
 
-
         # ===========================================================
         # ACL CHECK
         # ===========================================================
         try {
             $params = @{
-                FileSystem = $cont
-                Context    = $ctx
+                FileSystem  = $cont
+                Context     = $ctx
                 ErrorAction = 'Stop'
             }
-            if ($normalizedPath) { $params['Path'] = $normalizedPath.TrimStart('/') }
+            if ($normalizedPath) {
+                $params['Path'] = $normalizedPath.TrimStart('/')
+            }
 
             $item      = Get-AzDataLakeGen2Item @params
             $aclString = $item.Acl
@@ -184,13 +189,13 @@ foreach ($sub in $subs) {
             }
 
             $status = if ($matchEntry) { "OK" } else { "MISSING" }
-            $notes  = if ($matchEntry) { "ACL contains required permission" } else { "Missing required ACL entry" }
+            $notes  = if ($matchEntry) { "ACL contains required permission" } else { "Missing required ACL entry"
+            }
         }
         catch {
             $status = "ERROR"
             $notes  = "ACL read failed: $($_.Exception.Message)"
         }
-
 
         $out += [pscustomobject]@{
             SubscriptionName = $sub.Name
