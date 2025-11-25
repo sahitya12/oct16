@@ -1,11 +1,15 @@
 # /sanitychecks/.azure-pipelines/stages/adls.stage.yml
 
 parameters:
+- name: stageName          # NEW – so the caller can choose a unique name
+  type: string
+  default: 'adls_validation'
+
 - name: adh_group
   type: string
   default: ''
 
-- name: adh_sub_group          # OPTIONAL – can be blank
+- name: adh_sub_group      # OPTIONAL – can be blank
   type: string
   default: ''
 
@@ -25,10 +29,8 @@ parameters:
   default: ''
 
 stages:
-- stage: adls_validation
-  # Keep displayName simple to avoid YAML/template parser drama
+- stage: ${{ parameters.stageName }}
   displayName: "ADLS ACL Validation (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
-  # Only require adh_group; adh_sub_group can stay empty
   condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
   jobs:
