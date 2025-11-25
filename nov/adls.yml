@@ -1,3 +1,4 @@
+# stages/adls.stage.yml
 parameters:
 - name: adh_group
   type: string
@@ -22,23 +23,13 @@ parameters:
   type: string
   default: ''
 
-# OPTIONAL: allow changing stage name if ever needed
-- name: stageName
-  type: string
-  default: 'adls_validation'
-
-
 stages:
-- stage: ${{ parameters.stageName }}
-
-  # DisplayName WITHOUT subgroup
-  ${{ if eq(parameters.adh_sub_group, '') }}:
-    displayName: ${{ format('ADLS ACL Validation ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) }}
-
-  # DisplayName WITH subgroup
-  ${{ if ne(parameters.adh_sub_group, '') }}:
-    displayName: ${{ format('ADLS ACL Validation ({0}_{1} / {2})', parameters.adh_group, parameters.adh_sub_group, parameters.adh_subscription_type) }}
-
+- stage: adls_validation
+  displayName: ${{ 
+    eq(parameters.adh_sub_group, '') 
+      ? format('ADLS ACL Validation ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) 
+      : format('ADLS ACL Validation ({0}_{1} / {2})', parameters.adh_group, parameters.adh_sub_group, parameters.adh_subscription_type) 
+    }}
   condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
   jobs:
