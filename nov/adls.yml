@@ -1,12 +1,13 @@
-# stages/adls.stage.yml
+# /sanitychecks/.azure-pipelines/stages/adls.stage.yml
+
 parameters:
 - name: adh_group
   type: string
   default: ''
 
-- name: adh_sub_group
+- name: adh_sub_group          # OPTIONAL – can be blank
   type: string
-  default: ''          # OPTIONAL – can be left empty
+  default: ''
 
 - name: adh_subscription_type
   type: string
@@ -25,11 +26,9 @@ parameters:
 
 stages:
 - stage: adls_validation
-  displayName: ${{ 
-    eq(parameters.adh_sub_group, '') 
-      ? format('ADLS ACL Validation ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) 
-      : format('ADLS ACL Validation ({0}_{1} / {2})', parameters.adh_group, parameters.adh_sub_group, parameters.adh_subscription_type) 
-    }}
+  # Keep displayName simple to avoid YAML/template parser drama
+  displayName: "ADLS ACL Validation (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
+  # Only require adh_group; adh_sub_group can stay empty
   condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
   jobs:
