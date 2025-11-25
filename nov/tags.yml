@@ -3,7 +3,7 @@ parameters:
     type: string
     default: ''
 
-  - name: adh_sub_group       # OPTIONAL – can stay empty
+  - name: adh_sub_group      # optional
     type: string
     default: ''
 
@@ -24,36 +24,30 @@ parameters:
 
 
 stages:
-- stage: adls_validation
-
-  # Dynamic displayName depending on adh_sub_group
-  ${{ if eq(parameters.adh_sub_group, '') }}:
-    displayName: ${{ format('ADLS ACL Validation ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) }}
-
-  ${{ if ne(parameters.adh_sub_group, '') }}:
-    displayName: ${{ format('ADLS ACL Validation ({0}_{1} / {2})', parameters.adh_group, parameters.adh_sub_group, parameters.adh_subscription_type) }}
-
-  # Only run if adh_group is set
+- stage: rg_tags
+  displayName: "RG & Resource Tags Validation"
   condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
   jobs:
-  - template: ../templates/job.powershell-with-az.yml
-    parameters:
-      displayName: 'ADLS ACL Validation'
-      variableGroup: modernization_tfstate_backend_details
-      scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-ADLS-Acls.ps1'
-      workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
-      arguments: >-
-        -TenantId "$(tenant_id)"
-        -ClientId "$(backend_client_id)"
-        -ClientSecret "$(backend_client_secret)"
-        -adh_group "${{ parameters.adh_group }}"
-        -adh_sub_group "${{ parameters.adh_sub_group }}"
-        -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-        -InputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv"
-        -OutputDir "$(Build.ArtifactStagingDirectory)/adls-acl"
-        -BranchName "$(Build.SourceBranchName)"
-      artifactName: 'adls-acl-results'
-      publishPath: '$(Build.ArtifactStagingDirectory)/adls-acl'
-      poolName: ${{ parameters.poolName }}
-      agentName: ${{ parameters.agentName }}
+    - template: ../templates/job.powershell-with-az.yml
+      parameters:
+        displayName: "Scan RG & Resource Tags"
+
+        variableGroup: modernization_tfstate_backend_details
+        scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Tags.ps1'
+        workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
+
+        arguments: >-
+          -TenantId "$(tenant_id)"
+          -ClientId "$(backend_client_id)"
+          -ClientSecret "$(backend_client_secret)"
+          -adh_group "${{ parameters.adh_group }}"
+          -adh_sub_group "${{ parameters.adh_sub_group }}"
+          -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+          -OutputDir "$(Build.ArtifactStagingDirectory)/rg-tags"
+          -BranchName "$(Build.SourceBranchName)"
+
+        artifactName: 'rg-tags-results'
+        publishPath: '$(Build.ArtifactStagingDirectory)/rg-tags'
+        poolName: ${{ parameters.poolName }}
+        agentName: ${{ parameters.agentName }}
