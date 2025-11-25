@@ -3,7 +3,7 @@ parameters:
     type: string
     default: ''
 
-  - name: adh_sub_group
+  - name: adh_sub_group          # optional – can stay empty
     type: string
     default: ''
 
@@ -20,11 +20,24 @@ parameters:
     type: string
     default: ''
 
-# Build custodian part safely
-variables:
-  custodian_full: >
-    ${{ parameters.adh_group }}${{ ne(parameters.adh_sub_group, '') && format('_{0}', parameters.adh_sub_group) }}
 
+# -------------------------
+# Variables
+# -------------------------
+variables:
+  # default: just adh_group
+  - name: custodian_full
+    value: ${{ parameters.adh_group }}
+
+  # if adh_sub_group is not empty => overwrite with adh_group_adh_sub_group
+  - ${{ if ne(parameters.adh_sub_group, '') }}:
+    - name: custodian_full
+      value: ${{ format('{0}_{1}', parameters.adh_group, parameters.adh_sub_group) }}
+
+
+# -------------------------
+# Stage
+# -------------------------
 stages:
 - stage: rg_permissions
   displayName: "RG Permissions (${{ variables.custodian_full }} / ${{ parameters.adh_subscription_type }})"
@@ -33,11 +46,10 @@ stages:
   jobs:
   - template: ../templates/job.powershell-with-az.yml
     parameters:
-      displayName: 'RG Permissions'
+      displayName: 'RG Permissions (ByCustodian)'
       variableGroup: modernization_tfstate_backend_details
       scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-RG-Permissions-ByCustodian.ps1'
       workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
-
       arguments: >-
         -TenantId "$(tenant_id)"
         -ClientId "$(backend_client_id)"
@@ -49,7 +61,6 @@ stages:
         -NonProdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv"
         -OutputDir "$(Build.ArtifactStagingDirectory)/rg-permissions"
         -BranchName "$(Build.SourceBranchName)"
-
       artifactName: 'rg-permissions'
       publishPath: '$(Build.ArtifactStagingDirectory)/rg-permissions'
       poolName: ${{ parameters.poolName }}
