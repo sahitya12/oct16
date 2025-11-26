@@ -33,7 +33,6 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 # Build RG search patterns
 # --------------------------------------------------------------------
 $patterns = @("*$adh_group*")
-
 if (-not [string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $patterns += "*${adh_group}_${adh_sub_group}*"
 }
@@ -49,7 +48,7 @@ if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
 # Collect unique tag keys
 $allTagKeys = [System.Collections.Generic.HashSet[string]]::new()
-$entries = @()
+$entries    = @()
 
 foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
@@ -61,10 +60,15 @@ foreach ($sub in $subs) {
 
     foreach ($rg in $rgs) {
 
-        # If RG does NOT match ANY of the required patterns, skip
-        if (-not ($patterns | ForEach-Object { $rg.ResourceGroupName -like $_ } | Where-Object { $_ })) {
-            continue
+        # Check if RG name matches any pattern
+        $rgMatches = $false
+        foreach ($p in $patterns) {
+            if ($rg.ResourceGroupName -like $p) {
+                $rgMatches = $true
+                break
+            }
         }
+        if (-not $rgMatches) { continue }
 
         # --------------------------------------------
         # RG tags
@@ -77,12 +81,12 @@ foreach ($sub in $subs) {
             }
         }
 
-        # Record RG entry
+        # Record RG entry (now with ResourceName = RG name)
         $entries += [PSCustomObject]@{
             Scope         = 'ResourceGroup'
             ResourceGroup = $rg.ResourceGroupName
-            ResourceName  = ''
-            ResourceType  = ''
+            ResourceName  = $rg.ResourceGroupName
+            ResourceType  = 'Microsoft.Resources/resourceGroups'
             RgTags        = $rgTags
             ResTags       = @{}
         }
@@ -125,11 +129,12 @@ $rows = foreach ($item in $entries) {
         }
     }
 
+    # For RG rows, ResourceName is already set to RG name above.
     $obj = [ordered]@{
-        Scope          = $item.Scope
-        ResourceGroup  = $item.ResourceGroup
-        ResourceName   = $item.ResourceName
-        ResourceType   = $item.ResourceType
+        Scope           = $item.Scope
+        ResourceGroup   = $item.ResourceGroup
+        ResourceName    = $item.ResourceName
+        ResourceType    = $item.ResourceType
         InheritedFromRG = $inheritedFlag
     }
 
