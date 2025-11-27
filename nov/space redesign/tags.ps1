@@ -183,13 +183,19 @@ if (-not $rows -or $rows.Count -eq 0) {
 }
 
 # --------------------------------------------------------------------
-# Export CSV + HTML
+# Export CSV + HTML with adh_group / adh_group_adh_sub_group
 # --------------------------------------------------------------------
-$csvOut = New-StampedPath -BaseDir $OutputDir -Prefix ("rg_tags_{0}_{1}" -f $adh_group, $adh_subscription_type)
+$groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+    $adh_group
+} else {
+    "${adh_group}_${adh_sub_group}"
+}
+
+$csvOut = New-StampedPath -BaseDir $OutputDir -Prefix ("rg_tags_{0}_{1}" -f $groupForFile, $adh_subscription_type)
 Write-CsvSafe -Rows $rows -Path $csvOut
 
 $htmlOut = $csvOut -replace '\.csv$','.html'
-Convert-CsvToHtml -CsvPath $csvOut -HtmlPath $htmlOut -Title "RG & Resource Tags ($adh_group / $adh_subscription_type) $BranchName"
+Convert-CsvToHtml -CsvPath $csvOut -HtmlPath $htmlOut -Title "RG & Resource Tags ($groupForFile / $adh_subscription_type) $BranchName"
 
 Write-Host "RG Tag Scan Completed." -ForegroundColor Green
 Write-Host "CSV : $csvOut"
