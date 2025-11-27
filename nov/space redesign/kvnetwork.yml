@@ -1,0 +1,49 @@
+parameters:
+  - name: adh_group
+    type: string
+    default: ''
+
+  # OPTIONAL – can be left empty; PS1 will trim spaces
+  - name: adh_sub_group
+    type: string
+    default: ''
+
+  - name: adh_subscription_type
+    type: string
+    default: nonprd
+    values: [nonprd, prd]
+
+  - name: poolName
+    type: string
+    default: 'Self-Hosted-Pool'
+
+  - name: agentName
+    type: string
+    default: ''
+
+stages:
+- stage: kv_firewall
+  displayName: ${{ format('KV Firewall ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) }}
+  condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
+
+  jobs:
+  - template: ../templates/job.powershell-with-az.yml
+    parameters:
+      displayName: 'KV Firewall'
+      variableGroup: modernization_tfstate_backend_details
+      scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-KV-Networks.ps1'
+      workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
+      arguments: >-
+        -TenantId "$(tenant_id)"
+        -ClientId "$(backend_client_id)"
+        -ClientSecret "$(backend_client_secret)"
+        -adh_group "${{ parameters.adh_group }}"
+        -adh_sub_group "${{ parameters.adh_sub_group }}"
+        -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+        -OutputDir "$(Build.ArtifactStagingDirectory)/kv-firewall"
+        -BranchName "$(Build.SourceBranchName)"
+
+      artifactName: 'kv-firewall'
+      publishPath: '$(Build.ArtifactStagingDirectory)/kv-firewall'
+      poolName: ${{ parameters.poolName }}
+      agentName: ${{ parameters.agentName }}
