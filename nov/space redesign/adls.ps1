@@ -1,4 +1,4 @@
-param(
+param( 
     [Parameter(Mandatory = $true)][string]$TenantId,
     [Parameter(Mandatory = $true)][string]$ClientId,
     [Parameter(Mandatory = $true)][string]$ClientSecret,
@@ -10,8 +10,11 @@ param(
     [string]$BranchName = ''
 )
 
+Import-Module Az.Accounts, Az.Resources, Az.Storage -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
+
 # ----------------------------------------------------------------------
-# Normalize adh_sub_group (handle single-space from pipeline)
+# Normalise adh_sub_group (handle " " etc.)
 # ----------------------------------------------------------------------
 if ($null -ne $adh_sub_group) {
     $adh_sub_group = $adh_sub_group.Trim()
@@ -20,9 +23,6 @@ if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     Write-Host "DEBUG: adh_sub_group is empty/space -> treating as <none>"
     $adh_sub_group = ''
 }
-
-Import-Module Az.Accounts, Az.Resources, Az.Storage -ErrorAction Stop
-Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
 Write-Host "DEBUG: TenantId      = $TenantId"
 Write-Host "DEBUG: ClientId      = $ClientId"
@@ -50,25 +50,27 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # ----------------------------------------------------------------------
-# Custodian / <Cust> helpers
+# Custodian helpers according to your rules
 # ----------------------------------------------------------------------
-# Custodian = adh_group or adh_group_adh_sub_group
-$Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+
+# For RG / SA / Container & <Cust>:
+#   - ALWAYS based on adh_group only (NO subgroup)
+$BaseCustodian = $adh_group
+$BaseCustLower = $adh_group.ToLower() -replace '_',''
+
+# For Identity:
+#   - If only adh_group:          CustIdentity = adh_group
+#   - If adh_sub_group present:   CustIdentity = adh_group_adh_sub_group
+$CustIdentity = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 }
 else {
     "${adh_group}_${adh_sub_group}"
 }
 
-# For <Cust> placeholders we still want lowercase and NO underscores
-$custLowerNoUnderscore = $Custodian.ToLower() -replace '_',''
-
-# For /catalog mapping we want lowercase BUT KEEP underscores
-$custLowerWithUnderscore = $Custodian.ToLower()
-
-Write-Host "DEBUG: Custodian (for <Custodian>)   = $Custodian"
-Write-Host "DEBUG: <Cust> (no underscore, lower) = $custLowerNoUnderscore"
-Write-Host "DEBUG: Cust (with underscore, lower) = $custLowerWithUnderscore"
+Write-Host "DEBUG: BaseCustodian (RG/SA/Cont)  = $BaseCustodian"
+Write-Host "DEBUG: <Cust> (lower, no _)        = $BaseCustLower"
+Write-Host "DEBUG: CustIdentity (for Identity) = $CustIdentity"
 
 # ----------------------------------------------------------------------
 # Identity cache + resolver
@@ -141,42 +143,60 @@ foreach ($sub in $subs) {
         # ------------------------------------------------------------------
         # Placeholder substitution per row
         # ------------------------------------------------------------------
-        # NOTE: We keep your current semantics for RG/SA/Container/Identity
-        $rgName = ($r.ResourceGroupName   -replace '<Custodian>', $Custodian).Trim()
-        $saName = ($r.StorageAccountName  -replace '<Custodian>', $Custodian).Trim()
-        $saName = ($saName                -replace '<Cust>',      $custLowerNoUnderscore).Trim()
-        $cont   = ($r.ContainerName       -replace '<Cust>',      $custLowerNoUnderscore).Trim()
-        $iden   = ($r.Identity            -replace '<Custodian>', $Custodian).Trim()
 
-        # ---------- ENV FILTER (only scan correct ADLS for env) ----------
-        # Relaxed matching: just look for 'adlsnonprd' / 'adlsprd' anywhere
+        # RG: <Custodian> => adh_group only
+        $rgName = ($r.ResourceGroupName -replace '<Custodian>', $BaseCustodian).Trim()
+
+        # StorageAccountName: <Custodian> / <Cust> => adh_group only
+        $saName = $r.StorageAccountName
+        $saName = ($saName -replace '<Custodian>', $BaseCustodian)
+        $saName = ($saName -replace '<Cust>',      $BaseCustLower)
+        $saName = $saName.Trim()
+
+        # ContainerName: same rule as SA
+        $cont = $r.ContainerName
+        $cont = ($cont -replace '<Custodian>', $BaseCustodian)
+        $cont = ($cont -replace '<Cust>',      $BaseCustLower)
+        $cont = $cont.Trim()
+
+        # Identity: <Custodian> based on CustIdentity
+        $iden = ($r.Identity -replace '<Custodian>', $CustIdentity).Trim()
+
+        # ---------- ENV FILTER (same as before) ----------
         if ($adh_subscription_type -eq 'prd') {
-            # prd run -> skip nonprd accounts
-            if ($saName -like '*adlsnonprd*') {
+            # prd run -> skip *nonprd* accounts
+            if ($saName -match 'adlsnonprd$') {
                 Write-Host "SKIP (prd run): nonprod ADLS $saName" -ForegroundColor Yellow
                 continue
             }
         }
         else {
-            # nonprd run -> skip prod accounts
-            if ($saName -like '*adlsprd*') {
+            # nonprd run -> skip *prd* accounts
+            if ($saName -match 'adlsprd$') {
                 Write-Host "SKIP (nonprd run): prod ADLS $saName" -ForegroundColor Yellow
                 continue
             }
         }
-        # ------------------------------------------------------------------
 
         # AccessPath handling
         $accessPath = $r.AccessPath
-        $accessPath = ($accessPath -replace '<Custodian>', $Custodian)
-        $accessPath = ($accessPath -replace '<Cust>',      $custLowerNoUnderscore)
+        $accessPath = ($accessPath -replace '<Custodian>', $BaseCustodian)
+        $accessPath = ($accessPath -replace '<Cust>',      $BaseCustLower)
         $accessPath = $accessPath.Trim()
 
-        # /catalog → /adh_<adh_group>  or /adh_<adh_group>_<adh_sub_group>
-        # using lowercase but KEEPING underscores from Custodian
+        # /catalog → /adh_<adh_group> or /adh_<adh_group>_<adh_sub_group>
         if ($accessPath -like '/catalog*') {
-            $suffix   = $accessPath.Substring(8)   # after "/catalog"
-            $accessPath = "/adh_${custLowerWithUnderscore}${suffix}"
+            $prefixLength = '/catalog'.Length
+            $suffix       = $accessPath.Substring($prefixLength)  # includes leading / if present
+
+            if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+                # Only adh_group
+                $accessPath = "/adh_${adh_group}${suffix}"
+            }
+            else {
+                # adh_group + adh_sub_group
+                $accessPath = "/adh_${adh_group}_${adh_sub_group}${suffix}"
+            }
         }
 
         # Normalise root: "/" means container root (no Path parameter)
@@ -214,8 +234,7 @@ foreach ($sub in $subs) {
         # ------------------------------------------------------------------
         try {
             $sa = Get-AzStorageAccount -ResourceGroupName $rgName -Name $saName -ErrorAction Stop
-        }
-        catch {
+        } catch {
             $out += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $rgName
@@ -234,8 +253,7 @@ foreach ($sub in $subs) {
 
         try {
             $container = Get-AzStorageContainer -Name $cont -Context $ctx -ErrorAction Stop
-        }
-        catch {
+        } catch {
             $out += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $rgName
@@ -321,8 +339,7 @@ foreach ($sub in $subs) {
                 $notes = 'Permissions missing or mismatched'
             }
 
-        }
-        catch {
+        } catch {
             $status = 'ERROR'
             $notes  = "ACL read error: $($_.Exception.Message)"
         }
@@ -359,7 +376,7 @@ if (-not $out -or $out.Count -eq 0) {
 }
 
 # ----------------------------------------------------------------------
-# Export CSV + HTML with adh_group / adh_group_adh_sub_group
+# Export CSV + HTML (include adh_sub_group when present)
 # ----------------------------------------------------------------------
 $groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
