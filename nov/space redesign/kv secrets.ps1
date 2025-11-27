@@ -76,8 +76,10 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # --------------------------------------------------------------------
-# Subscription selection – mirror KV Permissions logic
+# Subscription selection – with safe fallback
 # --------------------------------------------------------------------
+$subs = $null
+
 switch ($adh_group.ToUpper()) {
   'KTK' {
     $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'dev_azure_20401_ADHPlatform' }
@@ -96,14 +98,18 @@ switch ($adh_group.ToUpper()) {
       $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'dev_azure_21001_ADHNHH' }
     }
   }
-  Default {
-    $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
-  }
 }
 
+# Fallback to generic resolver if special-case returned nothing
 if (-not $subs) {
+  Write-Host "DEBUG: Special-case subscription lookup empty; falling back to Resolve-ScSubscriptions..."
+  $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+}
+
+if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
+
+if (-not $subs -or $subs.Count -eq 0) {
   Write-Host "WARN: No subscriptions resolved for $adh_group / $adh_subscription_type"
-  $subs = @()
 }
 
 Write-Host "DEBUG: Subscriptions   = $($subs.Name -join ', ')"
@@ -129,7 +135,7 @@ foreach ($sub in $subs) {
 
   foreach ($row in $csvContent) {
 
-    # be extra defensive with header names + trimming
+    # robust header handling
     $rawKvName  = ($row.KEYVAULT_NAME, $row.KeyVaultName, $row.VaultName |
                    Where-Object { $_ -and $_.ToString().Trim() -ne '' } |
                    Select-Object -First 1)
@@ -162,29 +168,22 @@ foreach ($sub in $subs) {
         # find KV in cached list (case-insensitive)
         $kvRes = $allKVs | Where-Object { $_.Name -ieq $vaultName }
 
-        if (-not $kvRes) {
-            $note   = 'Key Vault not found'
-            $exists = $false
-        }
-        else {
+        if ($kvRes) {
             foreach ($kv in $kvRes) {
                 $kvRg = $kv.ResourceGroupName
 
                 try {
                     $sec = Get-AzKeyVaultSecret -VaultName $kv.Name -Name $secretName -ErrorAction Stop
-                    if ($null -ne $sec) { $exists = $true }
+                    if ($null -ne $sec) {
+                        $exists = $true
+                    }
                 }
                 catch {
                     $exists = $false
                 }
 
-                if ($exists) {
-                    $note = 'Secret exists'
-                } else {
-                    $note = 'Secret missing'
-                }
+                $note = if ($exists) { 'Secret exists' } else { 'Secret missing' }
 
-                # one row per (sub,kv,secret,env)
                 $result += [pscustomobject]@{
                     SubscriptionName = $sub.Name
                     VaultName        = $kv.Name
@@ -195,25 +194,9 @@ foreach ($sub in $subs) {
                     Notes            = $note
                 }
             }
-
-            # if for some reason we had kvRes but never added result, still add one
-            if (-not $kvRes -or ($result.Count -eq 0)) {
-                $result += [pscustomobject]@{
-                    SubscriptionName = $sub.Name
-                    VaultName        = $vaultName
-                    ResourceGroup    = $kvRg
-                    Environment      = $env
-                    SecretName       = $secretName
-                    Exists           = 'No'
-                    Notes            = 'Key Vault object resolved but secret check failed unexpectedly'
-                }
-            }
-
-            continue
         }
-
-        # KV not found at all in this subscription – still record row
-        if (-not $kvRes) {
+        else {
+            # KV not found at all in this subscription – still record row
             $result += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 VaultName        = $vaultName
@@ -221,7 +204,7 @@ foreach ($sub in $subs) {
                 Environment      = $env
                 SecretName       = $secretName
                 Exists           = 'No'
-                Notes            = $note
+                Notes            = 'Key Vault not found'
             }
         }
     }
