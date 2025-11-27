@@ -9,6 +9,14 @@ param(
     [string]$BranchName = ''
 )
 
+# --- NORMALIZE adh_sub_group: turn " " or "   " into empty string ---
+if ($null -ne $adh_sub_group) {
+    $adh_sub_group = $adh_sub_group.Trim()
+}
+if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+    $adh_sub_group = ''
+}
+
 Import-Module Az.Accounts, Az.Resources -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
@@ -17,7 +25,7 @@ Ensure-Dir -Path $OutputDir | Out-Null
 Write-Host "DEBUG: TenantId       = $TenantId"
 Write-Host "DEBUG: ClientId       = $ClientId"
 Write-Host "DEBUG: adh_group      = $adh_group"
-Write-Host "DEBUG: adh_sub_group  = $adh_sub_group"
+Write-Host "DEBUG: adh_sub_group  = '$adh_sub_group'"
 Write-Host "DEBUG: subscription   = $adh_subscription_type"
 Write-Host "DEBUG: OutputDir      = $OutputDir"
 Write-Host "DEBUG: BranchName     = $BranchName"
