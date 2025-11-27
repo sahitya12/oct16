@@ -1,0 +1,41 @@
+# stages/adls.stage.yml
+parameters:
+  - name: adh_group
+    type: string
+  - name: adh_sub_group
+    type: string
+    default: ''
+  - name: adh_subscription_type
+    type: string
+    default: nonprd
+  - name: poolName
+    type: string
+  - name: agentName
+    type: string
+
+jobs:
+- job: adls_acl_validation
+  displayName: "ADLS ACL Validation"
+  pool:
+    name: ${{ parameters.poolName }}
+    demands:
+      - Agent.Name -equals ${{ parameters.agentName }}
+
+  steps:
+    - checkout: self
+
+    - task: PowerShell@2
+      displayName: "Run Scan-ADLS-Acls.ps1"
+      inputs:
+        filePath: 'sanitychecks/scripts/Scan-ADLS-Acls.ps1'
+        pwsh: true
+        arguments: >
+          -TenantId "$(TenantId)"
+          -ClientId "$(ClientId)"
+          -ClientSecret "$(ClientSecret)"
+          -adh_group "${{ parameters.adh_group }}"
+          -adh_sub_group "${{ parameters.adh_sub_group }}"
+          -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+          -InputCsvPath "$(System.DefaultWorkingDirectory)/sanitychecks/inputs/adls_${{ parameters.adh_subscription_type }}_permissions.csv"
+          -OutputDir "$(Build.ArtifactStagingDirectory)/adls-acl"
+          -BranchName "$(Build.SourceBranchName)"
