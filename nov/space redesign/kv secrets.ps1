@@ -20,7 +20,7 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 Ensure-Dir $OutputDir | Out-Null
 
 # --------------------------------------------------------------------
-# Normalize adh_sub_group (handle space from pipeline)
+# Normalize adh_sub_group (handle single space from pipeline)
 # --------------------------------------------------------------------
 if ($null -ne $adh_sub_group) {
     $adh_sub_group = $adh_sub_group.Trim()
@@ -50,10 +50,11 @@ $csvRaw = Import-Csv $InputCsvPath
 if (-not $csvRaw -or $csvRaw.Count -eq 0) {
   throw "Secrets CSV '$InputCsvPath' has no rows at all."
 }
+
 Write-Host ("DEBUG: Raw header columns  : " + ($csvRaw[0].psobject.Properties.Name -join ', '))
 Write-Host ("DEBUG: Raw row count       : " + $csvRaw.Count)
 
-# Keep only rows that actually have KV + secret values (avoid trailing blank line issues)
+# Keep only rows that actually have KV + secret values
 $csvContent = $csvRaw | Where-Object {
     ($_.'KEYVAULT_NAME' -and $_.'KEYVAULT_NAME'.ToString().Trim() -ne '') -or
     ($_.'KeyVaultName'   -and $_.'KeyVaultName'.ToString().Trim()   -ne '') -or
@@ -66,12 +67,12 @@ $csvContent = $csvRaw | Where-Object {
 Write-Host ("DEBUG: Filtered data rows  : " + $csvContent.Count)
 
 if (-not $csvContent -or $csvContent.Count -eq 0) {
-  Write-Host "WARN: After filtering, CSV has no usable rows (no KEYVAULT_NAME+SECRET_NAME). Emitting NO_RESULTS."
+  Write-Host "WARN: After filtering, CSV has no usable rows (no KEYVAULT_NAME+SECRET_NAME)."
   $csvContent = @()
 }
 
 # --------------------------------------------------------------------
-# Custodian + env logic
+# Custodian + env logic  (<Custodian> & <env> placeholders)
 # --------------------------------------------------------------------
 $custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
@@ -92,35 +93,10 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # --------------------------------------------------------------------
-# Subscription selection – with safe fallback
+# Subscription selection – ALWAYS use Resolve-ScSubscriptions
+#    (old working behaviour)
 # --------------------------------------------------------------------
-$subs = $null
-
-switch ($adh_group.ToUpper()) {
-  'KTK' {
-    $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'dev_azure_20401_ADHPlatform' }
-  }
-  'MDM' {
-    if ($adh_subscription_type -eq 'prd') {
-      $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'prd_azure_20910_ADHMDM' }
-    } else {
-      $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'dev_azure_20911_ADHMDM' }
-    }
-  }
-  'NHH' {
-    if ($adh_subscription_type -eq 'prd') {
-      $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'prd_azure_21000_ADHNHH' }
-    } else {
-      $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'dev_azure_21001_ADHNHH' }
-    }
-  }
-}
-
-if (-not $subs) {
-  Write-Host "DEBUG: Special-case subscription lookup empty; falling back to Resolve-ScSubscriptions..."
-  $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
-}
-
+$subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
 if (-not $subs -or $subs.Count -eq 0) {
@@ -138,6 +114,7 @@ foreach ($sub in $subs) {
 
   Set-ScContext -Subscription $sub
 
+  # Cache all KVs once per subscription
   $allKVs = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" -ErrorAction SilentlyContinue
   if ($allKVs) {
       Write-Host "DEBUG: KeyVaults in sub '$($sub.Name)': " + ($allKVs.Name -join ', ')
@@ -149,7 +126,7 @@ foreach ($sub in $subs) {
   foreach ($row in $csvContent) {
     $rowIndex++
 
-    # robust header handling
+    # Robust header handling
     $rawKvName  = ($row.KEYVAULT_NAME, $row.KeyVaultName, $row.VaultName |
                    Where-Object { $_ -and $_.ToString().Trim() -ne '' } |
                    Select-Object -First 1)
@@ -207,6 +184,7 @@ foreach ($sub in $subs) {
             }
         }
         else {
+            # KV not found in this subscription – still record row
             $result += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 VaultName        = $vaultName
