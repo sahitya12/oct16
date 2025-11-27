@@ -1,83 +1,37 @@
-# sanitychecks/stages/adls.stage.yml
 parameters:
-  - name: adh_group
-    type: string
-  - name: adh_sub_group
-    type: string
-    default: ''
-  - name: adh_subscription_type
-    type: string
-    default: nonprd
-  - name: poolName
-    type: string
-  - name: agentName
-    type: string
-  - name: variableGroup
-    type: string
-    default: modernization_tfstate_backend_details
+  adh_group: ''
+  adh_subscription_type: 'nonprd'
+  poolName: 'Self-Hosted-Pool'
+  agentName: ''
+  variableGroup: 'modernization_tfstate_backend_details'
+  adlsCsvPath: '$(Build.SourcesDirectory)/sanitychecks/inputs/adls_permissions.csv'
 
-jobs:
-- job: adls_acl_validation
-  displayName: "ADLS ACL Validation (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
-  pool:
-    name: ${{ parameters.poolName }}
-    demands:
-      - Agent.Name -equals ${{ parameters.agentName }}
+stages:
+- stage: ADLS_Validate
+  displayName: "ADLS RBAC + ACL Validation (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
 
-  variables:
-  - group: ${{ parameters.variableGroup }}   # <== modernization_tfstate_backend_details
+  jobs:
+  - template: ../templates/job.powershell-with-az.yml
+    parameters:
+      variableGroup: ${{ parameters.variableGroup }}
+      displayName: 'ADLS RBAC + ACL Validation'
 
-  steps:
-    - checkout: self
+      scriptPath: 'sanitychecks/scripts/Validate-ADLS.ps1'
+      workingDir:  '$(Build.SourcesDirectory)/sanitychecks/scripts'
 
-    - task: PowerShell@2
-      displayName: "Run Scan-ADLS-Acls.ps1"
-      inputs:
-        targetType: 'inline'
-        pwsh: true
-        script: |
-          Write-Host "=== Building params for Scan-ADLS-Acls.ps1 ==="
+      arguments: >
+        -TenantId "$(tenant_id)"
+        -ClientId "$(backend_client_id)"
+        -ClientSecret "$(backend_client_secret)"
+        -CsvPath "${{ parameters.adlsCsvPath }}"
+        -adh_group "${{ parameters.adh_group }}"
+        -adh_subscription_type "${{ parameters.adh_subscription_type }}"
+        -OutputDir "$(Build.ArtifactStagingDirectory)/adls-validate"
+        -BranchName "$(Build.SourceBranchName)"
 
-          # NOTE: these map variable group vars -> script params
-          # modernization_tfstate_backend_details must define:
-          #   tenant_id
-          #   backend_client_id
-          #   backend_client_secret
-          $params = @{
-            TenantId              = "$(tenant_id)"
-            ClientId              = "$(backend_client_id)"
-            ClientSecret          = "$(backend_client_secret)"
+      artifactName: 'adls-validate'
+      publishPath:  '$(Build.ArtifactStagingDirectory)/adls-validate'
 
-            adh_group             = "${{ parameters.adh_group }}"
-            adh_sub_group         = "${{ parameters.adh_sub_group }}"
-            adh_subscription_type = "${{ parameters.adh_subscription_type }}"
-
-            InputCsvPath          = "$(System.DefaultWorkingDirectory)/sanitychecks/inputs/adls_${{ parameters.adh_subscription_type }}_permissions.csv"
-            OutputDir             = "$(Build.ArtifactStagingDirectory)/adls-acl"
-            BranchName            = "$(Build.SourceBranchName)"
-          }
-
-          Write-Host "DEBUG: Parameter values passed to Scan-ADLS-Acls.ps1:"
-          $params.GetEnumerator() | ForEach-Object {
-            Write-Host "  $($_.Key) = $($_.Value)"
-          }
-
-          $scriptPath = "$(System.DefaultWorkingDirectory)/sanitychecks/scripts/Scan-ADLS-Acls.ps1"
-          Write-Host "DEBUG: Script path = $scriptPath"
-
-          if (-not (Test-Path -LiteralPath $scriptPath)) {
-            Write-Error "Scan-ADLS-Acls.ps1 not found at $scriptPath"
-            exit 1
-          }
-
-          & $scriptPath @params
-
-          $exitCode = $LASTEXITCODE
-          Write-Host "Scan-ADLS-Acls.ps1 exit code = $exitCode"
-
-          if ($exitCode -ne 0) {
-            Write-Error "Scan-ADLS-Acls.ps1 failed with exit code $exitCode"
-            exit $exitCode
-          }
-
-          Write-Host "Scan-ADLS-Acls.ps1 finished successfully."
+      poolType: self
+      poolName: ${{ parameters.poolName }}
+      agentName: ${{ parameters.agentName }}
