@@ -31,7 +31,7 @@ $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscript
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
 # ======================================================================
-# 1) VNet peering scan (unchanged)
+# 1) VNet peering scan
 # ======================================================================
 $vnetRows = @()
 
@@ -128,7 +128,7 @@ Write-Host "VNet peering scan completed."
 Write-Host "  CSV : $vnetCsv"
 
 # ======================================================================
-# 2) Azure Firewall + Public IP scan  (reworked)
+# 2) Azure Firewall + Public IP scan  (back to Get-AzFirewall)
 # ======================================================================
 $fwRows = @()
 
@@ -138,82 +138,65 @@ foreach ($sub in $subs) {
     Write-Host ""
     Write-Host "=== Firewall scan for subscription: $($sub.Name) ===" -ForegroundColor Cyan
 
-    # First: discover firewall *resources* (this almost always works)
-    $fwResources = Get-AzResource -ResourceType "Microsoft.Network/azureFirewalls" -ErrorAction SilentlyContinue
-    Write-Host "DEBUG: Get-AzResource found $(@($fwResources).Count) firewall resources in $($sub.Name)"
+    $firewalls = Get-AzFirewall -ErrorAction SilentlyContinue
+    $fwCount   = @($firewalls).Count
+    Write-Host "DEBUG: Get-AzFirewall returned $fwCount firewall(s) in $($sub.Name)"
 
-    if (-not $fwResources) {
-        Write-Host "DEBUG: No firewall resources in $($sub.Name)"
+    if (-not $firewalls) {
         continue
     }
 
-    foreach ($fwRes in $fwResources) {
+    foreach ($fw in $firewalls) {
 
-        Write-Host "DEBUG: Processing firewall resource: $($fwRes.Name) / RG: $($fwRes.ResourceGroupName)"
-
-        $pipName    = ''
-        $pipRg      = ''
-        $pipAddress = ''
-        $pipSku     = ''
-        $pipType    = ''
-
-        # Try to get full Firewall object (for IP configs)
-        $fwObj = $null
-        try {
-            $fwObj = Get-AzFirewall -Name $fwRes.Name -ResourceGroupName $fwRes.ResourceGroupName -ErrorAction Stop
-        } catch {
-            Write-Host "WARN: Get-AzFirewall failed for $($fwRes.Name) in $($fwRes.ResourceGroupName): $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-
-        if ($fwObj -and $fwObj.IpConfigurations) {
-            foreach ($ipConf in $fwObj.IpConfigurations) {
-                $pipName    = ''
-                $pipRg      = ''
-                $pipAddress = ''
-                $pipSku     = ''
-                $pipType    = ''
-
-                if ($ipConf.PublicIpAddress -and $ipConf.PublicIpAddress.Id) {
-                    $idParts = $ipConf.PublicIpAddress.Id -split '/'
-                    $pipName = $idParts[-1]
-                    $rgIndex = [Array]::IndexOf($idParts, 'resourceGroups')
-                    if ($rgIndex -ge 0 -and $rgIndex + 1 -lt $idParts.Count) {
-                        $pipRg = $idParts[$rgIndex + 1]
-                    }
-
-                    try {
-                        $pip = Get-AzPublicIpAddress -Name $pipName -ResourceGroupName $pipRg -ErrorAction Stop
-                        $pipAddress = $pip.IpAddress
-                        $pipSku     = $pip.Sku.Name
-                        $pipType    = $pip.PublicIpAllocationMethod
-                    } catch {
-                        Write-Host "WARN: Failed to resolve Public IP $pipName in RG $pipRg : $($_.Exception.Message)" -ForegroundColor Yellow
-                    }
-                }
-
-                $fwRows += [pscustomobject]@{
-                    SubscriptionName = $sub.Name
-                    SubscriptionId   = $sub.Id
-                    ResourceGroup    = $fwRes.ResourceGroupName
-                    FirewallName     = $fwRes.Name
-                    PublicIpName     = $pipName
-                    PublicIpAddress  = $pipAddress
-                    PublicIpSku      = $pipSku
-                    PublicIpType     = $pipType
-                }
-            }
-        }
-        else {
-            # We still output a row even if we couldn't get IP config details
+        # If no IP configs, still output one row
+        if (-not $fw.IpConfigurations -or $fw.IpConfigurations.Count -eq 0) {
             $fwRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 SubscriptionId   = $sub.Id
-                ResourceGroup    = $fwRes.ResourceGroupName
-                FirewallName     = $fwRes.Name
+                ResourceGroup    = $fw.ResourceGroupName
+                FirewallName     = $fw.Name
                 PublicIpName     = ''
                 PublicIpAddress  = ''
                 PublicIpSku      = ''
                 PublicIpType     = ''
+            }
+            continue
+        }
+
+        foreach ($ipConf in $fw.IpConfigurations) {
+            $pipName    = ''
+            $pipRg      = ''
+            $pipAddress = ''
+            $pipSku     = ''
+            $pipType    = ''
+
+            if ($ipConf.PublicIpAddress -and $ipConf.PublicIpAddress.Id) {
+                $idParts = $ipConf.PublicIpAddress.Id -split '/'
+                $pipName = $idParts[-1]
+                $rgIndex = [Array]::IndexOf($idParts, 'resourceGroups')
+                if ($rgIndex -ge 0 -and $rgIndex + 1 -lt $idParts.Count) {
+                    $pipRg = $idParts[$rgIndex + 1]
+                }
+
+                try {
+                    $pip = Get-AzPublicIpAddress -Name $pipName -ResourceGroupName $pipRg -ErrorAction Stop
+                    $pipAddress = $pip.IpAddress
+                    $pipSku     = $pip.Sku.Name
+                    $pipType    = $pip.PublicIpAllocationMethod
+                } catch {
+                    Write-Host "WARN: Failed to resolve Public IP $pipName in RG $pipRg : $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
+
+            $fwRows += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                SubscriptionId   = $sub.Id
+                ResourceGroup    = $fw.ResourceGroupName
+                FirewallName     = $fw.Name
+                PublicIpName     = $pipName
+                PublicIpAddress  = $pipAddress
+                PublicIpSku      = $pipSku
+                PublicIpType     = $pipType
             }
         }
     }
@@ -242,7 +225,7 @@ Write-Host "Firewall public IP scan completed."
 Write-Host "  CSV : $fwCsv"
 
 # ======================================================================
-# 3) Subnets + NSG + Route Table scan (unchanged)
+# 3) Subnets + NSG + Route Table scan
 # ======================================================================
 $subnetRows = @()
 
