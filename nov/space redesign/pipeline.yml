@@ -10,6 +10,8 @@ parameters:
     default: ''
 
   # OPTIONAL – can be left blank when not used (KTK only, etc.)
+  # Default is a single space so the UI doesn't block the Run button,
+  # but we normalize it to '' in variables.
   - name: adh_sub_group
     type: string
     default: ' '
@@ -76,15 +78,17 @@ parameters:
     type: boolean
     default: false
 
+
 variables:
-  # Normalize adh_sub_group: trim spaces so single-space input becomes ''
+  # Normalize adh_sub_group: remove all spaces so " " becomes ""
   - name: adh_sub_group_normalized
-    value: ${{ trim(parameters.adh_sub_group) }}
+    value: ${{ replace(parameters.adh_sub_group, ' ', '') }}
 
   # NOTE: adh_sub_group is intentionally NOT part of the agent name
   # Example: KTK_nonprd_agent1
   - name: agentName
     value: ${{ format('{0}_{1}{2}', parameters.adh_group, parameters.adh_subscription_type, parameters.poolSuffix) }}
+
 
 stages:
   # -------------------------------------------------------
@@ -92,7 +96,7 @@ stages:
   # -------------------------------------------------------
   - stage: agent_injection_check
     displayName: "Agent Parameter Injection and Diagnostics"
-    condition: ne('${{ parameters.adh_group }}','')   # don't run if adh_group is empty
+    condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))   # don't run if adh_group is empty
     jobs:
       - job: test_param_injection
         displayName: "PowerShell Parameter and Environment Check"
@@ -151,7 +155,7 @@ stages:
     - template: stages/rg_permissions.stage.yml
       parameters:
         adh_group:             ${{ parameters.adh_group }}
-        adh_sub_group:         ${{ variables.adh_sub_group_normalized }}   # optional; normalized
+        adh_sub_group:         ${{ variables.adh_sub_group_normalized }}
         adh_subscription_type: ${{ parameters.adh_subscription_type }}
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
