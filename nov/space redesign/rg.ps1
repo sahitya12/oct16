@@ -22,8 +22,7 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 Ensure-Dir -Path $OutputDir | Out-Null
 
 # =============================================================
-# NORMALIZE adh_sub_group
-# Removes space, tabs, whitespace
+# NORMALIZE adh_sub_group  (handle single space from pipeline)
 # =============================================================
 $adh_sub_group = $adh_sub_group.Trim()
 if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
@@ -47,7 +46,6 @@ if (-not (Test-Path -LiteralPath $csvPath)) {
 
 $inputRows = Import-Csv -LiteralPath $csvPath
 
-
 # =============================================================
 # CONNECT TO AZURE
 # =============================================================
@@ -56,7 +54,7 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # =============================================================
-# BUILD EXACT CUSTODIAN PATTERN
+# BUILD EXACT CUSTODIAN FOR SCAN
 # =============================================================
 if ($adh_sub_group -eq "") {
     # Example: KTK → scan KTK only
@@ -70,10 +68,9 @@ else {
 
 Write-Host "Scanning ONLY custodian: $Custodian"
 
-# Which pattern to look for in RG names
+# Pattern for RG name check
 $pattern = "*$Custodian*"
 Write-Host "RG search pattern = $pattern"
-
 
 # =============================================================
 # SUBSCRIPTIONS
@@ -89,18 +86,18 @@ foreach ($sub in $subs) {
 
     foreach ($row in $inputRows) {
 
-        $resolvedRg = $row.resource_group_name -replace '<Custodian>', $Custodian
-        $resolvedAdGrp = $row.ad_group_name -replace '<Custodian>', $Custodian
-        $role = $row.role_definition_name
+        $resolvedRg    = $row.resource_group_name -replace '<Custodian>', $Custodian
+        $resolvedAdGrp = $row.ad_group_name      -replace '<Custodian>', $Custodian
+        $role          = $row.role_definition_name
 
-        # Skip if RG after replacement does not match the custodian prefix
+        # Skip if RG after replacement does not match the custodian pattern
         if ($resolvedRg -notlike $pattern) { continue }
 
         $rg = Get-AzResourceGroup -Name $resolvedRg -ErrorAction SilentlyContinue
         $rgStatus = if ($rg) { 'EXISTS' } else { 'NOT_FOUND' }
 
         $permStatus = 'N/A'
-        $details = ''
+        $details    = ''
 
         if ($rg) {
             $scope = "/subscriptions/{0}/resourceGroups/{1}" -f $sub.Id, $resolvedRg
@@ -136,13 +133,19 @@ foreach ($sub in $subs) {
 }
 
 # =============================================================
-# OUTPUT CSV & HTML
+# OUTPUT CSV & HTML – use adh_group / adh_group_adh_sub_group
 # =============================================================
-$csvOut = New-StampedPath -BaseDir $OutputDir -Prefix ("rg_permissions_{0}_{1}" -f $Custodian, $adh_subscription_type)
+$groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+    $adh_group
+} else {
+    "${adh_group}_${adh_sub_group}"
+}
+
+$csvOut = New-StampedPath -BaseDir $OutputDir -Prefix ("rg_permissions_{0}_{1}" -f $groupForFile, $adh_subscription_type)
 Write-CsvSafe -Rows $result -Path $csvOut
 
 $htmlOut = $csvOut -replace '\.csv$','.html'
-Convert-CsvToHtml -CsvPath $csvOut -HtmlPath $htmlOut -Title "RG Permission Scan - $Custodian"
+Convert-CsvToHtml -CsvPath $csvOut -HtmlPath $htmlOut -Title "RG Permission Scan - $groupForFile"
 
 Write-Host "RG permission scan completed successfully."
 Write-Host "CSV : $csvOut"
