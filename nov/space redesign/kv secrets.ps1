@@ -20,9 +20,11 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 Ensure-Dir $OutputDir | Out-Null
 
 # --------------------------------------------------------------------
-# Normalize adh_sub_group (handle single-space from pipeline)
+# Normalize adh_sub_group (handle space from pipeline)
 # --------------------------------------------------------------------
-$adh_sub_group = $adh_sub_group.Trim()
+if ($null -ne $adh_sub_group) {
+    $adh_sub_group = $adh_sub_group.Trim()
+}
 if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     Write-Host "DEBUG: adh_sub_group is empty/space -> treating as <none>"
     $adh_sub_group = ''
@@ -53,29 +55,60 @@ Write-Host ("DEBUG: Found header columns: " + ($csvContent[0].psobject.Propertie
 # --------------------------------------------------------------------
 # Custodian + env logic
 #   KEYVAULT_NAME will have <Custodian> and <env> placeholders
+#   - <Custodian>  = adh_group          (no subgroup)
+#   - <Custodian>  = adh_group_adh_sub  (with subgroup)
 # --------------------------------------------------------------------
 $custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
-    $adh_group                   # only adh_group
+    $adh_group
 } else {
-    "${adh_group}_${adh_sub_group}"  # adh_group_adh_sub_group
+    "${adh_group}_${adh_sub_group}"
 }
 
 $envs = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev','tst','stg') }
 
-Write-Host "DEBUG: Custodian     = $custodian"
-Write-Host "DEBUG: Environments  = $($envs -join ', ')"
+Write-Host "DEBUG: Custodian       = $custodian"
+Write-Host "DEBUG: Environments    = $($envs -join ', ')"
 
 # --------------------------------------------------------------------
-# Connect & resolve subscriptions
+# Connect to Azure
 # --------------------------------------------------------------------
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
   throw "Azure connection failed."
 }
-$subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+
+# --------------------------------------------------------------------
+# Subscription selection – mirror KV Permissions logic
+# --------------------------------------------------------------------
+switch ($adh_group.ToUpper()) {
+  'KTK' {
+    # Same as KV permissions
+    $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'dev_azure_20401_ADHPlatform' }
+  }
+  'MDM' {
+    if ($adh_subscription_type -eq 'prd') {
+      $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'prd_azure_20910_ADHMDM' }
+    } else {
+      $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'dev_azure_20911_ADHMDM' }
+    }
+  }
+  'NHH' {
+    if ($adh_subscription_type -eq 'prd') {
+      $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'prd_azure_21000_ADHNHH' }
+    } else {
+      $subs = Get-AzSubscription | Where-Object { $_.Name -eq 'dev_azure_21001_ADHNHH' }
+    }
+  }
+  Default {
+    $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+  }
+}
+
 if (-not $subs) {
-  Write-Host "WARN: Resolve-ScSubscriptions returned no subscriptions for $adh_group / $adh_subscription_type"
+  Write-Host "WARN: No subscriptions resolved for $adh_group / $adh_subscription_type"
   $subs = @()
 }
+
+Write-Host "DEBUG: Subscriptions   = $($subs.Name -join ', ')"
 
 $result = @()
 
@@ -166,7 +199,7 @@ if (-not $result -or $result.Count -eq 0) {
 }
 
 # --------------------------------------------------------------------
-# Output file naming: include adh_sub_group when present
+# Output file naming: include adh_group_adh_sub_group when present
 # --------------------------------------------------------------------
 $groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
