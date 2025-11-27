@@ -39,18 +39,36 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 
 # --------------------------------------------------------------------
 # Build RG search patterns
+#   - If ONLY adh_group => *adh_group*
+#   - If adh_sub_group also passed => *adh_group_adh_sub_group* ONLY
 # --------------------------------------------------------------------
 [string[]]$patterns = @()
 
 if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+    # Only adh_group used
     $patterns = @("*$adh_group*")
 }
 else {
+    # Only adh_group_adh_sub_group used
     $patterns = @("*${adh_group}_${adh_sub_group}*")
 }
 
 Write-Host "DEBUG: RG patterns to search:"
 $patterns | ForEach-Object { Write-Host " - $_" }
+
+# --------------------------------------------------------------------
+# Tag keys to exclude from output columns
+# (case-insensitive comparison)
+# --------------------------------------------------------------------
+$excludedTagKeys = @(
+    'managedby',
+    'patchenrollment',
+    'patchexemption',
+    'patchschedule',
+    'tag_resourcename',
+    'application',
+    'databricks-environment'
+)
 
 # --------------------------------------------------------------------
 # Resolve subscriptions
@@ -86,11 +104,16 @@ foreach ($sub in $subs) {
         }
 
         # --------------------------------------------
-        # RG tags
+        # RG tags (respect exclusion list)
         # --------------------------------------------
         $rgTags = @{}
         if ($rg.Tags) {
             foreach ($key in $rg.Tags.Keys) {
+                $keyLower = $key.ToLowerInvariant()
+                if ($excludedTagKeys -contains $keyLower) {
+                    continue
+                }
+
                 $rgTags[$key] = $rg.Tags[$key]
                 $allTagKeys.Add($key) | Out-Null
             }
@@ -107,7 +130,7 @@ foreach ($sub in $subs) {
         }
 
         # --------------------------------------------
-        # Resource tags
+        # Resource tags (respect exclusion list)
         # --------------------------------------------
         $resources = Get-AzResource -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
 
@@ -115,6 +138,11 @@ foreach ($sub in $subs) {
             $resTags = @{}
             if ($res.Tags) {
                 foreach ($k in $res.Tags.Keys) {
+                    $kLower = $k.ToLowerInvariant()
+                    if ($excludedTagKeys -contains $kLower) {
+                        continue
+                    }
+
                     $resTags[$k] = $res.Tags[$k]
                     $allTagKeys.Add($k) | Out-Null
                 }
@@ -133,10 +161,8 @@ foreach ($sub in $subs) {
 }
 
 # --------------------------------------------------------------------
-# Build final merged tag dataset (protect base columns from tag overwrite)
+# Build final merged tag dataset
 # --------------------------------------------------------------------
-$baseColumns = @('Scope','ResourceGroup','ResourceName','ResourceType','InheritedFromRG')
-
 $rows = foreach ($item in $entries) {
 
     $inheritedFlag = 'No'
@@ -162,16 +188,7 @@ $rows = foreach ($item in $entries) {
         elseif ($item.RgTags.ContainsKey($tagKey)) {
             $value = $item.RgTags[$tagKey]
         }
-
-        # Avoid overwriting base columns – prefix if name collides
-        $colName = if ($baseColumns -contains $tagKey) {
-            "Tag_$tagKey"
-        }
-        else {
-            $tagKey
-        }
-
-        $obj[$colName] = $value
+        $obj[$tagKey] = $value
     }
 
     [PSCustomObject]$obj
