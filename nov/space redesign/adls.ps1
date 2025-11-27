@@ -1,356 +1,87 @@
-param( 
-    [Parameter(Mandatory = $true)][string]$TenantId,
-    [Parameter(Mandatory = $true)][string]$ClientId,
-    [Parameter(Mandatory = $true)][string]$ClientSecret,
-    [Parameter(Mandatory = $true)][string]$adh_group,
-    [string]$adh_sub_group = '',
-    [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
-    [Parameter(Mandatory = $true)][string]$InputCsvPath,
-    [Parameter(Mandatory = $true)][string]$OutputDir,
-    [string]$BranchName = ''
-)
+# .azure-pipelines/stages/adls.stage.yml
 
-Import-Module Az.Accounts, Az.Resources, Az.Storage -ErrorAction Stop
-Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
+parameters:
+  - name: adh_group
+    type: string
+  - name: adh_sub_group
+    type: string
+    default: ''
+  - name: adh_subscription_type
+    type: string
+    default: nonprd
+  - name: poolName
+    type: string
+  - name: agentName
+    type: string
+  - name: variableGroup
+    type: string
+    default: modernization_tfstate_backend_details
 
-# ----------------------------------------------------------------------
-# Normalise adh_sub_group (handle " " etc.)
-# ----------------------------------------------------------------------
-if ($null -ne $adh_sub_group) {
-    $adh_sub_group = $adh_sub_group.Trim()
-}
-if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
-    Write-Host "DEBUG: adh_sub_group is empty/space -> treating as <none>"
-    $adh_sub_group = ''
-}
+stages:
+- stage: ADLS_Scan
+  displayName: "ADLS ACL Scan (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
 
-Write-Host "DEBUG: TenantId      = $TenantId"
-Write-Host "DEBUG: ClientId      = $ClientId"
-Write-Host "DEBUG: adh_group     = $adh_group"
-Write-Host "DEBUG: adh_sub_group = '$adh_sub_group'"
-Write-Host "DEBUG: subscription  = $adh_subscription_type"
-Write-Host "DEBUG: InputCsvPath  = $InputCsvPath"
-Write-Host "DEBUG: OutputDir     = $OutputDir"
-Write-Host "DEBUG: BranchName    = $BranchName"
+  variables:
+    - group: ${{ parameters.variableGroup }}   # modernization_tfstate_backend_details
 
-# ----------------------------------------------------------------------
-# Ensure output dir
-# ----------------------------------------------------------------------
-Ensure-Dir -Path $OutputDir | Out-Null
+  jobs:
+  - job: adls_acl_validation
+    displayName: "ADLS ACL Validation"
+    pool:
+      name: ${{ parameters.poolName }}
+      demands:
+        - Agent.Name -equals ${{ parameters.agentName }}
 
-if (-not (Test-Path -LiteralPath $InputCsvPath)) {
-    throw "ADLS CSV not found: $InputCsvPath"
-}
+    steps:
+      - checkout: self
 
-# ----------------------------------------------------------------------
-# Connect to Azure
-# ----------------------------------------------------------------------
-if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
-    throw "Azure connection failed."
-}
+      - task: PowerShell@2
+        displayName: "Run Scan-ADLS-Acls.ps1"
+        inputs:
+          targetType: 'inline'
+          pwsh: true
+          script: |
+            Write-Host "=== Building params for Scan-ADLS-Acls.ps1 ==="
 
-# ----------------------------------------------------------------------
-# Custodian helpers according to your rules
-# ----------------------------------------------------------------------
-$BaseCustodian = $adh_group
-$BaseCustLower = $adh_group.ToLower() -replace '_',''
-
-$CustIdentity = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
-    $adh_group
-}
-else {
-    "${adh_group}_${adh_sub_group}"
-}
-
-Write-Host "DEBUG: BaseCustodian (RG/SA/Cont)  = $BaseCustodian"
-Write-Host "DEBUG: <Cust> (lower, no _)        = $BaseCustLower"
-Write-Host "DEBUG: CustIdentity (for Identity) = $CustIdentity"
-
-# ----------------------------------------------------------------------
-# Identity cache + resolver
-# ----------------------------------------------------------------------
-$script:IdentityCache = @{ }
-
-function Resolve-IdentityObjectId {
-    param(
-        [Parameter(Mandatory = $true)][string]$IdentityName
-    )
-
-    if ($script:IdentityCache.ContainsKey($IdentityName)) {
-        return $script:IdentityCache[$IdentityName]
-    }
-
-    $id = $null
-
-    try {
-        $grp = Get-AzADGroup -DisplayName $IdentityName -ErrorAction Stop
-        if ($grp -and $grp.Id) { $id = $grp.Id }
-    } catch {}
-
-    if (-not $id) {
-        try {
-            $sp = Get-AzADServicePrincipal -DisplayName $IdentityName -ErrorAction Stop
-            if ($sp -and $sp.Id) { $id = $sp.Id }
-        } catch {}
-    }
-
-    if (-not $id) {
-        try {
-            $sp2 = Get-AzADServicePrincipal -SearchString $IdentityName -ErrorAction Stop
-            if ($sp2 -and $sp2.Count -ge 1) { $id = $sp2[0].Id }
-        } catch {}
-    }
-
-    if (-not $id) {
-        $guidRef = [ref]([Guid]::Empty)
-        if ([Guid]::TryParse($IdentityName, $guidRef)) {
-            $id = $IdentityName
-        }
-    }
-
-    $script:IdentityCache[$IdentityName] = $id
-    return $id
-}
-
-# ----------------------------------------------------------------------
-# Load CSV & subscriptions
-# ----------------------------------------------------------------------
-$rows = Import-Csv -LiteralPath $InputCsvPath
-
-$subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
-if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
-
-$out = @()
-
-foreach ($sub in $subs) {
-    Set-ScContext -Subscription $sub
-
-    Write-Host ""
-    Write-Host "=== Subscription: $($sub.Name) ===" -ForegroundColor Cyan
-
-    foreach ($r in $rows) {
-
-        # RG: <Custodian> => adh_group only
-        $rgName = ($r.ResourceGroupName -replace '<Custodian>', $BaseCustodian).Trim()
-
-        # StorageAccountName: <Custodian> / <Cust> => adh_group only
-        $saName = $r.StorageAccountName
-        $saName = ($saName -replace '<Custodian>', $BaseCustodian)
-        $saName = ($saName -replace '<Cust>',      $BaseCustLower)
-        $saName = $saName.Trim()
-
-        # ContainerName: same rule as SA
-        $cont = $r.ContainerName
-        $cont = ($cont -replace '<Custodian>', $BaseCustodian)
-        $cont = ($cont -replace '<Cust>',      $BaseCustLower)
-        $cont = $cont.Trim()
-
-        # Identity: <Custodian> based on CustIdentity
-        $iden = ($r.Identity -replace '<Custodian>', $CustIdentity).Trim()
-
-        # ENV FILTER
-        if ($adh_subscription_type -eq 'prd') {
-            if ($saName -match 'adlsnonprd$') {
-                Write-Host "SKIP (prd run): nonprod ADLS $saName" -ForegroundColor Yellow
-                continue
-            }
-        }
-        else {
-            if ($saName -match 'adlsprd$') {
-                Write-Host "SKIP (nonprd run): prod ADLS $saName" -ForegroundColor Yellow
-                continue
-            }
-        }
-
-        # AccessPath handling
-        $accessPath = $r.AccessPath
-        $accessPath = ($accessPath -replace '<Custodian>', $BaseCustodian)
-        $accessPath = ($accessPath -replace '<Cust>',      $BaseCustLower)
-        $accessPath = $accessPath.Trim()
-
-        if ($accessPath -like '/catalog*') {
-            $prefixLength = '/catalog'.Length
-            $suffix       = $accessPath.Substring($prefixLength)
-
-            if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
-                $accessPath = "/adh_${adh_group}${suffix}"
-            }
-            else {
-                $accessPath = "/adh_${adh_group}_${adh_sub_group}${suffix}"
-            }
-        }
-
-        $normalizedPath = $accessPath
-        if ($normalizedPath -eq '/') { $normalizedPath = '' }
-
-        $folderForReport = if ([string]::IsNullOrWhiteSpace($normalizedPath)) { '/' } else { $normalizedPath }
-
-        Write-Host "DEBUG Row:"
-        Write-Host "  RG      = $rgName"
-        Write-Host "  Storage = $saName"
-        Write-Host "  Cont    = $cont"
-        Write-Host "  Id      = $iden"
-        Write-Host "  Path    = $normalizedPath"
-
-        if ([string]::IsNullOrWhiteSpace($rgName) -or [string]::IsNullOrWhiteSpace($saName)) {
-            $out += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rgName
-                Storage          = $saName
-                Container        = $cont
-                Folder           = $folderForReport
-                Identity         = $iden
-                Permission       = $r.PermissionType
-                Status           = 'ERROR'
-                Notes            = 'After placeholder replacement ResourceGroupName or StorageAccountName is empty.'
-            }
-            continue
-        }
-
-        try {
-            $sa = Get-AzStorageAccount -ResourceGroupName $rgName -Name $saName -ErrorAction Stop
-        } catch {
-            $out += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rgName
-                Storage          = $saName
-                Container        = $cont
-                Folder           = $folderForReport
-                Identity         = $iden
-                Permission       = $r.PermissionType
-                Status           = 'ERROR'
-                Notes            = "Storage account error: $($_.Exception.Message)"
-            }
-            continue
-        }
-
-        $ctx = $sa.Context
-
-        try {
-            $container = Get-AzStorageContainer -Name $cont -Context $ctx -ErrorAction Stop
-        } catch {
-            $out += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rgName
-                Storage          = $saName
-                Container        = $cont
-                Folder           = $folderForReport
-                Identity         = $iden
-                Permission       = $r.PermissionType
-                Status           = 'ERROR'
-                Notes            = "Container fetch error: $($_.Exception.Message)"
-            }
-            continue
-        }
-
-        $objectId = Resolve-IdentityObjectId -IdentityName $iden
-        if (-not $objectId) {
-            $out += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rgName
-                Storage          = $saName
-                Container        = $cont
-                Folder           = $folderForReport
-                Identity         = $iden
-                Permission       = $r.PermissionType
-                Status           = 'ERROR'
-                Notes            = "Identity '$iden' not found in Entra ID"
-            }
-            continue
-        }
-
-        try {
+            # modernization_tfstate_backend_details should define:
+            #   tenant_id
+            #   backend_client_id
+            #   backend_client_secret
             $params = @{
-                FileSystem  = $cont
-                Context     = $ctx
-                ErrorAction = 'Stop'
+              TenantId              = "$(tenant_id)"
+              ClientId              = "$(backend_client_id)"
+              ClientSecret          = "$(backend_client_secret)"
+
+              adh_group             = "${{ parameters.adh_group }}"
+              adh_sub_group         = "${{ parameters.adh_sub_group }}"
+              adh_subscription_type = "${{ parameters.adh_subscription_type }}"
+
+              InputCsvPath          = "$(System.DefaultWorkingDirectory)/sanitychecks/inputs/adls_${{ parameters.adh_subscription_type }}_permissions.csv"
+              OutputDir             = "$(Build.ArtifactStagingDirectory)/adls-acl"
+              BranchName            = "$(Build.SourceBranchName)"
             }
 
-            if (-not [string]::IsNullOrWhiteSpace($normalizedPath)) {
-                $params['Path'] = $normalizedPath.TrimStart('/')
+            Write-Host "DEBUG: Parameter values passed to Scan-ADLS-Acls.ps1:"
+            $params.GetEnumerator() | ForEach-Object {
+              Write-Host "  $($_.Key) = $($_.Value)"
             }
 
-            $item      = Get-AzDataLakeGen2Item @params
-            $aclString = $item.Acl
-            $permType  = $r.PermissionType
+            $scriptPath = "$(System.DefaultWorkingDirectory)/sanitychecks/scripts/Scan-ADLS-Acls.ps1"
+            Write-Host "DEBUG: Script path = $scriptPath"
 
-            $matchEntry = $aclString | Where-Object {
-                ($_ -like "*$objectId*") -and ($_ -like "*$permType*")
+            if (-not (Test-Path -LiteralPath $scriptPath)) {
+              Write-Error "Scan-ADLS-Acls.ps1 not found at $scriptPath"
+              exit 1
             }
 
-            $ownerMatch = $false
-            $groupMatch = $false
+            & $scriptPath @params
 
-            if ($item.Owner) {
-                if ($item.Owner -like "*$objectId*" -or $item.Owner -eq $iden) {
-                    $ownerMatch = $true
-                }
-            }
-            if ($item.Group) {
-                if ($item.Group -like "*$objectId*" -or $item.Group -eq $iden) {
-                    $groupMatch = $true
-                }
+            $exitCode = $LASTEXITCODE
+            Write-Host "Scan-ADLS-Acls.ps1 exit code = $exitCode"
+
+            if ($exitCode -ne 0) {
+              Write-Error "Scan-ADLS-Acls.ps1 failed with exit code $exitCode"
+              exit $exitCode
             }
 
-            $hasMatch = $matchEntry -or $ownerMatch -or $groupMatch
-
-            $status = if ($hasMatch) { 'OK' } else { 'MISSING' }
-            if ($matchEntry) {
-                $notes = 'ACL contains required permission'
-            }
-            elseif ($ownerMatch -or $groupMatch) {
-                $notes = 'Identity matches Owner/Group with required permission mask'
-            }
-            else {
-                $notes = 'Permissions missing or mismatched'
-            }
-
-        } catch {
-            $status = 'ERROR'
-            $notes  = "ACL read error: $($_.Exception.Message)"
-        }
-
-        $out += [pscustomobject]@{
-            SubscriptionName = $sub.Name
-            ResourceGroup    = $rgName
-            Storage          = $saName
-            Container        = $cont
-            Folder           = $folderForReport
-            Identity         = $iden
-            Permission       = $r.PermissionType
-            Status           = $status
-            Notes            = $notes
-        }
-    }
-}
-
-if (-not $out -or $out.Count -eq 0) {
-    $out += [pscustomobject]@{
-        SubscriptionName = ''
-        ResourceGroup    = ''
-        Storage          = ''
-        Container        = ''
-        Folder           = ''
-        Identity         = ''
-        Permission       = ''
-        Status           = 'NO_RESULTS'
-        Notes            = 'Nothing matched in scan'
-    }
-}
-
-$groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
-    $adh_group
-}
-else {
-    "${adh_group}_${adh_sub_group}"
-}
-
-$csvOut  = New-StampedPath -BaseDir $OutputDir -Prefix ("adls_validation_{0}_{1}" -f $groupForFile, $adh_subscription_type)
-Write-CsvSafe -Rows $out -Path $csvOut
-
-$htmlOut = $csvOut -replace '\.csv$','.html'
-Convert-CsvToHtml -CsvPath $csvOut -HtmlPath $htmlOut -Title "ADLS Validation ($groupForFile / $adh_subscription_type) $BranchName"
-
-Write-Host "ADLS validation completed." -ForegroundColor Green
-Write-Host "CSV : $csvOut"
-Write-Host "HTML: $htmlOut"
+            Write-Host "Scan-ADLS-Acls.ps1 finished successfully."
