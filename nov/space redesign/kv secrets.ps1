@@ -1,28 +1,19 @@
+# sanitychecks/scripts/Scan-KV-Secrets.ps1
+
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$TenantId,
+    [Parameter(Mandatory)][string]$TenantId,
+    [Parameter(Mandatory)][string]$ClientId,
+    [Parameter(Mandatory)][string]$ClientSecret,
 
-    [Parameter(Mandatory = $true)]
-    [string]$ClientId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$ClientSecret,
-
-    [Parameter(Mandatory = $true)]
-    [string]$adh_group,
+    [Parameter(Mandatory)][string]$adh_group,
 
     # May come as ' ' from pipeline – normalize below
     [string]$adh_sub_group = '',
 
-    [ValidateSet('nonprd','prd')]
-    [string]$adh_subscription_type = 'nonprd',
+    [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
 
-    [Parameter(Mandatory = $true)]
-    [string]$InputCsvPath,
-
-    [Parameter(Mandatory = $true)]
-    [string]$OutputDir,
-
+    [Parameter(Mandatory)][string]$InputCsvPath,
+    [Parameter(Mandatory)][string]$OutputDir,
     [string]$BranchName = ''
 )
 
@@ -65,7 +56,7 @@ if (-not $csvRaw -or $csvRaw.Count -eq 0) {
 Write-Host ("DEBUG: Raw header columns  : " + ($csvRaw[0].psobject.Properties.Name -join ', '))
 Write-Host ("DEBUG: Raw row count       : " + $csvRaw.Count)
 
-# Keep only rows that actually have KV + secret values
+# Keep only rows that actually have KV + secret values (avoid trailing blank lines)
 $csvContent = $csvRaw | Where-Object {
     ($_.'KEYVAULT_NAME' -and $_.'KEYVAULT_NAME'.ToString().Trim() -ne '') -or
     ($_.'KeyVaultName'   -and $_.'KeyVaultName'.ToString().Trim()   -ne '') -or
@@ -84,12 +75,13 @@ if (-not $csvContent -or $csvContent.Count -eq 0) {
 
 # --------------------------------------------------------------------
 # Custodian + env logic  (<Custodian> & <env> placeholders)
-#   IMPORTANT: adh_group-adh_sub_group (hyphen) if sub-group present
+#   <Custodian> -> adh_group           (no subgroup)
+#   <Custodian> -> adh_group-adh_sub   (with subgroup, hyphen)
 # --------------------------------------------------------------------
 $custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
-    $adh_group                      # e.g. KTK
+    $adh_group
 } else {
-    "${adh_group}-${adh_sub_group}" # e.g. NHH-OPX  (hyphen)
+    "$adh_group-$adh_sub_group"
 }
 
 $envs = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev','tst','stg') }
@@ -105,7 +97,7 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # --------------------------------------------------------------------
-# Subscription selection – ALWAYS use Resolve-ScSubscriptions
+# Subscription selection – use Resolve-ScSubscriptions (aligned with others)
 # --------------------------------------------------------------------
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
@@ -139,11 +131,11 @@ foreach ($sub in $subs) {
 
         # Robust header handling
         $rawKvName  = ($row.KEYVAULT_NAME, $row.KeyVaultName, $row.VaultName |
-                       Where-Object { $_ -and $_.ToString().Trim() -ne '' } |
-                       Select-Object -First 1)
+                        Where-Object { $_ -and $_.ToString().Trim() -ne '' } |
+                        Select-Object -First 1)
         $secretName = ($row.SECRET_NAME, $row.SecretName |
-                       Where-Object { $_ -and $_.ToString().Trim() -ne '' } |
-                       Select-Object -First 1)
+                        Where-Object { $_ -and $_.ToString().Trim() -ne '' } |
+                        Select-Object -First 1)
 
         if ([string]::IsNullOrWhiteSpace($rawKvName) -or
             [string]::IsNullOrWhiteSpace($secretName)) {
@@ -156,6 +148,7 @@ foreach ($sub in $subs) {
 
         foreach ($env in $envs) {
 
+            # Replace <Custodian> and <env> in KEYVAULT_NAME
             $vaultName = $rawKvName
             $vaultName = $vaultName -replace '<Custodian>', $custodian
             $vaultName = $vaultName -replace '<env>',       $env
@@ -167,6 +160,7 @@ foreach ($sub in $subs) {
             $exists = $false
             $note   = ''
 
+            # Case-insensitive lookup in cached list
             $kvRes = $allKVs | Where-Object { $_.Name -ieq $vaultName }
 
             if ($kvRes) {
@@ -234,7 +228,7 @@ if (-not $result -or $result.Count -eq 0) {
 $groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 } else {
-    "${adh_group}-${adh_sub_group}"
+    "$adh_group-$adh_sub_group"
 }
 
 $csvOut = New-StampedPath -BaseDir $OutputDir -Prefix ("kv_secrets_{0}_{1}" -f $groupForFile, $adh_subscription_type)
