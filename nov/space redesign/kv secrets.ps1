@@ -5,10 +5,11 @@ param(
 
     [Parameter(Mandatory)][string]$adh_group,
 
-    # Comes as '' or ' ' from pipeline – treat space as empty
+    # Can arrive as " " from pipeline – we normalise below
     [string]$adh_sub_group = '',
 
-    [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
+    [ValidateSet('nonprd','prd')]
+    [string]$adh_subscription_type = 'nonprd',
 
     [Parameter(Mandatory)][string]$InputCsvPath,
     [Parameter(Mandatory)][string]$OutputDir,
@@ -20,7 +21,7 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 Ensure-Dir $OutputDir | Out-Null
 
 # --------------------------------------------------------------------
-# Normalise adh_sub_group (single space -> empty)
+# Normalise adh_sub_group (handle single space from pipeline)
 # --------------------------------------------------------------------
 if ($null -ne $adh_sub_group) {
     $adh_sub_group = $adh_sub_group.Trim()
@@ -40,21 +41,13 @@ Write-Host "DEBUG: OutputDir       = $OutputDir"
 Write-Host "DEBUG: BranchName      = $BranchName"
 
 # --------------------------------------------------------------------
-# Load CSV (KEYVAULT_NAME, SECRET_NAME) with delimiter detection
+# Load CSV (expects KEYVAULT_NAME, SECRET_NAME columns)
 # --------------------------------------------------------------------
 if (-not (Test-Path -LiteralPath $InputCsvPath)) {
     throw "Secrets CSV not found: $InputCsvPath"
 }
 
-# Detect delimiter from first line
-$firstLine = Get-Content -LiteralPath $InputCsvPath -First 1
-$delimiter = ','
-if ($firstLine -like '*;*' -and $firstLine -notlike '*,*') {
-    $delimiter = ';'
-}
-Write-Host "DEBUG: Detected delimiter = '$delimiter' (first line: $firstLine)"
-
-$csvRaw = Import-Csv -LiteralPath $InputCsvPath -Delimiter $delimiter
+$csvRaw = Import-Csv -LiteralPath $InputCsvPath
 if (-not $csvRaw -or $csvRaw.Count -eq 0) {
     throw "Secrets CSV '$InputCsvPath' has no rows at all."
 }
@@ -79,10 +72,9 @@ if (-not $csvContent -or $csvContent.Count -eq 0) {
 }
 
 # --------------------------------------------------------------------
-# Custodian + env logic
-#   <Custodian> will be replaced by:
-#     adh_group           (if no sub group)
-#     adh_group-adh_sub   (WITH hyphen) if sub group is provided
+# Custodian + env logic  (<Custodian> & <env> placeholders)
+#   - Custodian = adh_group              (no sub-group)
+#   - Custodian = adh_group-adh_sub      (with sub-group, hyphen)
 # --------------------------------------------------------------------
 $custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
@@ -103,7 +95,7 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # --------------------------------------------------------------------
-# Subscription selection – standard resolver (like other scripts)
+# Subscription selection – use common helper
 # --------------------------------------------------------------------
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
@@ -114,6 +106,9 @@ if (-not $subs -or $subs.Count -eq 0) {
 
 Write-Host "DEBUG: Subscriptions   = $($subs.Name -join ', ')"
 
+# --------------------------------------------------------------------
+# Main scan
+# --------------------------------------------------------------------
 $result = @()
 
 foreach ($sub in $subs) {
@@ -123,11 +118,12 @@ foreach ($sub in $subs) {
 
     Set-ScContext -Subscription $sub
 
-    # Cache all Key Vault resources in this subscription
+    # Cache all KVs once per subscription
     $allKVs = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" -ErrorAction SilentlyContinue
     if ($allKVs) {
         Write-Host "DEBUG: KeyVaults in sub '$($sub.Name)': " + ($allKVs.Name -join ', ')
-    } else {
+    }
+    else {
         Write-Host "DEBUG: No KeyVaults found in subscription '$($sub.Name)'"
     }
 
@@ -139,7 +135,6 @@ foreach ($sub in $subs) {
         $rawKvName  = ($row.KEYVAULT_NAME, $row.KeyVaultName, $row.VaultName |
                        Where-Object { $_ -and $_.ToString().Trim() -ne '' } |
                        Select-Object -First 1)
-
         $secretName = ($row.SECRET_NAME, $row.SecretName |
                        Where-Object { $_ -and $_.ToString().Trim() -ne '' } |
                        Select-Object -First 1)
@@ -155,7 +150,7 @@ foreach ($sub in $subs) {
 
         foreach ($env in $envs) {
 
-            # Replace placeholders <Custodian> + <env>
+            # Replace <Custodian> and <env> in KEYVAULT_NAME
             $vaultName = $rawKvName
             $vaultName = $vaultName -replace '<Custodian>', $custodian
             $vaultName = $vaultName -replace '<env>',       $env
@@ -167,6 +162,7 @@ foreach ($sub in $subs) {
             $exists = $false
             $note   = ''
 
+            # find KV in cached list (case-insensitive)
             $kvRes = $allKVs | Where-Object { $_.Name -ieq $vaultName }
 
             if ($kvRes) {
@@ -229,7 +225,7 @@ if (-not $result -or $result.Count -eq 0) {
 }
 
 # --------------------------------------------------------------------
-# Output file naming: include adh_group-adh_sub_group in title if present
+# Output file naming: include adh_group-adh_sub_group when present
 # --------------------------------------------------------------------
 $groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
