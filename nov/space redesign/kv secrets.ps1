@@ -21,7 +21,7 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 Ensure-Dir $OutputDir | Out-Null
 
 # --------------------------------------------------------------------
-# Normalise adh_sub_group (handle single space from pipeline)
+# Normalize adh_sub_group (handle single space from pipeline)
 # --------------------------------------------------------------------
 if ($null -ne $adh_sub_group) {
     $adh_sub_group = $adh_sub_group.Trim()
@@ -162,7 +162,6 @@ foreach ($sub in $subs) {
             $exists = $false
             $note   = ''
 
-            # find KV in cached list (case-insensitive)
             $kvRes = $allKVs | Where-Object { $_.Name -ieq $vaultName }
 
             if ($kvRes) {
