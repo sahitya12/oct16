@@ -1,33 +1,53 @@
 parameters:
-  adh_group: ''
-  adh_subscription_type: 'nonprd'
-  poolName: 'Self-Hosted-Pool'
-  agentName: ''
-  variableGroup: 'modernization_tfstate_backend_details'
+  - name: adh_group
+    type: string
+    default: ''
+
+  - name: adh_sub_group
+    type: string
+    default: ''
+
+  - name: adh_subscription_type
+    type: string
+    default: nonprd
+    values:
+      - nonprd
+      - prd
+
+  - name: poolName
+    type: string
+    default: 'Self-Hosted-Pool'
+
+  - name: agentName
+    type: string
+    default: ''
 
 stages:
-- stage: ADLS_ACL_Validation
-  displayName: "ADLS ACL Validation (${{ parameters.adh_group }} / ${{ parameters.adh_subscription_type }})"
+- stage: adls_acl
+  displayName: ${{ format('ADLS ACL Validation ({0} / {1})', parameters.adh_group, parameters.adh_subscription_type) }}
+  condition: and(succeeded(), ne('${{ parameters.adh_group }}',''))
 
   jobs:
   - template: ../templates/job.powershell-with-az.yml
     parameters:
-      variableGroup: ${{ parameters.variableGroup }}
       displayName: 'ADLS ACL Validation'
+      variableGroup: modernization_tfstate_backend_details
       scriptPath: '$(Build.SourcesDirectory)/sanitychecks/scripts/Scan-ADLS-Acls.ps1'
-      workingDir:  '$(Build.SourcesDirectory)/sanitychecks/scripts'
+      workingDir: '$(Build.SourcesDirectory)/sanitychecks/scripts'
+
+      # This is the only tricky part: choose the correct CSV based on adh_subscription_type
       arguments: >-
         -TenantId "$(tenant_id)"
         -ClientId "$(backend_client_id)"
         -ClientSecret "$(backend_client_secret)"
         -adh_group "${{ parameters.adh_group }}"
-        -adh_sub_group ""                             # or 'OPX' / 'SVS' when you need it
+        -adh_sub_group "${{ parameters.adh_sub_group }}"
         -adh_subscription_type "${{ parameters.adh_subscription_type }}"
-        -InputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_nonprd_permissions.csv"
+        -InputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_${{ parameters.adh_subscription_type }}_permissions.csv"
         -OutputDir "$(Build.ArtifactStagingDirectory)/adls-acl"
         -BranchName "$(Build.SourceBranchName)"
-      poolType: self
-      poolName: ${{ parameters.poolName }}
-      agentName: ${{ parameters.agentName }}
+
       artifactName: 'adls-acl'
       publishPath: '$(Build.ArtifactStagingDirectory)/adls-acl'
+      poolName: ${{ parameters.poolName }}
+      agentName: ${{ parameters.agentName }}
