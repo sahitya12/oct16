@@ -3,14 +3,16 @@ param(
     [Parameter(Mandatory = $true)][string]$ClientId,
     [Parameter(Mandatory = $true)][string]$ClientSecret,
     [Parameter(Mandatory = $true)][string]$adh_group,
+
+    # comes as "" or " " from pipeline when optional
     [string]$adh_sub_group = '',
+
     [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
+
     [Parameter(Mandatory = $true)][string]$InputCsvPath,
     [Parameter(Mandatory = $true)][string]$OutputDir,
     [string]$BranchName = ''
 )
-
-$ErrorActionPreference = 'Stop'
 
 Import-Module Az.Accounts, Az.Resources, Az.Storage -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
@@ -52,18 +54,19 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # ----------------------------------------------------------------------
-# Custodian helpers according to your rules
-#   RG / SA / Container use adh_group only
-#   Identity uses adh_group or adh_group_<subgroup> (underscore)
+# Custodian helpers
+#   - For RG/SA/Container & <Cust>:              based on adh_group only
+#   - For Identity (<Custodian> placeholder):    adh_group  or adh_group-adh_sub_group
 # ----------------------------------------------------------------------
 $BaseCustodian = $adh_group
 $BaseCustLower = $adh_group.ToLower() -replace '_',''
 
+# NOTE: you said **hyphen** between adh_group and adh_sub_group
 $CustIdentity = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 }
 else {
-    "${adh_group}_${adh_sub_group}"
+    "${adh_group}-${adh_sub_group}"
 }
 
 Write-Host "DEBUG: BaseCustodian (RG/SA/Cont)  = $BaseCustodian"
@@ -86,11 +89,13 @@ function Resolve-IdentityObjectId {
 
     $id = $null
 
+    # Try group by display name
     try {
         $grp = Get-AzADGroup -DisplayName $IdentityName -ErrorAction Stop
         if ($grp -and $grp.Id) { $id = $grp.Id }
     } catch {}
 
+    # Try SPN by display name
     if (-not $id) {
         try {
             $sp = Get-AzADServicePrincipal -DisplayName $IdentityName -ErrorAction Stop
@@ -98,6 +103,7 @@ function Resolve-IdentityObjectId {
         } catch {}
     }
 
+    # Try SPN by SearchString (looser)
     if (-not $id) {
         try {
             $sp2 = Get-AzADServicePrincipal -SearchString $IdentityName -ErrorAction Stop
@@ -105,6 +111,7 @@ function Resolve-IdentityObjectId {
         } catch {}
     }
 
+    # If it is already a GUID
     if (-not $id) {
         $guidRef = [ref]([Guid]::Empty)
         if ([Guid]::TryParse($IdentityName, $guidRef)) {
@@ -120,12 +127,18 @@ function Resolve-IdentityObjectId {
 # Load CSV & subscriptions
 # ----------------------------------------------------------------------
 $rows = Import-Csv -LiteralPath $InputCsvPath
-Write-Host "DEBUG: CSV row count = $($rows.Count)"
+
+Write-Host ("DEBUG: CSV rows loaded: {0}" -f $rows.Count)
+Write-Host ("DEBUG: CSV headers     : " + ($rows[0].psobject.Properties.Name -join ', '))
 
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
-Write-Host "DEBUG: Subscriptions = $($subs.Name -join ', ')"
+if (-not $subs -or $subs.Count -eq 0) {
+    throw "No subscriptions resolved for $adh_group / $adh_subscription_type"
+}
+
+Write-Host "DEBUG: Subscriptions   = $($subs.Name -join ', ')"
 
 $out = @()
 
@@ -137,56 +150,70 @@ foreach ($sub in $subs) {
 
     foreach ($r in $rows) {
 
-        # --- Placeholder substitution per row ---------------------------
+        # ------------------------------------------------------------------
+        # Placeholder substitution per row
+        # ------------------------------------------------------------------
+
+        # RG: <Custodian> => adh_group only
         $rgName = ($r.ResourceGroupName -replace '<Custodian>', $BaseCustodian).Trim()
 
+        # StorageAccountName: <Custodian> / <Cust> => adh_group only
         $saName = $r.StorageAccountName
         $saName = ($saName -replace '<Custodian>', $BaseCustodian)
         $saName = ($saName -replace '<Cust>',      $BaseCustLower)
         $saName = $saName.Trim()
 
+        # ContainerName: same rule as SA
         $cont = $r.ContainerName
         $cont = ($cont -replace '<Custodian>', $BaseCustodian)
         $cont = ($cont -replace '<Cust>',      $BaseCustLower)
         $cont = $cont.Trim()
 
+        # Identity: <Custodian> based on CustIdentity (with hyphen if sub-group)
         $iden = ($r.Identity -replace '<Custodian>', $CustIdentity).Trim()
 
-        # --- ENV filter between adlsnonprd / adlsprd --------------------
+        # ---------- ENV FILTER ----------
         if ($adh_subscription_type -eq 'prd') {
+            # prd run -> skip *nonprd* accounts
             if ($saName -match 'adlsnonprd$') {
                 Write-Host "SKIP (prd run): nonprod ADLS $saName" -ForegroundColor Yellow
                 continue
             }
-        } else {
+        }
+        else {
+            # nonprd run -> skip *prd* accounts
             if ($saName -match 'adlsprd$') {
                 Write-Host "SKIP (nonprd run): prod ADLS $saName" -ForegroundColor Yellow
                 continue
             }
         }
 
-        # --- AccessPath -------------------------------------------------
+        # AccessPath handling
         $accessPath = $r.AccessPath
         $accessPath = ($accessPath -replace '<Custodian>', $BaseCustodian)
         $accessPath = ($accessPath -replace '<Cust>',      $BaseCustLower)
         $accessPath = $accessPath.Trim()
 
-        # /catalog → /adh_<adh_group> or /adh_<adh_group>_<adh_sub_group>
+        # Special /catalog → /adh_<group> or /adh_<group>_<subgroup> (old rule)
         if ($accessPath -like '/catalog*') {
             $prefixLength = '/catalog'.Length
-            $suffix       = $accessPath.Substring($prefixLength)  # includes leading /
+            $suffix       = $accessPath.Substring($prefixLength)  # includes leading / if present
 
             if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+                # Only adh_group
                 $accessPath = "/adh_${adh_group}${suffix}"
             }
             else {
+                # adh_group + adh_sub_group
                 $accessPath = "/adh_${adh_group}_${adh_sub_group}${suffix}"
             }
         }
 
+        # Normalise root: "/" means container root (no Path parameter)
         $normalizedPath = $accessPath
         if ($normalizedPath -eq '/') { $normalizedPath = '' }
 
+        # Folder value for report
         $folderForReport = if ([string]::IsNullOrWhiteSpace($normalizedPath)) { '/' } else { $normalizedPath }
 
         Write-Host "DEBUG Row:"
@@ -196,7 +223,7 @@ foreach ($sub in $subs) {
         Write-Host "  Id      = $iden"
         Write-Host "  Path    = $normalizedPath"
 
-        # --- Basic validation -------------------------------------------
+        # Guard against empty RG/SA
         if ([string]::IsNullOrWhiteSpace($rgName) -or [string]::IsNullOrWhiteSpace($saName)) {
             $out += [pscustomobject]@{
                 SubscriptionName = $sub.Name
@@ -212,9 +239,9 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # ----------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Resolve storage account and container
-        # ----------------------------------------------------------------
+        # ------------------------------------------------------------------
         try {
             $sa = Get-AzStorageAccount -ResourceGroupName $rgName -Name $saName -ErrorAction Stop
         } catch {
@@ -251,9 +278,9 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # ----------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Resolve identity objectId
-        # ----------------------------------------------------------------
+        # ------------------------------------------------------------------
         $objectId = Resolve-IdentityObjectId -IdentityName $iden
         if (-not $objectId) {
             $out += [pscustomobject]@{
@@ -270,9 +297,9 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # ----------------------------------------------------------------
-        # Read ACLs
-        # ----------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Read ACLs for the target path
+        # ------------------------------------------------------------------
         try {
             $params = @{
                 FileSystem  = $cont
@@ -280,6 +307,7 @@ foreach ($sub in $subs) {
                 ErrorAction = 'Stop'
             }
 
+            # Only pass Path when we really have a sub-path. Root ("/") -> no Path.
             if (-not [string]::IsNullOrWhiteSpace($normalizedPath)) {
                 $params['Path'] = $normalizedPath.TrimStart('/')
             }
@@ -288,12 +316,12 @@ foreach ($sub in $subs) {
             $aclString = $item.Acl
             $permType  = $r.PermissionType
 
-            # 1) Explicit ACL
+            # 1) Check explicit ACL entries: user:<objectId>:rwx / group:<objectId>:r-x etc.
             $matchEntry = $aclString | Where-Object {
                 ($_ -like "*$objectId*") -and ($_ -like "*$permType*")
             }
 
-            # 2) Owner / Group
+            # 2) Also treat Owner / Group of the item as a valid match
             $ownerMatch = $false
             $groupMatch = $false
 
@@ -340,6 +368,9 @@ foreach ($sub in $subs) {
     }
 }
 
+# ----------------------------------------------------------------------
+# Handle "no results" scenario
+# ----------------------------------------------------------------------
 if (-not $out -or $out.Count -eq 0) {
     $out += [pscustomobject]@{
         SubscriptionName = ''
@@ -354,11 +385,14 @@ if (-not $out -or $out.Count -eq 0) {
     }
 }
 
+# ----------------------------------------------------------------------
+# Export CSV + HTML (include adh_sub_group when present)
+# ----------------------------------------------------------------------
 $groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 }
 else {
-    "${adh_group}_${adh_sub_group}"
+    "${adh_group}-${adh_sub_group}"
 }
 
 $csvOut  = New-StampedPath -BaseDir $OutputDir -Prefix ("adls_validation_{0}_{1}" -f $groupForFile, $adh_subscription_type)
@@ -371,4 +405,5 @@ Write-Host "ADLS validation completed." -ForegroundColor Green
 Write-Host "CSV : $csvOut"
 Write-Host "HTML: $htmlOut"
 
-# IMPORTANT: do NOT call exit here → exit code 0 by default
+# Make sure DevOps sees success if we reached here
+exit 0
