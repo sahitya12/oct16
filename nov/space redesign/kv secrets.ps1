@@ -3,25 +3,31 @@ param(
     [Parameter(Mandatory)][string]$ClientId,
     [Parameter(Mandatory)][string]$ClientSecret,
 
+
     [Parameter(Mandatory)][string]$adh_group,
+
 
     # Can arrive as " " from pipeline – we normalise below
     [string]$adh_sub_group = '',
 
+
     [ValidateSet('nonprd','prd')]
     [string]$adh_subscription_type = 'nonprd',
+
 
     [Parameter(Mandatory)][string]$InputCsvPath,
     [Parameter(Mandatory)][string]$OutputDir,
     [string]$BranchName = ''
 )
 
+
 Import-Module Az.Accounts, Az.KeyVault, Az.Resources -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 Ensure-Dir $OutputDir | Out-Null
 
+
 # --------------------------------------------------------------------
-# Normalize adh_sub_group (handle single space from pipeline)
+# Normalise adh_sub_group (handle single space from pipeline)
 # --------------------------------------------------------------------
 if ($null -ne $adh_sub_group) {
     $adh_sub_group = $adh_sub_group.Trim()
@@ -30,6 +36,7 @@ if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     Write-Host "DEBUG: adh_sub_group is empty/space -> treating as <none>"
     $adh_sub_group = ''
 }
+
 
 Write-Host "DEBUG: TenantId        = $TenantId"
 Write-Host "DEBUG: ClientId        = $ClientId"
@@ -40,6 +47,7 @@ Write-Host "DEBUG: InputCsvPath    = $InputCsvPath"
 Write-Host "DEBUG: OutputDir       = $OutputDir"
 Write-Host "DEBUG: BranchName      = $BranchName"
 
+
 # --------------------------------------------------------------------
 # Load CSV (expects KEYVAULT_NAME, SECRET_NAME columns)
 # --------------------------------------------------------------------
@@ -47,34 +55,38 @@ if (-not (Test-Path -LiteralPath $InputCsvPath)) {
     throw "Secrets CSV not found: $InputCsvPath"
 }
 
+
 $csvRaw = Import-Csv -LiteralPath $InputCsvPath
 if (-not $csvRaw -or $csvRaw.Count -eq 0) {
     throw "Secrets CSV '$InputCsvPath' has no rows at all."
 }
 
+
 Write-Host ("DEBUG: Raw header columns  : " + ($csvRaw[0].psobject.Properties.Name -join ', '))
 Write-Host ("DEBUG: Raw row count       : " + $csvRaw.Count)
+
 
 # Keep only rows that actually have KV + secret values
 $csvContent = $csvRaw | Where-Object {
     ($_.'KEYVAULT_NAME' -and $_.'KEYVAULT_NAME'.ToString().Trim() -ne '') -or
-    ($_.'KeyVaultName'   -and $_.'KeyVaultName'.ToString().Trim()   -ne '') -or
-    ($_.'VaultName'      -and $_.'VaultName'.ToString().Trim()      -ne '')
+    ($_.'KeyVaultName'  -and $_.'KeyVaultName'.ToString().Trim()  -ne '') -or
+    ($_.'VaultName'     -and $_.'VaultName'.ToString().Trim()     -ne '')
 } | Where-Object {
     ($_.'SECRET_NAME' -and $_.'SECRET_NAME'.ToString().Trim() -ne '') -or
     ($_.'SecretName'  -and $_.'SecretName'.ToString().Trim()  -ne '')
 }
 
+
 Write-Host ("DEBUG: Filtered data rows  : " + $csvContent.Count)
+
 
 if (-not $csvContent -or $csvContent.Count -eq 0) {
     throw "Could not detect usable KV/secret rows in CSV '$InputCsvPath'. Check that you have KEYVAULT_NAME and SECRET_NAME columns."
 }
 
+
 # --------------------------------------------------------------------
-# Custodian + env logic  (<Custodian> & <env> placeholders)
-#   - Custodian = adh_group              (no sub-group)
-#   - Custodian = adh_group-adh_sub      (with sub-group, hyphen)
+# Custodian + env logic
 # --------------------------------------------------------------------
 $custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
@@ -82,10 +94,13 @@ $custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     "$adh_group-$adh_sub_group"
 }
 
+
 $envs = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev','tst','stg') }
+
 
 Write-Host "DEBUG: Custodian       = $custodian"
 Write-Host "DEBUG: Environments    = $($envs -join ', ')"
+
 
 # --------------------------------------------------------------------
 # Connect to Azure
@@ -94,29 +109,37 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
     throw "Azure connection failed."
 }
 
+
 # --------------------------------------------------------------------
 # Subscription selection – use common helper
 # --------------------------------------------------------------------
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
+
 if (-not $subs -or $subs.Count -eq 0) {
     Write-Host "WARN: No subscriptions resolved for $adh_group / $adh_subscription_type"
 }
 
+
 Write-Host "DEBUG: Subscriptions   = $($subs.Name -join ', ')"
+
 
 # --------------------------------------------------------------------
 # Main scan
 # --------------------------------------------------------------------
 $result = @()
 
+
 foreach ($sub in $subs) {
+
 
     Write-Host ""
     Write-Host "=== Subscription: $($sub.Name) ===" -ForegroundColor Cyan
 
+
     Set-ScContext -Subscription $sub
+
 
     # Cache all KVs once per subscription
     $allKVs = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" -ErrorAction SilentlyContinue
@@ -127,9 +150,11 @@ foreach ($sub in $subs) {
         Write-Host "DEBUG: No KeyVaults found in subscription '$($sub.Name)'"
     }
 
+
     $rowIndex = 0
     foreach ($row in $csvContent) {
         $rowIndex++
+
 
         # Robust header handling
         $rawKvName  = ($row.KEYVAULT_NAME, $row.KeyVaultName, $row.VaultName |
@@ -139,16 +164,20 @@ foreach ($sub in $subs) {
                        Where-Object { $_ -and $_.ToString().Trim() -ne '' } |
                        Select-Object -First 1)
 
+
         if ([string]::IsNullOrWhiteSpace($rawKvName) -or
             [string]::IsNullOrWhiteSpace($secretName)) {
             Write-Host "DEBUG: Row #$rowIndex has empty KV / Secret, skipping."
             continue
         }
 
+
         $rawKvName  = $rawKvName.Trim()
         $secretName = $secretName.Trim()
 
+
         foreach ($env in $envs) {
+
 
             # Replace <Custodian> and <env> in KEYVAULT_NAME
             $vaultName = $rawKvName
@@ -156,35 +185,51 @@ foreach ($sub in $subs) {
             $vaultName = $vaultName -replace '<env>',       $env
             $vaultName = $vaultName.Trim()
 
-            Write-Host "DEBUG: row#$rowIndex sub='$($sub.Name)' env='$env' template='$rawKvName' -> vault='$vaultName', secret='$secretName'"
+
+            # Replace <Custodian> and <env> in SECRET_NAME
+            $secretNameResolved = $secretName
+            $secretNameResolved = $secretNameResolved -replace '<Custodian>', $custodian
+            $secretNameResolved = $secretNameResolved -replace '<env>',       $env
+            $secretNameResolved = $secretNameResolved.Trim()
+
+
+            Write-Host "DEBUG: row#$rowIndex sub='$($sub.Name)' env='$env' template='$rawKvName' -> vault='$vaultName', secret='$secretNameResolved'"
+
 
             $kvRg   = ''
             $exists = $false
             $note   = ''
 
+
+            # find KV in cached list (case-insensitive)
             $kvRes = $allKVs | Where-Object { $_.Name -ieq $vaultName }
+
 
             if ($kvRes) {
                 foreach ($kv in $kvRes) {
                     $kvRg = $kv.ResourceGroupName
 
+
                     try {
-                        $sec = Get-AzKeyVaultSecret -VaultName $kv.Name -Name $secretName -ErrorAction Stop
+                        $sec = Get-AzKeyVaultSecret -VaultName $kv.Name -Name $secretNameResolved -ErrorAction Stop
                         if ($null -ne $sec) { $exists = $true }
                     }
                     catch {
                         $exists = $false
                     }
 
+
                     $note = if ($exists) { 'Secret exists' } else { 'Secret missing' }
+                    $existsValue = $(if ($exists) { 'Yes' } else { 'No' })
+
 
                     $result += [pscustomobject]@{
                         SubscriptionName = $sub.Name
                         VaultName        = $kv.Name
                         ResourceGroup    = $kvRg
                         Environment      = $env
-                        SecretName       = $secretName
-                        Exists           = (if ($exists) { 'Yes' } else { 'No' })
+                        SecretName       = $secretNameResolved
+                        Exists           = $existsValue
                         Notes            = $note
                     }
                 }
@@ -196,7 +241,7 @@ foreach ($sub in $subs) {
                     VaultName        = $vaultName
                     ResourceGroup    = ''
                     Environment      = $env
-                    SecretName       = $secretName
+                    SecretName       = $secretNameResolved
                     Exists           = 'No'
                     Notes            = 'Key Vault not found'
                 }
@@ -204,6 +249,7 @@ foreach ($sub in $subs) {
         }
     }
 }
+
 
 # --------------------------------------------------------------------
 # Guard for completely empty result
@@ -223,6 +269,7 @@ if (-not $result -or $result.Count -eq 0) {
     )
 }
 
+
 # --------------------------------------------------------------------
 # Output file naming: include adh_group-adh_sub_group when present
 # --------------------------------------------------------------------
@@ -232,11 +279,14 @@ $groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     "$adh_group-$adh_sub_group"
 }
 
+
 $csvOut = New-StampedPath -BaseDir $OutputDir -Prefix ("kv_secrets_{0}_{1}" -f $groupForFile, $adh_subscription_type)
 Write-CsvSafe -Rows $result -Path $csvOut
 
+
 $htmlOut = $csvOut -replace '\.csv$','.html'
 Convert-CsvToHtml -CsvPath $csvOut -HtmlPath $htmlOut -Title "KV Secrets ($groupForFile / $adh_subscription_type) $BranchName"
+
 
 Write-Host "KV Secrets scan completed."
 Write-Host "CSV : $csvOut"
