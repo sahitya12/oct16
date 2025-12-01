@@ -61,7 +61,7 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 $BaseCustodian = $adh_group
 $BaseCustLower = $adh_group.ToLower() -replace '_',''
 
-# NOTE: you said **hyphen** between adh_group and adh_sub_group
+# NOTE: Identity name uses hyphen between adh_group and adh_sub_group (as per your AD group pattern)
 $CustIdentity = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
     $adh_group
 }
@@ -188,24 +188,31 @@ foreach ($sub in $subs) {
             }
         }
 
+        # ------------------------------------------------------------------
         # AccessPath handling
+        # ------------------------------------------------------------------
         $accessPath = $r.AccessPath
         $accessPath = ($accessPath -replace '<Custodian>', $BaseCustodian)
         $accessPath = ($accessPath -replace '<Cust>',      $BaseCustLower)
         $accessPath = $accessPath.Trim()
 
-        # Special /catalog → /adh_<group> or /adh_<group>_<subgroup> (old rule)
+        # Special /catalog rule:
+        # - if adh_sub_group empty:   /catalog... -> /adh_<adh_group_lower>...
+        # - if adh_sub_group present: /catalog... -> /adh_<adh_group_lower>_<adh_sub_group_lower>...
+        #   (group and subgroup lower case in PATH)
         if ($accessPath -like '/catalog*') {
             $prefixLength = '/catalog'.Length
             $suffix       = $accessPath.Substring($prefixLength)  # includes leading / if present
 
+            $groupLower = $adh_group.ToLower()
             if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
-                # Only adh_group
-                $accessPath = "/adh_${adh_group}${suffix}"
+                # Only adh_group, lower-case in path
+                $accessPath = "/adh_${groupLower}${suffix}"
             }
             else {
-                # adh_group + adh_sub_group
-                $accessPath = "/adh_${adh_group}_${adh_sub_group}${suffix}"
+                # adh_group + adh_sub_group, both lower-case in path
+                $subLower   = $adh_sub_group.ToLower()
+                $accessPath = "/adh_${groupLower}_${subLower}${suffix}"
             }
         }
 
