@@ -8,7 +8,7 @@ param(
     # IMPORTANT:
     # This parameter accepts BOTH -ClientId and -ApplicationId
     # because of the Alias. So any caller passing -ApplicationId
-    # will still bind correctly and avoid NamedParameterNotFound.
+    # will still bind correctly.
     [Parameter(Mandatory)]
     [Alias('ApplicationId')]
     [string]$ClientId,
@@ -19,6 +19,7 @@ param(
     [Parameter(Mandatory)]
     [string]$adh_group,
 
+    # Optional (comes as "" or " " from pipeline)
     [string]$adh_sub_group = '',
 
     [ValidateSet('nonprd','prd')]
@@ -45,12 +46,12 @@ if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
 $EffectiveClientId = $ClientId
 
 Write-Host "INFO : Using EffectiveClientId = $EffectiveClientId" -ForegroundColor Cyan
-Write-Host "DEBUG: Bound params = $($PSBoundParameters.Keys -join ', ')" -ForegroundColor Yellow
-Write-Host "DEBUG: adh_group     = $adh_group"
-Write-Host "DEBUG: adh_sub_group = '$adh_sub_group'"
-Write-Host "DEBUG: subscription  = $adh_subscription_type"
-Write-Host "DEBUG: OutputDir     = $OutputDir"
-Write-Host "DEBUG: BranchName    = $BranchName"
+Write-Host "DEBUG: Bound params      = $($PSBoundParameters.Keys -join ', ')" -ForegroundColor Yellow
+Write-Host "DEBUG: adh_group         = $adh_group"
+Write-Host "DEBUG: adh_sub_group     = '$adh_sub_group'"
+Write-Host "DEBUG: subscription type = $adh_subscription_type"
+Write-Host "DEBUG: OutputDir         = $OutputDir"
+Write-Host "DEBUG: BranchName        = $BranchName"
 
 # -------------------------------------------------------
 # Imports
@@ -83,7 +84,7 @@ $Custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
 }
 
 # -------------------------------------------------------
-# Env mapping (no helper, explicit):
+# Env mapping:
 #   nonprd -> dev, tst, stg
 #   prd    -> prd
 # -------------------------------------------------------
@@ -93,7 +94,7 @@ if ($adh_subscription_type -eq 'nonprd') {
     $envsToCheck = @('prd')
 }
 
-# Subscriptions still via helper
+# Subscriptions via helper (DatabricksHelper.psm1)
 $subs = Resolve-DbSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 
 Write-Host "INFO: Custodian = $Custodian" -ForegroundColor Cyan
@@ -142,7 +143,7 @@ foreach ($sub in $subs) {
         # ---------------------------------------------------
         # KV names (fixed as per your pattern)
         #   Infra KV: ADH-<adh_group>-Infra-KV-<env>
-        #   Cust KV : ADH-<Custodian>-KV-<env>  (kept as-is: varies by subgroup)
+        #   Cust KV : ADH-<Custodian>-KV-<env>  (depends on subgroup)
         # ---------------------------------------------------
         $keyVaultNameInfra = "ADH-$adh_group-Infra-KV-$env"
         $keyVaultNameCust  = "ADH-$Custodian-KV-$env"
@@ -188,6 +189,8 @@ foreach ($sub in $subs) {
         $urlSecretNameTypos  = "DATABRICKS-WORKSAPCE-URL"
         $idSecretNameTidy    = "DATABRICKS-WORKSPACE-ID"
         $idSecretNameTypos   = "DATABRICKS-WORKSAPCE-ID"
+
+        $wsUrlSecret = $null
 
         # URL
         try {
