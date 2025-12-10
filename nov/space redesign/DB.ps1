@@ -31,7 +31,7 @@ param(
     [string]$BranchName = ''
 )
 
-Write-Host "SCRIPT VERSION: Scan-Databricks.ps1 / 2025-12-10c" -ForegroundColor Magenta
+Write-Host "SCRIPT VERSION: Scan-Databricks.ps1 / 2025-12-10d" -ForegroundColor Magenta
 Write-Host "DEBUG: PSBoundParameters: $($PSBoundParameters.Keys -join ', ')" -ForegroundColor Yellow
 
 # -------------------------------------------------------
@@ -215,21 +215,22 @@ foreach ($sub in $subs) {
         try {
             $wsUrlSecret  = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTidy -ErrorAction Stop
             $workspaceUrl = $wsUrlSecret.SecretValueText
-            if ($workspaceUrl) {
-                Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTidy' -> [$workspaceUrl]" -ForegroundColor Yellow
-            }
+            Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTidy'" -ForegroundColor Yellow
         } catch {
             Write-Warning "URL secret '$urlSecretNameTidy' not found in '$keyVaultNameInfra' ($env): $_"
             try {
                 $wsUrlSecret  = Get-AzKeyVaultSecret -VaultName $keyVaultNameInfra -Name $urlSecretNameTypos -ErrorAction Stop
                 $workspaceUrl = $wsUrlSecret.SecretValueText
-                if ($workspaceUrl) {
-                    Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTypos' -> [$workspaceUrl]" -ForegroundColor Yellow
-                }
+                Write-Host "DEBUG: URL from '$keyVaultNameInfra' ($env) using '$urlSecretNameTypos'" -ForegroundColor Yellow
             } catch {
                 Write-Warning "URL secret '$urlSecretNameTypos' not found in '$keyVaultNameInfra' ($env) as well: $_"
             }
         }
+
+        # Extra debug for workspaceUrl
+        $length = if ([string]::IsNullOrEmpty($workspaceUrl)) { 0 } else { $workspaceUrl.Length }
+        Write-Host "DEBUG: Raw workspaceUrl for '$workspaceName' ($env) = '[$workspaceUrl]'" -ForegroundColor DarkCyan
+        Write-Host "DEBUG: workspaceUrl Length = $length" -ForegroundColor DarkCyan
 
         # ID
         try {
@@ -522,7 +523,7 @@ $csvCatPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_catalog_perms_{0}
 $csvExt     = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc_{0}_{1}"        -f $adh_group, $adh_subscription_type)
 $csvExtPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc_perms_{0}_{1}"  -f $adh_group, $adh_subscription_type)
 
-function Write-EmptySafeCsv {
+function Write-ResultsCsv {
     param(
         [string]$Path,
         [array]$Rows
@@ -530,19 +531,19 @@ function Write-EmptySafeCsv {
     if ($Rows -and $Rows.Count -gt 0) {
         Write-CsvSafe -Rows $Rows -Path $Path
     } else {
-        # Create an empty file so the artifact exists, but no header/rows
+        # Create an empty file so the artifact exists
         New-Item -ItemType File -Path $Path -Force | Out-Null
     }
 }
 
-Write-EmptySafeCsv -Path $csvWs      -Rows $workspaceResults
-Write-EmptySafeCsv -Path $csvWsPerm  -Rows $workspacePermResults
-Write-EmptySafeCsv -Path $csvWh      -Rows $sqlWhResults
-Write-EmptySafeCsv -Path $csvWhPerm  -Rows $sqlWhPermResults
-Write-EmptySafeCsv -Path $csvCatList -Rows $catalogListResults
-Write-EmptySafeCsv -Path $csvCatPerm -Rows $catalogPermResults
-Write-EmptySafeCsv -Path $csvExt     -Rows $extLocResults
-Write-EmptySafeCsv -Path $csvExtPerm -Rows $extLocPermResults
+Write-ResultsCsv -Path $csvWs      -Rows $workspaceResults
+Write-ResultsCsv -Path $csvWsPerm  -Rows $workspacePermResults
+Write-ResultsCsv -Path $csvWh      -Rows $sqlWhResults
+Write-ResultsCsv -Path $csvWhPerm  -Rows $sqlWhPermResults
+Write-ResultsCsv -Path $csvCatList -Rows $catalogListResults
+Write-ResultsCsv -Path $csvCatPerm -Rows $catalogPermResults
+Write-ResultsCsv -Path $csvExt     -Rows $extLocResults
+Write-ResultsCsv -Path $csvExtPerm -Rows $extLocPermResults
 
 # Only build HTML if we have workspace rows
 if ($workspaceResults.Count -gt 0) {
