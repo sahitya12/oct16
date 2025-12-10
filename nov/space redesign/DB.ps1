@@ -111,9 +111,9 @@ $databricksResourceId = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
 # We call this $DatabricksPat to stay compatible with DatabricksHelper.psm1,
 # but the value is actually an AAD access token.
-$DatabricksPat = (Get-AzAccessToken -TenantId $TenantId `
-                                   -ApplicationId $EffectiveClientId `
-                                   -ResourceUrl $databricksResourceId).Token
+# NOTE: Do NOT pass -ApplicationId here, it's not supported in the Az version on the agent.
+$tokenResponse = Get-AzAccessToken -ResourceUrl $databricksResourceId
+$DatabricksPat = $tokenResponse.Token
 
 if (-not $DatabricksPat) {
     throw "Failed to acquire Databricks AAD token for resource $databricksResourceId."
