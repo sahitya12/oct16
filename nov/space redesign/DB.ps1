@@ -31,7 +31,7 @@ param(
     [string]$BranchName = ''
 )
 
-Write-Host "SCRIPT VERSION: Scan-Databricks.ps1 / 2025-12-10b" -ForegroundColor Magenta
+Write-Host "SCRIPT VERSION: Scan-Databricks.ps1 / 2025-12-10c" -ForegroundColor Magenta
 Write-Host "DEBUG: PSBoundParameters: $($PSBoundParameters.Keys -join ', ')" -ForegroundColor Yellow
 
 # -------------------------------------------------------
@@ -199,6 +199,10 @@ foreach ($sub in $subs) {
 
         # -----------------------------------------------
         # Workspace URL and ID from Infra KV
+        #   URL secret (correct):  DATABRICKS-WORKSPACE-URL
+        #   URL secret (typo):     DATABRICKS-WORKSAPCE-URL
+        #   ID secret (correct):   DATABRICKS-WORKSPACE-ID
+        #   ID secret (typo):      DATABRICKS-WORKSAPCE-ID
         # -----------------------------------------------
         $urlSecretNameTidy   = "DATABRICKS-WORKSPACE-URL"
         $urlSecretNameTypos  = "DATABRICKS-WORKSAPCE-URL"
@@ -498,7 +502,7 @@ foreach ($sub in $subs) {
 }
 
 # -------------------------------------------------------
-# Export Data (always create CSVs, even if empty)
+# Export Data (defensive for empty arrays)
 # -------------------------------------------------------
 Write-Host "INFO: workspaceResults count     = $($workspaceResults.Count)"     -ForegroundColor Cyan
 Write-Host "INFO: workspacePermResults count = $($workspacePermResults.Count)" -ForegroundColor Cyan
@@ -518,16 +522,35 @@ $csvCatPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_catalog_perms_{0}
 $csvExt     = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc_{0}_{1}"        -f $adh_group, $adh_subscription_type)
 $csvExtPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc_perms_{0}_{1}"  -f $adh_group, $adh_subscription_type)
 
-Write-CsvSafe -Rows $workspaceResults     -Path $csvWs
-Write-CsvSafe -Rows $workspacePermResults -Path $csvWsPerm
-Write-CsvSafe -Rows $sqlWhResults         -Path $csvWh
-Write-CsvSafe -Rows $sqlWhPermResults     -Path $csvWhPerm
-Write-CsvSafe -Rows $catalogListResults   -Path $csvCatList
-Write-CsvSafe -Rows $catalogPermResults   -Path $csvCatPerm
-Write-CsvSafe -Rows $extLocResults        -Path $csvExt
-Write-CsvSafe -Rows $extLocPermResults    -Path $csvExtPerm
+function Write-EmptySafeCsv {
+    param(
+        [string]$Path,
+        [array]$Rows
+    )
+    if ($Rows -and $Rows.Count -gt 0) {
+        Write-CsvSafe -Rows $Rows -Path $Path
+    } else {
+        # Create an empty file so the artifact exists, but no header/rows
+        New-Item -ItemType File -Path $Path -Force | Out-Null
+    }
+}
 
-Convert-CsvToHtml -CsvPath $csvWs -HtmlPath ($csvWs -replace '.csv$', '.html') -Title "Databricks Workspaces ($adh_group / $adh_subscription_type) $BranchName"
+Write-EmptySafeCsv -Path $csvWs      -Rows $workspaceResults
+Write-EmptySafeCsv -Path $csvWsPerm  -Rows $workspacePermResults
+Write-EmptySafeCsv -Path $csvWh      -Rows $sqlWhResults
+Write-EmptySafeCsv -Path $csvWhPerm  -Rows $sqlWhPermResults
+Write-EmptySafeCsv -Path $csvCatList -Rows $catalogListResults
+Write-EmptySafeCsv -Path $csvCatPerm -Rows $catalogPermResults
+Write-EmptySafeCsv -Path $csvExt     -Rows $extLocResults
+Write-EmptySafeCsv -Path $csvExtPerm -Rows $extLocPermResults
+
+# Only build HTML if we have workspace rows
+if ($workspaceResults.Count -gt 0) {
+    Convert-CsvToHtml -CsvPath $csvWs -HtmlPath ($csvWs -replace '.csv$', '.html') `
+        -Title "Databricks Workspaces ($adh_group / $adh_subscription_type) $BranchName"
+} else {
+    Write-Warning "No workspace results collected – skipping workspace HTML export."
+}
 
 Write-Host "Databricks inventory scan completed." -ForegroundColor Green
 Write-Host "Workspace CSV           : $csvWs"
