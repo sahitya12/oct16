@@ -31,6 +31,9 @@ param(
     [string]$BranchName = ''
 )
 
+Write-Host "SCRIPT VERSION: Scan-Databricks.ps1 / 2025-12-10" -ForegroundColor Magenta
+Write-Host "DEBUG: PSBoundParameters: $($PSBoundParameters.Keys -join ', ')" -ForegroundColor Yellow
+
 # -------------------------------------------------------
 # Normalise adh_sub_group (handle "" / " " from pipeline)
 # -------------------------------------------------------
@@ -46,7 +49,6 @@ if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
 $EffectiveClientId = $ClientId
 
 Write-Host "INFO : Using EffectiveClientId = $EffectiveClientId" -ForegroundColor Cyan
-Write-Host "DEBUG: Bound params      = $($PSBoundParameters.Keys -join ', ')" -ForegroundColor Yellow
 Write-Host "DEBUG: adh_group         = $adh_group"
 Write-Host "DEBUG: adh_sub_group     = '$adh_sub_group'"
 Write-Host "DEBUG: subscription type = $adh_subscription_type"
