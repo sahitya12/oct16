@@ -31,7 +31,7 @@ param(
     [string]$BranchName = ''
 )
 
-Write-Host "SCRIPT VERSION: Scan-Databricks.ps1 / 2025-12-10" -ForegroundColor Magenta
+Write-Host "SCRIPT VERSION: Scan-Databricks.ps1 / 2025-12-10b" -ForegroundColor Magenta
 Write-Host "DEBUG: PSBoundParameters: $($PSBoundParameters.Keys -join ', ')" -ForegroundColor Yellow
 
 # -------------------------------------------------------
@@ -109,9 +109,7 @@ Write-Host "INFO: Subs      = $($subs.Name -join ', ')" -ForegroundColor Cyan
 # Azure Databricks resource ID (multi-tenant AAD app)
 $databricksResourceId = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
-# We call this $DatabricksPat to stay compatible with DatabricksHelper.psm1,
-# but the value is actually an AAD access token.
-# NOTE: Do NOT pass -ApplicationId here, it's not supported in the Az version on the agent.
+# Use current Az context (set by Connect-ScAz) to get AAD access token
 $tokenResponse = Get-AzAccessToken -ResourceUrl $databricksResourceId
 $DatabricksPat = $tokenResponse.Token
 
@@ -158,34 +156,49 @@ foreach ($sub in $subs) {
 
         # -----------------------------------------------
         # Gen_SPN info from Custodian KV (for reporting)
-        #   Secret name:        ADH_<Custodian>_Gen_SPN_<env>
-        #   Secret name (pass): ADH_<Custodian>_Gen_SPN_<env>-Secret
+        # We support two patterns:
+        #   1) ADH_<Custodian>_Gen_SPN_<env> (+ -Secret suffix)
+        #   2) ADH-Gen-SPN-ClientID / ADH-Gen-SPN-ClientSecret
         # -----------------------------------------------
-        $genSpnBaseName = "ADH_{0}_Gen_SPN_{1}" -f $Custodian, $env
+        $genSpnBaseNameEnv = "ADH_{0}_Gen_SPN_{1}" -f $Custodian, $env
+        $genericSpnIdName  = "ADH-Gen-SPN-ClientID"
+        $genericSpnPwName  = "ADH-Gen-SPN-ClientSecret"
 
+        # ClientId
         try {
-            $genSpnIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameCust -Name $genSpnBaseName -ErrorAction Stop
+            $genSpnIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameCust -Name $genSpnBaseNameEnv -ErrorAction Stop
             $DbSpnClientId  = $genSpnIdSecret.SecretValueText
-            Write-Host "INFO: Gen_SPN ClientId from '$keyVaultNameCust' ($env) name '$genSpnBaseName'" -ForegroundColor Cyan
+            Write-Host "INFO: Gen_SPN ClientId from '$keyVaultNameCust' ($env) name '$genSpnBaseNameEnv'" -ForegroundColor Cyan
         } catch {
-            Write-Warning "Gen_SPN ClientId '$genSpnBaseName' not found in '$keyVaultNameCust' ($env): $_"
+            Write-Warning "Gen_SPN ClientId '$genSpnBaseNameEnv' not found in '$keyVaultNameCust' ($env) – trying generic '$genericSpnIdName'"
+            try {
+                $genSpnIdSecret = Get-AzKeyVaultSecret -VaultName $keyVaultNameCust -Name $genericSpnIdName -ErrorAction Stop
+                $DbSpnClientId  = $genSpnIdSecret.SecretValueText
+                Write-Host "INFO: Gen_SPN ClientId (generic) from '$keyVaultNameCust' ($env) name '$genericSpnIdName'" -ForegroundColor Cyan
+            } catch {
+                Write-Warning "Gen_SPN ClientId '$genericSpnIdName' not found in '$keyVaultNameCust' ($env) either: $_"
+            }
         }
 
+        # ClientSecret
         try {
-            $genSpnSecretName  = $genSpnBaseName + "-Secret"
+            $genSpnSecretName  = $genSpnBaseNameEnv + "-Secret"
             $genSpnSecret      = Get-AzKeyVaultSecret -VaultName $keyVaultNameCust -Name $genSpnSecretName -ErrorAction Stop
             $DbSpnClientSecret = $genSpnSecret.SecretValueText
             Write-Host ("INFO: Gen_SPN ClientSecret from '{0}' ({1}) name '{2}' (len={3})" -f $keyVaultNameCust, $env, $genSpnSecretName, $DbSpnClientSecret.Length) -ForegroundColor Cyan
         } catch {
-            Write-Warning "Gen_SPN ClientSecret '$genSpnSecretName' not found in '$keyVaultNameCust' ($env): $_"
+            Write-Warning "Gen_SPN ClientSecret '$genSpnSecretName' not found in '$keyVaultNameCust' ($env) – trying generic '$genericSpnPwName'"
+            try {
+                $genSpnSecret      = Get-AzKeyVaultSecret -VaultName $keyVaultNameCust -Name $genericSpnPwName -ErrorAction Stop
+                $DbSpnClientSecret = $genSpnSecret.SecretValueText
+                Write-Host ("INFO: Gen_SPN ClientSecret (generic) from '{0}' ({1}) name '{2}' (len={3})" -f $keyVaultNameCust, $env, $genericSpnPwName, $DbSpnClientSecret.Length) -ForegroundColor Cyan
+            } catch {
+                Write-Warning "Gen_SPN ClientSecret '$genericSpnPwName' not found in '$keyVaultNameCust' ($env) either: $_"
+            }
         }
 
         # -----------------------------------------------
         # Workspace URL and ID from Infra KV
-        #   URL secret (correct):  DATABRICKS-WORKSPACE-URL
-        #   URL secret (typo):     DATABRICKS-WORKSAPCE-URL
-        #   ID secret (correct):   DATABRICKS-WORKSPACE-ID
-        #   ID secret (typo):      DATABRICKS-WORKSAPCE-ID
         # -----------------------------------------------
         $urlSecretNameTidy   = "DATABRICKS-WORKSPACE-URL"
         $urlSecretNameTypos  = "DATABRICKS-WORKSAPCE-URL"
@@ -485,67 +498,43 @@ foreach ($sub in $subs) {
 }
 
 # -------------------------------------------------------
-# Export Data
+# Export Data (always create CSVs, even if empty)
 # -------------------------------------------------------
-$csvWs       = $null
-$csvWsPerm   = $null
-$csvWh       = $null
-$csvWhPerm   = $null
-$csvCatList  = $null
-$csvCatPerm  = $null
-$csvExt      = $null
-$csvExtPerm  = $null
+Write-Host "INFO: workspaceResults count     = $($workspaceResults.Count)"     -ForegroundColor Cyan
+Write-Host "INFO: workspacePermResults count = $($workspacePermResults.Count)" -ForegroundColor Cyan
+Write-Host "INFO: sqlWhResults count         = $($sqlWhResults.Count)"         -ForegroundColor Cyan
+Write-Host "INFO: sqlWhPermResults count     = $($sqlWhPermResults.Count)"     -ForegroundColor Cyan
+Write-Host "INFO: catalogListResults count   = $($catalogListResults.Count)"   -ForegroundColor Cyan
+Write-Host "INFO: catalogPermResults count   = $($catalogPermResults.Count)"   -ForegroundColor Cyan
+Write-Host "INFO: extLocResults count        = $($extLocResults.Count)"        -ForegroundColor Cyan
+Write-Host "INFO: extLocPermResults count    = $($extLocPermResults.Count)"    -ForegroundColor Cyan
 
-if ($workspaceResults.Count -gt 0) {
-    $csvWs = New-StampedPath -BaseDir $OutputDir -Prefix ("db_ws_{0}_{1}" -f $adh_group, $adh_subscription_type)
-    Write-CsvSafe -Rows $workspaceResults -Path $csvWs
-    Convert-CsvToHtml -CsvPath $csvWs -HtmlPath ($csvWs -replace '.csv$', '.html') -Title "Databricks Workspaces ($adh_group / $adh_subscription_type) $BranchName"
-} else {
-    Write-Warning "No workspace results collected – skipping workspace CSV export."
-}
+$csvWs      = New-StampedPath -BaseDir $OutputDir -Prefix ("db_ws_{0}_{1}"            -f $adh_group, $adh_subscription_type)
+$csvWsPerm  = New-StampedPath -BaseDir $OutputDir -Prefix ("db_ws_perms_{0}_{1}"      -f $adh_group, $adh_subscription_type)
+$csvWh      = New-StampedPath -BaseDir $OutputDir -Prefix ("db_sqlwh_{0}_{1}"         -f $adh_group, $adh_subscription_type)
+$csvWhPerm  = New-StampedPath -BaseDir $OutputDir -Prefix ("db_sqlwh_perms_{0}_{1}"   -f $adh_group, $adh_subscription_type)
+$csvCatList = New-StampedPath -BaseDir $OutputDir -Prefix ("db_catalogs_{0}_{1}"      -f $adh_group, $adh_subscription_type)
+$csvCatPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_catalog_perms_{0}_{1}" -f $adh_group, $adh_subscription_type)
+$csvExt     = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc_{0}_{1}"        -f $adh_group, $adh_subscription_type)
+$csvExtPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc_perms_{0}_{1}"  -f $adh_group, $adh_subscription_type)
 
-if ($workspacePermResults.Count -gt 0) {
-    $csvWsPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_ws_perms_{0}_{1}" -f $adh_group, $adh_subscription_type)
-    Write-CsvSafe -Rows $workspacePermResults -Path $csvWsPerm
-}
+Write-CsvSafe -Rows $workspaceResults     -Path $csvWs
+Write-CsvSafe -Rows $workspacePermResults -Path $csvWsPerm
+Write-CsvSafe -Rows $sqlWhResults         -Path $csvWh
+Write-CsvSafe -Rows $sqlWhPermResults     -Path $csvWhPerm
+Write-CsvSafe -Rows $catalogListResults   -Path $csvCatList
+Write-CsvSafe -Rows $catalogPermResults   -Path $csvCatPerm
+Write-CsvSafe -Rows $extLocResults        -Path $csvExt
+Write-CsvSafe -Rows $extLocPermResults    -Path $csvExtPerm
 
-if ($sqlWhResults.Count -gt 0) {
-    $csvWh = New-StampedPath -BaseDir $OutputDir -Prefix ("db_sqlwh_{0}_{1}" -f $adh_group, $adh_subscription_type)
-    Write-CsvSafe -Rows $sqlWhResults -Path $csvWh
-}
-
-if ($sqlWhPermResults.Count -gt 0) {
-    $csvWhPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_sqlwh_perms_{0}_{1}" -f $adh_group, $adh_subscription_type)
-    Write-CsvSafe -Rows $sqlWhPermResults -Path $csvWhPerm
-}
-
-if ($catalogListResults.Count -gt 0) {
-    $csvCatList = New-StampedPath -BaseDir $OutputDir -Prefix ("db_catalogs_{0}_{1}" -f $adh_group, $adh_subscription_type)
-    Write-CsvSafe -Rows $catalogListResults -Path $csvCatList
-}
-
-if ($catalogPermResults.Count -gt 0) {
-    $csvCatPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_catalog_perms_{0}_{1}" -f $adh_group, $adh_subscription_type)
-    Write-CsvSafe -Rows $catalogPermResults -Path $csvCatPerm
-}
-
-if ($extLocResults.Count -gt 0) {
-    $csvExt = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc_{0}_{1}" -f $adh_group, $adh_subscription_type)
-    Write-CsvSafe -Rows $extLocResults -Path $csvExt
-}
-
-if ($extLocPermResults.Count -gt 0) {
-    $csvExtPerm = New-StampedPath -BaseDir $OutputDir -Prefix ("db_extloc_perms_{0}_{1}" -f $adh_group, $adh_subscription_type)
-    Write-CsvSafe -Rows $extLocPermResults -Path $csvExtPerm
-}
+Convert-CsvToHtml -CsvPath $csvWs -HtmlPath ($csvWs -replace '.csv$', '.html') -Title "Databricks Workspaces ($adh_group / $adh_subscription_type) $BranchName"
 
 Write-Host "Databricks inventory scan completed." -ForegroundColor Green
-
-if ($csvWs)      { Write-Host "Workspace CSV           : $csvWs" }
-if ($csvWsPerm)  { Write-Host "Workspace perms CSV     : $csvWsPerm" }
-if ($csvWh)      { Write-Host "SQL Warehouses CSV      : $csvWh" }
-if ($csvWhPerm)  { Write-Host "SQL Warehouse perms CSV : $csvWhPerm" }
-if ($csvCatList) { Write-Host "Catalog list CSV        : $csvCatList" }
-if ($csvCatPerm) { Write-Host "Catalog perms CSV       : $csvCatPerm" }
-if ($csvExt)     { Write-Host "External locations CSV  : $csvExt" }
-if ($csvExtPerm) { Write-Host "Ext loc perms CSV       : $csvExtPerm" }
+Write-Host "Workspace CSV           : $csvWs"
+Write-Host "Workspace perms CSV     : $csvWsPerm"
+Write-Host "SQL Warehouses CSV      : $csvWh"
+Write-Host "SQL Warehouse perms CSV : $csvWhPerm"
+Write-Host "Catalog list CSV        : $csvCatList"
+Write-Host "Catalog perms CSV       : $csvCatPerm"
+Write-Host "External locations CSV  : $csvExt"
+Write-Host "Ext loc perms CSV       : $csvExtPerm"
