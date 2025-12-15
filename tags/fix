@@ -1,0 +1,99 @@
+resource "local_file" "standard_tags_json" {
+  filename = "${path.module}/standard_tags.json"
+
+  content = jsonencode({
+    tags_to_be_added           = local.tags_to_be_added
+    sql_warehouse_desired_tags = local.sql_warehouse_desired_tags
+    databricks_compute_tags    = local.databricks_compute_tags
+  })
+}
+
+# ------------------------------------------------------------
+# Add/update tags on Azure resources (if tags_to_be_added is used)
+# tags_to_be_added = { "<resourceId>" = { "k"="v", ... }, ... }
+# ------------------------------------------------------------
+resource "null_resource" "add_tags" {
+  for_each = local.tags_to_be_added
+
+  triggers = {
+    resource_id = each.key
+    tags_hash   = sha1(jsonencode(each.value))
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["pwsh", "-NoProfile", "-Command"]
+    working_dir = path.module
+    on_failure  = "fail"
+
+    command = <<-EOT
+      $ErrorActionPreference = "Stop"
+
+      $rid = "${each.key}"
+
+      # Build "key=value" array for az resource tag
+      $tags = @()
+      $tagsMap = ${jsonencode(each.value)}
+      foreach ($k in $tagsMap.PSObject.Properties.Name) {
+        $v = $tagsMap.$k
+        $tags += ("{0}={1}" -f $k, $v)
+      }
+
+      Write-Host "Tagging Azure resource: $rid"
+      az resource tag --ids $rid --tags $tags | Out-Host
+
+      Start-Sleep -Seconds ${var.adh_standard_tags_update_delay_in_seconds}
+    EOT
+  }
+
+  depends_on = [
+    local_file.standard_tags_json
+  ]
+}
+
+# ------------------------------------------------------------
+# Databricks SQL Warehouse tags (PowerShell script)
+# FIX: call script via absolute path using -File
+# ------------------------------------------------------------
+resource "null_resource" "sql_warehouse_tags" {
+  triggers = {
+    tags_hash = sha1(jsonencode(local.sql_warehouse_desired_tags))
+  }
+
+  provisioner "local-exec" {
+    working_dir = path.module
+    on_failure  = "fail"
+
+    # Most reliable way in ADO agents:
+    command = "pwsh -NoProfile -ExecutionPolicy Bypass -File \"${path.module}\\tag_sql_warehouse.ps1\""
+  }
+
+  depends_on = [
+    local_file.standard_tags_json,
+    null_resource.add_tags
+  ]
+}
+
+# ------------------------------------------------------------
+# Databricks Compute tags (PowerShell script)
+# FIX: call script via absolute path using -File
+# ------------------------------------------------------------
+resource "null_resource" "compute_tags" {
+  triggers = {
+    tags_hash = sha1(jsonencode(local.databricks_compute_tags))
+    mode      = var.databricks_compute_tags_use_json_file_as_source_of_truth
+  }
+
+  provisioner "local-exec" {
+    working_dir = path.module
+    on_failure  = "fail"
+
+    command = var.databricks_compute_tags_use_json_file_as_source_of_truth == "true"
+      ? "pwsh -NoProfile -ExecutionPolicy Bypass -File \"${path.module}\\tag_compute.ps1\" -run_idempotent:$true"
+      : "pwsh -NoProfile -ExecutionPolicy Bypass -File \"${path.module}\\tag_compute.ps1\" -run_idempotent:$false"
+  }
+
+  depends_on = [
+    local_file.standard_tags_json,
+    null_resource.add_tags
+  ]
+}
