@@ -1,7 +1,6 @@
 module "adh_standard_tags" {
-  source = "../../Modules/standard_tags"
+  source = "../"
 
-  # pass structures directly from tfvars (HCL)
   tags_to_be_added           = var.tags_to_be_added
   sql_warehouse_desired_tags = var.sql_warehouse_desired_tags
   databricks_compute_tags    = var.databricks_compute_tags
