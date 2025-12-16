@@ -43,7 +43,7 @@ foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
 
     # Get ALL data factories in this subscription
-    $dfs = Get-AzDataFactoryV2 -ErrorAction SilentlyContinue
+    $dfs = @(Get-AzDataFactoryV2 -ErrorAction SilentlyContinue)
 
     $adfCount = @($dfs).Count
     if ($adfCount -eq 0) {
@@ -90,26 +90,27 @@ foreach ($sub in $subs) {
         # ----------------- Linked services --------------
         $ls = @()
         try {
-            $ls = Get-AzDataFactoryV2LinkedService `
+            $ls = @(Get-AzDataFactoryV2LinkedService `
                     -ResourceGroupName $df.ResourceGroupName `
                     -DataFactoryName   $dfName `
-                    -ErrorAction Stop
+                    -ErrorAction Stop)
         }
         catch {
             Write-Warning "DEBUG: Failed to query Linked Services for ADF '$dfName' in RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
             $ls = @()
         }
 
-        # Deduplicate by linked service name (protect against weird duplicates)
+        # Deduplicate by linked service name
         $ls = $ls | Group-Object Name | ForEach-Object { $_.Group | Select-Object -First 1 }
 
         Write-Host "DEBUG: ADF '$dfName' RG '$($df.ResourceGroupName)' -> LinkedServices: $(@($ls).Count)"
 
         foreach ($l in $ls) {
 
-            # Resolve Type in a robust way
+            # Try to resolve a useful Type for the linked service
             $lsType = $null
 
+            # 1) Most common shape: .Properties.Type
             if ($l.PSObject.Properties.Match('Properties').Count -gt 0 -and $l.Properties) {
                 if ($l.Properties.PSObject.Properties.Match('Type').Count -gt 0 -and
                     -not [string]::IsNullOrWhiteSpace($l.Properties.Type)) {
@@ -117,15 +118,19 @@ foreach ($sub in $subs) {
                 }
             }
 
-            if (-not $lsType -and $l.PSObject.Properties.Match('Type').Count -gt 0 -and
+            # 2) Some Az.DataFactory versions expose .Type directly
+            if (-not $lsType -and
+                $l.PSObject.Properties.Match('Type').Count -gt 0 -and
                 -not [string]::IsNullOrWhiteSpace($l.Type)) {
                 $lsType = $l.Type
             }
 
+            # 3) Fallback: use the underlying .Properties .NET type name
             if (-not $lsType -and $l.Properties) {
-                $lsType = $l.Properties.GetType().Name  # e.g. "AzureSqlDatabaseLinkedService"
+                $lsType = $l.Properties.GetType().Name   # e.g. "AzureSqlDatabaseLinkedService"
             }
 
+            # 4) Absolute fallback
             if (-not $lsType) { $lsType = 'Unknown' }
 
             $lsRows += [pscustomobject]@{
@@ -140,10 +145,11 @@ foreach ($sub in $subs) {
         # ----------------- Integration runtimes ---------
         $irs = @()
         try {
-            $irs = Get-AzDataFactoryV2IntegrationRuntime `
+            # IMPORTANT: Wrap in @() so single object becomes an array
+            $irs = @(Get-AzDataFactoryV2IntegrationRuntime `
                      -ResourceGroupName $df.ResourceGroupName `
                      -DataFactoryName   $dfName `
-                     -ErrorAction Stop
+                     -ErrorAction Stop)
         }
         catch {
             Write-Warning "DEBUG: Failed to query Integration Runtimes for ADF '$dfName' in RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
@@ -154,7 +160,7 @@ foreach ($sub in $subs) {
 
         foreach ($ir in $irs) {
 
-            # IR Type: best-effort across Az module versions
+            # IR Type
             $irType = $null
             if ($ir.PSObject.Properties.Match('Type').Count -gt 0 -and $ir.Type) {
                 $irType = $ir.Type
@@ -164,7 +170,7 @@ foreach ($sub in $subs) {
             }
             if ([string]::IsNullOrWhiteSpace($irType)) { $irType = "Unknown" }
 
-            # Compute description: best-effort
+            # Compute description (best-effort)
             $computeDesc = ""
             if ($ir.Properties) {
                 if ($ir.Properties.Description) {
@@ -175,7 +181,7 @@ foreach ($sub in $subs) {
                 }
             }
 
-            # STATUS: Get-AzDataFactoryV2IntegrationRuntimeStatus is the correct API
+            # Status (use Status cmdlet)
             $status = ""
             try {
                 $irStatus = Get-AzDataFactoryV2IntegrationRuntimeStatus `
@@ -184,7 +190,6 @@ foreach ($sub in $subs) {
                                 -Name              $ir.Name `
                                 -ErrorAction Stop
 
-                # Common shapes: Status or State
                 if ($irStatus.PSObject.Properties.Match('Status').Count -gt 0 -and $irStatus.Status) {
                     $status = [string]$irStatus.Status
                 }
@@ -192,12 +197,10 @@ foreach ($sub in $subs) {
                     $status = [string]$irStatus.State
                 }
                 else {
-                    # Fallback: try to find something meaningful
                     $status = ($irStatus | Out-String).Trim()
                 }
             }
             catch {
-                # If ADF shows "Not Found" in portal for self-hosted IR, it often throws here
                 $status = "Not Found"
             }
 
@@ -230,7 +233,7 @@ if (-not $overview) {
     }
 }
 
-# Ensure LS / IR CSVs always have at least one row (and correct columns)
+# Ensure LS / IR CSVs always have at least one row with correct columns
 if (-not $lsRows) {
     foreach ($sub in $subs) {
         $lsRows += [pscustomobject]@{
