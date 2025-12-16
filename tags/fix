@@ -1,3 +1,10 @@
+- powershell: |
+    Remove-Item -Recurse -Force .terraform -ErrorAction SilentlyContinue
+    Write-Host "Cleaned .terraform directory"
+  displayName: 'Clean Terraform cache'
+
+
+
 resource "local_file" "standard_tags_json" {
   filename = "${path.module}/standard_tags.json"
   content = jsonencode({
