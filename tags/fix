@@ -1,16 +1,28 @@
 - powershell: |
-    Write-Host "Cleaning Terraform cache in $(Get-Location)"
-    Remove-Item -Recurse -Force .terraform -ErrorAction SilentlyContinue
+    Write-Host "PWD:" (Get-Location)
+    Write-Host "modulePath=$(modulePath)"
+    Write-Host "Listing deployTest folder:"
     Get-ChildItem -Force
-  displayName: 'Clean Terraform cache'
+    Write-Host "Deleting .terraform in this folder..."
+    Remove-Item -Recurse -Force .terraform -ErrorAction SilentlyContinue
+    Write-Host "After delete:"
+    Get-ChildItem -Force
+  displayName: 'DEBUG + Clean Terraform cache'
   workingDirectory: '$(modulePath)/deployTest'
 
-- task: TerraformTask@5
-  displayName: Run Terraform Init
-  inputs:
-    command: init
-    workingDirectory: '$(modulePath)/deployTest'
-    backendAzureRmUseEntraIdToken: true
+- powershell: |
+    Write-Host "Show module source (deployTest/main.tf) from repo:"
+    Get-Content -Path ".\main.tf" -TotalCount 120
+  displayName: 'DEBUG: Print deployTest/main.tf'
+  workingDirectory: '$(modulePath)/deployTest'
+
+
+- powershell: |
+    Write-Host "Listing .terraform/modules after init:"
+    Get-ChildItem -Recurse -Force .terraform\modules | Select-Object FullName
+  displayName: 'DEBUG: List terraform modules cache'
+  workingDirectory: '$(modulePath)/deployTest'
+
 
 
 
