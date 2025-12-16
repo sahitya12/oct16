@@ -25,7 +25,7 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 }
 
 # ----------------------------------------------------------------------
-# Resolve subscription from adh_group + environment
+# Resolve subscriptions from adh_group + environment
 # ----------------------------------------------------------------------
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
@@ -37,10 +37,29 @@ $overview = @()
 $lsRows   = @()
 $irRows   = @()
 
+# Optional: ensure az is logged in (uncomment if CLI returns auth errors)
+# try {
+#     az account show --only-show-errors 1>$null 2>$null
+# } catch {
+#     Write-Host "DEBUG: az not logged in; logging in as SPN for CLI fallback..."
+#     az login --service-principal -u $ClientId -p $ClientSecret --tenant $TenantId --only-show-errors | Out-Null
+# }
+
 foreach ($sub in $subs) {
 
-    Write-Host "DEBUG: Processing subscription $($sub.Name)"
-    Set-ScContext -Subscription $sub
+    Write-Host "DEBUG: Processing subscription $($sub.Name) ($($sub.Id))"
+
+    try {
+        Set-ScContext -Subscription $sub
+    } catch {
+        Write-Warning "DEBUG: Set-ScContext failed for sub '$($sub.Name)': $($_.Exception.Message)"
+    }
+
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -Tenant $TenantId -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Warning "DEBUG: Set-AzContext failed for sub '$($sub.Name)': $($_.Exception.Message)"
+    }
 
     # Get ALL data factories in this subscription
     $dfs = @(Get-AzDataFactoryV2 -ErrorAction SilentlyContinue)
@@ -57,7 +76,6 @@ foreach ($sub in $subs) {
 
         # ----------------- Determine a safe DataFactory name -------------
         $dfName = $null
-
         if ($df.PSObject.Properties.Match('DataFactoryName').Count -gt 0 -and
             -not [string]::IsNullOrWhiteSpace($df.DataFactoryName)) {
             $dfName = $df.DataFactoryName
@@ -66,10 +84,9 @@ foreach ($sub in $subs) {
                 -not [string]::IsNullOrWhiteSpace($df.FactoryName)) {
             $dfName = $df.FactoryName
         }
-        else {
-            if ($df.PSObject.Properties.Match('Name').Count -gt 0) {
-                $dfName = $df.Name
-            }
+        elseif ($df.PSObject.Properties.Match('Name').Count -gt 0 -and
+                -not [string]::IsNullOrWhiteSpace($df.Name)) {
+            $dfName = $df.Name
         }
 
         if ([string]::IsNullOrWhiteSpace($dfName)) {
@@ -102,15 +119,13 @@ foreach ($sub in $subs) {
 
         # Deduplicate by linked service name
         $ls = $ls | Group-Object Name | ForEach-Object { $_.Group | Select-Object -First 1 }
-
         Write-Host "DEBUG: ADF '$dfName' RG '$($df.ResourceGroupName)' -> LinkedServices: $(@($ls).Count)"
 
         foreach ($l in $ls) {
 
-            # Try to resolve a useful Type for the linked service
             $lsType = $null
 
-            # 1) Most common shape: .Properties.Type
+            # 1) Most common: .Properties.Type
             if ($l.PSObject.Properties.Match('Properties').Count -gt 0 -and $l.Properties) {
                 if ($l.Properties.PSObject.Properties.Match('Type').Count -gt 0 -and
                     -not [string]::IsNullOrWhiteSpace($l.Properties.Type)) {
@@ -118,19 +133,18 @@ foreach ($sub in $subs) {
                 }
             }
 
-            # 2) Some Az.DataFactory versions expose .Type directly
+            # 2) Some versions expose .Type directly
             if (-not $lsType -and
                 $l.PSObject.Properties.Match('Type').Count -gt 0 -and
                 -not [string]::IsNullOrWhiteSpace($l.Type)) {
                 $lsType = $l.Type
             }
 
-            # 3) Fallback: use the underlying .Properties .NET type name
+            # 3) Fallback .NET type
             if (-not $lsType -and $l.Properties) {
-                $lsType = $l.Properties.GetType().Name   # e.g. "AzureSqlDatabaseLinkedService"
+                $lsType = $l.Properties.GetType().Name
             }
 
-            # 4) Absolute fallback
             if (-not $lsType) { $lsType = 'Unknown' }
 
             $lsRows += [pscustomobject]@{
@@ -142,35 +156,62 @@ foreach ($sub in $subs) {
             }
         }
 
-        # ----------------- Integration runtimes ---------
+        # ----------------- Integration runtimes (robust) ---------
         $irs = @()
+        $usedCliFallback = $false
+
+        # Try Az PowerShell first
         try {
-            # IMPORTANT: Wrap in @() so single object becomes an array
             $irs = @(Get-AzDataFactoryV2IntegrationRuntime `
                      -ResourceGroupName $df.ResourceGroupName `
                      -DataFactoryName   $dfName `
                      -ErrorAction Stop)
         }
         catch {
-            Write-Warning "DEBUG: Failed to query Integration Runtimes for ADF '$dfName' in RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
+            Write-Warning "DEBUG: Get-AzDataFactoryV2IntegrationRuntime FAILED for ADF '$dfName' RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
             $irs = @()
         }
 
-        Write-Host "DEBUG: ADF '$dfName' RG '$($df.ResourceGroupName)' -> IntegrationRuntimes: $(@($irs).Count)"
+        # CLI fallback if PS returned nothing
+        if (@($irs).Count -eq 0) {
+            try {
+                $usedCliFallback = $true
+                $cliListJson = az datafactory integration-runtime list `
+                    --resource-group "$($df.ResourceGroupName)" `
+                    --factory-name "$dfName" `
+                    --only-show-errors `
+                    -o json
+
+                $cliIrs = @()
+                if (-not [string]::IsNullOrWhiteSpace($cliListJson)) {
+                    $cliIrs = @($cliListJson | ConvertFrom-Json)
+                }
+
+                $irs = $cliIrs | ForEach-Object {
+                    [pscustomobject]@{
+                        Name       = $_.name
+                        Properties = $_.properties
+                        Type       = if ($_.properties.type) { $_.properties.type } else { '' }
+                    }
+                }
+            }
+            catch {
+                Write-Warning "DEBUG: AZ CLI fallback FAILED for IR list ADF '$dfName' RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
+                $irs = @()
+            }
+        }
+
+        Write-Host "DEBUG: ADF '$dfName' RG '$($df.ResourceGroupName)' -> IntegrationRuntimes: $(@($irs).Count) (CLI fallback used: $usedCliFallback)"
 
         foreach ($ir in $irs) {
 
-            # IR Type
+            # IRType
             $irType = $null
-            if ($ir.PSObject.Properties.Match('Type').Count -gt 0 -and $ir.Type) {
-                $irType = $ir.Type
-            }
-            elseif ($ir.Properties -and $ir.Properties.PSObject.Properties.Match('Type').Count -gt 0 -and $ir.Properties.Type) {
-                $irType = $ir.Properties.Type
-            }
+            if ($ir.Type) { $irType = $ir.Type }
+            elseif ($ir.Properties -and $ir.Properties.Type) { $irType = $ir.Properties.Type }
             if ([string]::IsNullOrWhiteSpace($irType)) { $irType = "Unknown" }
 
-            # Compute description (best-effort)
+            # ComputeDesc
             $computeDesc = ""
             if ($ir.Properties) {
                 if ($ir.Properties.Description) {
@@ -181,8 +222,10 @@ foreach ($sub in $subs) {
                 }
             }
 
-            # Status (use Status cmdlet)
+            # Status (PS status cmdlet first; if fails use CLI show)
             $status = ""
+            $statusFetched = $false
+
             try {
                 $irStatus = Get-AzDataFactoryV2IntegrationRuntimeStatus `
                                 -ResourceGroupName $df.ResourceGroupName `
@@ -197,11 +240,35 @@ foreach ($sub in $subs) {
                     $status = [string]$irStatus.State
                 }
                 else {
-                    $status = ($irStatus | Out-String).Trim()
+                    $status = "Unknown"
                 }
+
+                $statusFetched = $true
             }
             catch {
-                $status = "Not Found"
+                try {
+                    $cliShowJson = az datafactory integration-runtime show `
+                        --resource-group "$($df.ResourceGroupName)" `
+                        --factory-name "$dfName" `
+                        --name "$($ir.Name)" `
+                        --only-show-errors `
+                        -o json
+
+                    if (-not [string]::IsNullOrWhiteSpace($cliShowJson)) {
+                        $cliShow = $cliShowJson | ConvertFrom-Json
+                        if ($cliShow.properties.state) { $status = [string]$cliShow.properties.state }
+                        elseif ($cliShow.properties.status) { $status = [string]$cliShow.properties.status }
+                        else { $status = "Unknown" }
+                        $statusFetched = $true
+                    }
+                }
+                catch {
+                    $status = "Not Found"
+                }
+            }
+
+            if (-not $statusFetched -and [string]::IsNullOrWhiteSpace($status)) {
+                $status = "Unknown"
             }
 
             $irRows += [pscustomobject]@{
