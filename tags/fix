@@ -1,5 +1,18 @@
- ------------------------------------------------------------
-# Write standard_tags.json (used by PowerShell scripts)
+terraform {
+  required_providers {
+    local = {
+      source  = "hashicorp/local"
+      version = ">= 2.4.0"
+    }
+    null = {
+      source  = "hashicorp/null"
+      version = ">= 3.2.0"
+    }
+  }
+}
+
+# ------------------------------------------------------------
+# 1) Write standard_tags.json (for your Databricks scripts)
 # ------------------------------------------------------------
 resource "local_file" "standard_tags_json" {
   filename = "${path.module}/standard_tags.json"
@@ -12,7 +25,7 @@ resource "local_file" "standard_tags_json" {
 }
 
 # ------------------------------------------------------------
-# Write per-resource tags to temp JSON (SAFE PowerShell input)
+# 2) Write per-resource tags JSON files (safe input)
 # ------------------------------------------------------------
 resource "local_file" "resource_tags_json" {
   for_each = local.tags_to_be_added
@@ -22,7 +35,46 @@ resource "local_file" "resource_tags_json" {
 }
 
 # ------------------------------------------------------------
-# Add/update Azure resource tags
+# 3) Create a helper PowerShell script file (NO inline -Command)
+# ------------------------------------------------------------
+resource "local_file" "azure_tag_script" {
+  filename = "${path.module}/tag_azure_resource.ps1"
+
+  content = <<-PS1
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Rid,
+    [Parameter(Mandatory)][string]$TagsFile,
+    [Parameter(Mandatory)][int]$SleepSeconds
+  )
+
+  $ErrorActionPreference = "Stop"
+
+  Write-Host "Loading tags from: $TagsFile"
+  if (-not (Test-Path -LiteralPath $TagsFile)) {
+    throw "Tags file not found: $TagsFile"
+  }
+
+  $tagsMap = Get-Content -LiteralPath $TagsFile -Raw | ConvertFrom-Json
+
+  $tags = @()
+  foreach ($prop in $tagsMap.PSObject.Properties) {
+    # sanitize values (avoid newlines breaking CLI args)
+    $val = [string]$prop.Value
+    $val = $val -replace "`r|`n", " "
+
+    $tags += ("{0}={1}" -f $prop.Name, $val)
+  }
+
+  Write-Host "Tagging Azure resource: $Rid"
+  az resource tag --ids $Rid --tags $tags | Out-Host
+
+  Start-Sleep -Seconds $SleepSeconds
+  PS1
+}
+
+# ------------------------------------------------------------
+# 4) Add/update tags on Azure resources (stable execution)
 # ------------------------------------------------------------
 resource "null_resource" "add_tags" {
   for_each = local.tags_to_be_added
@@ -36,36 +88,17 @@ resource "null_resource" "add_tags" {
     working_dir = path.module
     on_failure  = "fail"
 
-    command = <<-EOT
-      pwsh -NoProfile -ExecutionPolicy Bypass -Command "
-        $ErrorActionPreference = 'Stop'
-
-        $rid = '${each.key}'
-        $tagsFile = 'tags_${replace(each.key, "/", "_")}.json'
-
-        Write-Host 'Loading tags from:' $tagsFile
-        $tagsMap = Get-Content $tagsFile -Raw | ConvertFrom-Json
-
-        $tags = @()
-        foreach ($prop in $tagsMap.PSObject.Properties) {
-          $tags += ('{0}={1}' -f $prop.Name, $prop.Value)
-        }
-
-        Write-Host 'Tagging Azure resource:' $rid
-        az resource tag --ids $rid --tags $tags | Out-Host
-
-        Start-Sleep -Seconds ${var.adh_standard_tags_update_delay_in_seconds}
-      "
-    EOT
+    command = "pwsh -NoProfile -ExecutionPolicy Bypass -File \"${path.module}\\tag_azure_resource.ps1\" -Rid \"${each.key}\" -TagsFile \"${path.module}\\tags_${replace(each.key, "/", "_")}.json\" -SleepSeconds ${var.adh_standard_tags_update_delay_in_seconds}"
   }
 
   depends_on = [
+    local_file.azure_tag_script,
     local_file.resource_tags_json
   ]
 }
 
 # ------------------------------------------------------------
-# Databricks SQL Warehouse tags
+# 5) Databricks SQL Warehouse tags
 # ------------------------------------------------------------
 resource "null_resource" "sql_warehouse_tags" {
   triggers = {
@@ -75,8 +108,7 @@ resource "null_resource" "sql_warehouse_tags" {
   provisioner "local-exec" {
     working_dir = path.module
     on_failure  = "fail"
-
-    command = "pwsh -NoProfile -ExecutionPolicy Bypass -File \"${path.module}\\tag_sql_warehouse.ps1\""
+    command     = "pwsh -NoProfile -ExecutionPolicy Bypass -File \"${path.module}\\tag_sql_warehouse.ps1\""
   }
 
   depends_on = [
@@ -86,7 +118,7 @@ resource "null_resource" "sql_warehouse_tags" {
 }
 
 # ------------------------------------------------------------
-# Databricks Compute tags
+# 6) Databricks Compute tags
 # ------------------------------------------------------------
 resource "null_resource" "compute_tags" {
   triggers = {
