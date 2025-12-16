@@ -11,6 +11,41 @@ param(
 Import-Module Az.Accounts, Az.Resources, Az.DataFactory -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
+function Write-RequiredPermissions {
+    param(
+        [string]$ScopeHint = "Subscription or Resource Group containing the Data Factory"
+    )
+
+    Write-Host ""
+    Write-Host "================ PERMISSIONS REQUIRED ================" -ForegroundColor Yellow
+    Write-Host "Your identity could not read Data Factory / Integration Runtime data."
+    Write-Host "Grant ONE of the following (least privilege preferred) at: $ScopeHint"
+    Write-Host ""
+    Write-Host "Option A (recommended if available):" -ForegroundColor Yellow
+    Write-Host "  - Data Factory Reader (or equivalent custom role allowing Microsoft.DataFactory/*/read)"
+    Write-Host ""
+    Write-Host "Option B:" -ForegroundColor Yellow
+    Write-Host "  - Reader + explicit DataFactory read permissions (custom role)"
+    Write-Host ""
+    Write-Host "Option C (broad, not recommended):" -ForegroundColor Yellow
+    Write-Host "  - Data Factory Contributor"
+    Write-Host ""
+    Write-Host "After the scan, remove the role assignment (use PIM/JIT if possible)." -ForegroundColor Yellow
+    Write-Host "======================================================" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+function Is-AuthError([string]$msg) {
+    if ([string]::IsNullOrWhiteSpace($msg)) { return $false }
+    $m = $msg.ToLowerInvariant()
+    return ($m -match "authorizationfailed" -or
+            $m -match "does not have authorization" -or
+            $m -match "insufficient privileges" -or
+            $m -match "forbidden" -or
+            $m -match "statuscode:\s*403" -or
+            $m -match "permission")
+}
+
 Write-Host "DEBUG: TenantId              = $TenantId"
 Write-Host "DEBUG: ClientId              = $ClientId"
 Write-Host "DEBUG: adh_group             = $adh_group"
@@ -24,8 +59,16 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
     throw "Azure connection failed."
 }
 
+# Make Azure CLI auth explicit (important for CLI fallback)
+try {
+    Write-Host "DEBUG: Logging into Azure CLI as SPN..."
+    az login --service-principal -u $ClientId -p $ClientSecret --tenant $TenantId --only-show-errors | Out-Null
+} catch {
+    Write-Warning "DEBUG: Azure CLI login failed. CLI fallback may not work. Error: $($_.Exception.Message)"
+}
+
 # ----------------------------------------------------------------------
-# Resolve subscriptions from adh_group + environment
+# Resolve subscription from adh_group + environment
 # ----------------------------------------------------------------------
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
@@ -37,64 +80,48 @@ $overview = @()
 $lsRows   = @()
 $irRows   = @()
 
-# Optional: ensure az is logged in (uncomment if CLI returns auth errors)
-# try {
-#     az account show --only-show-errors 1>$null 2>$null
-# } catch {
-#     Write-Host "DEBUG: az not logged in; logging in as SPN for CLI fallback..."
-#     az login --service-principal -u $ClientId -p $ClientSecret --tenant $TenantId --only-show-errors | Out-Null
-# }
-
 foreach ($sub in $subs) {
 
     Write-Host "DEBUG: Processing subscription $($sub.Name) ($($sub.Id))"
 
+    try { Set-ScContext -Subscription $sub } catch {}
+    try { Set-AzContext -SubscriptionId $sub.Id -Tenant $TenantId -ErrorAction Stop | Out-Null } catch {}
+
+    # ----------------- Get ALL data factories (FAIL LOUD) -----------------
+    $dfs = @()
     try {
-        Set-ScContext -Subscription $sub
-    } catch {
-        Write-Warning "DEBUG: Set-ScContext failed for sub '$($sub.Name)': $($_.Exception.Message)"
+        $dfs = @(Get-AzDataFactoryV2 -ErrorAction Stop)
+    }
+    catch {
+        $msg = $_.Exception.Message
+        Write-Host "ERROR: Cannot list Data Factories in subscription '$($sub.Name)'. $msg" -ForegroundColor Red
+        if (Is-AuthError $msg) {
+            Write-RequiredPermissions -ScopeHint "Subscription '$($sub.Name)' or RG hosting the Data Factory"
+        }
+        throw
     }
 
-    try {
-        Set-AzContext -SubscriptionId $sub.Id -Tenant $TenantId -ErrorAction Stop | Out-Null
-    } catch {
-        Write-Warning "DEBUG: Set-AzContext failed for sub '$($sub.Name)': $($_.Exception.Message)"
-    }
+    Write-Host "DEBUG: DataFactories found in $($sub.Name) = $($dfs.Count)"
 
-    # Get ALL data factories in this subscription
-    $dfs = @(Get-AzDataFactoryV2 -ErrorAction SilentlyContinue)
-
-    $adfCount = @($dfs).Count
-    if ($adfCount -eq 0) {
+    if ($dfs.Count -eq 0) {
         Write-Host "DEBUG: No DataFactories found in $($sub.Name)"
         continue
-    } else {
-        Write-Host "DEBUG: Found $adfCount DataFactory instance(s) in $($sub.Name)"
     }
 
     foreach ($df in $dfs) {
 
-        # ----------------- Determine a safe DataFactory name -------------
+        # Determine ADF Name safely
         $dfName = $null
-        if ($df.PSObject.Properties.Match('DataFactoryName').Count -gt 0 -and
-            -not [string]::IsNullOrWhiteSpace($df.DataFactoryName)) {
-            $dfName = $df.DataFactoryName
-        }
-        elseif ($df.PSObject.Properties.Match('FactoryName').Count -gt 0 -and
-                -not [string]::IsNullOrWhiteSpace($df.FactoryName)) {
-            $dfName = $df.FactoryName
-        }
-        elseif ($df.PSObject.Properties.Match('Name').Count -gt 0 -and
-                -not [string]::IsNullOrWhiteSpace($df.Name)) {
-            $dfName = $df.Name
-        }
+        if ($df.PSObject.Properties.Match('DataFactoryName').Count -gt 0 -and $df.DataFactoryName) { $dfName = $df.DataFactoryName }
+        elseif ($df.PSObject.Properties.Match('FactoryName').Count -gt 0 -and $df.FactoryName) { $dfName = $df.FactoryName }
+        elseif ($df.PSObject.Properties.Match('Name').Count -gt 0 -and $df.Name) { $dfName = $df.Name }
 
         if ([string]::IsNullOrWhiteSpace($dfName)) {
-            Write-Warning "DEBUG: DataFactory object in subscription '$($sub.Name)' has no detectable name. Skipping. Raw object: `n$($df | Out-String)"
+            Write-Warning "DEBUG: ADF object has no detectable name; skipping."
             continue
         }
 
-        # ----------------- Overview row -----------------
+        # Overview row
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -104,7 +131,7 @@ foreach ($sub in $subs) {
             Location         = $df.Location
         }
 
-        # ----------------- Linked services --------------
+        # ----------------- Linked services -----------------
         $ls = @()
         try {
             $ls = @(Get-AzDataFactoryV2LinkedService `
@@ -113,39 +140,25 @@ foreach ($sub in $subs) {
                     -ErrorAction Stop)
         }
         catch {
-            Write-Warning "DEBUG: Failed to query Linked Services for ADF '$dfName' in RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
+            $msg = $_.Exception.Message
+            Write-Host "ERROR: Cannot list Linked Services for ADF '$dfName' RG '$($df.ResourceGroupName)'. $msg" -ForegroundColor Red
+            if (Is-AuthError $msg) {
+                Write-RequiredPermissions -ScopeHint "RG '$($df.ResourceGroupName)' (Data Factory scope)"
+            }
+            # Do not stop entire scan; keep going
             $ls = @()
         }
 
-        # Deduplicate by linked service name
+        # Dedup by name
         $ls = $ls | Group-Object Name | ForEach-Object { $_.Group | Select-Object -First 1 }
-        Write-Host "DEBUG: ADF '$dfName' RG '$($df.ResourceGroupName)' -> LinkedServices: $(@($ls).Count)"
 
         foreach ($l in $ls) {
-
             $lsType = $null
 
-            # 1) Most common: .Properties.Type
-            if ($l.PSObject.Properties.Match('Properties').Count -gt 0 -and $l.Properties) {
-                if ($l.Properties.PSObject.Properties.Match('Type').Count -gt 0 -and
-                    -not [string]::IsNullOrWhiteSpace($l.Properties.Type)) {
-                    $lsType = $l.Properties.Type
-                }
-            }
-
-            # 2) Some versions expose .Type directly
-            if (-not $lsType -and
-                $l.PSObject.Properties.Match('Type').Count -gt 0 -and
-                -not [string]::IsNullOrWhiteSpace($l.Type)) {
-                $lsType = $l.Type
-            }
-
-            # 3) Fallback .NET type
-            if (-not $lsType -and $l.Properties) {
-                $lsType = $l.Properties.GetType().Name
-            }
-
-            if (-not $lsType) { $lsType = 'Unknown' }
+            if ($l.Properties -and $l.Properties.Type) { $lsType = $l.Properties.Type }
+            elseif ($l.Type) { $lsType = $l.Type }
+            elseif ($l.Properties) { $lsType = $l.Properties.GetType().Name }
+            if (-not $lsType) { $lsType = "Unknown" }
 
             $lsRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
@@ -156,31 +169,32 @@ foreach ($sub in $subs) {
             }
         }
 
-        # ----------------- Integration runtimes (robust) ---------
+        # ----------------- Integration runtimes (PS + CLI fallback) -----------------
         $irs = @()
         $usedCliFallback = $false
 
-        # Try Az PowerShell first
         try {
             $irs = @(Get-AzDataFactoryV2IntegrationRuntime `
-                     -ResourceGroupName $df.ResourceGroupName `
-                     -DataFactoryName   $dfName `
-                     -ErrorAction Stop)
+                        -ResourceGroupName $df.ResourceGroupName `
+                        -DataFactoryName   $dfName `
+                        -ErrorAction Stop)
         }
         catch {
-            Write-Warning "DEBUG: Get-AzDataFactoryV2IntegrationRuntime FAILED for ADF '$dfName' RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
+            $msg = $_.Exception.Message
+            Write-Host "WARN: PS IR list failed for ADF '$dfName' RG '$($df.ResourceGroupName)'. $msg" -ForegroundColor Yellow
             $irs = @()
         }
 
-        # CLI fallback if PS returned nothing
-        if (@($irs).Count -eq 0) {
+        if ($irs.Count -eq 0) {
+            # CLI fallback list
             try {
                 $usedCliFallback = $true
+                az account set --subscription $sub.Id --only-show-errors | Out-Null
+
                 $cliListJson = az datafactory integration-runtime list `
                     --resource-group "$($df.ResourceGroupName)" `
                     --factory-name "$dfName" `
-                    --only-show-errors `
-                    -o json
+                    --only-show-errors -o json
 
                 $cliIrs = @()
                 if (-not [string]::IsNullOrWhiteSpace($cliListJson)) {
@@ -190,39 +204,36 @@ foreach ($sub in $subs) {
                 $irs = $cliIrs | ForEach-Object {
                     [pscustomobject]@{
                         Name       = $_.name
+                        Type       = $_.properties.type
                         Properties = $_.properties
-                        Type       = if ($_.properties.type) { $_.properties.type } else { '' }
                     }
                 }
             }
             catch {
-                Write-Warning "DEBUG: AZ CLI fallback FAILED for IR list ADF '$dfName' RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
+                $msg = $_.Exception.Message
+                Write-Host "ERROR: CLI IR list failed for ADF '$dfName' RG '$($df.ResourceGroupName)'. $msg" -ForegroundColor Red
+                if (Is-AuthError $msg) {
+                    Write-RequiredPermissions -ScopeHint "RG '$($df.ResourceGroupName)' (Data Factory scope)"
+                }
                 $irs = @()
             }
         }
 
-        Write-Host "DEBUG: ADF '$dfName' RG '$($df.ResourceGroupName)' -> IntegrationRuntimes: $(@($irs).Count) (CLI fallback used: $usedCliFallback)"
+        Write-Host "DEBUG: ADF '$dfName' -> IR count: $($irs.Count) (CLI fallback: $usedCliFallback)"
 
         foreach ($ir in $irs) {
 
-            # IRType
-            $irType = $null
-            if ($ir.Type) { $irType = $ir.Type }
-            elseif ($ir.Properties -and $ir.Properties.Type) { $irType = $ir.Properties.Type }
-            if ([string]::IsNullOrWhiteSpace($irType)) { $irType = "Unknown" }
+            $irType = if ($ir.Type) { $ir.Type } elseif ($ir.Properties -and $ir.Properties.Type) { $ir.Properties.Type } else { "Unknown" }
 
-            # ComputeDesc
             $computeDesc = ""
             if ($ir.Properties) {
-                if ($ir.Properties.Description) {
-                    $computeDesc = [string]$ir.Properties.Description
-                }
+                if ($ir.Properties.Description) { $computeDesc = [string]$ir.Properties.Description }
                 elseif ($ir.Properties.AdditionalProperties -and $ir.Properties.AdditionalProperties.ClusterSize) {
                     $computeDesc = [string]$ir.Properties.AdditionalProperties.ClusterSize
                 }
             }
 
-            # Status (PS status cmdlet first; if fails use CLI show)
+            # Status: PS first; else CLI show
             $status = ""
             $statusFetched = $false
 
@@ -233,26 +244,22 @@ foreach ($sub in $subs) {
                                 -Name              $ir.Name `
                                 -ErrorAction Stop
 
-                if ($irStatus.PSObject.Properties.Match('Status').Count -gt 0 -and $irStatus.Status) {
-                    $status = [string]$irStatus.Status
-                }
-                elseif ($irStatus.PSObject.Properties.Match('State').Count -gt 0 -and $irStatus.State) {
-                    $status = [string]$irStatus.State
-                }
-                else {
-                    $status = "Unknown"
-                }
+                if ($irStatus.Status) { $status = [string]$irStatus.Status }
+                elseif ($irStatus.State) { $status = [string]$irStatus.State }
+                else { $status = "Unknown" }
 
                 $statusFetched = $true
             }
             catch {
+                # CLI show fallback
                 try {
+                    az account set --subscription $sub.Id --only-show-errors | Out-Null
+
                     $cliShowJson = az datafactory integration-runtime show `
                         --resource-group "$($df.ResourceGroupName)" `
                         --factory-name "$dfName" `
                         --name "$($ir.Name)" `
-                        --only-show-errors `
-                        -o json
+                        --only-show-errors -o json
 
                     if (-not [string]::IsNullOrWhiteSpace($cliShowJson)) {
                         $cliShow = $cliShowJson | ConvertFrom-Json
@@ -267,9 +274,7 @@ foreach ($sub in $subs) {
                 }
             }
 
-            if (-not $statusFetched -and [string]::IsNullOrWhiteSpace($status)) {
-                $status = "Unknown"
-            }
+            if (-not $statusFetched -and [string]::IsNullOrWhiteSpace($status)) { $status = "Unknown" }
 
             $irRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
