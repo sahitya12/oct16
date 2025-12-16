@@ -1,0 +1,48 @@
+resource "null_resource" "add_tags" {
+  for_each = local.tags_to_be_added
+
+  triggers = {
+    resource_id = each.key
+    tags_hash   = sha1(jsonencode(each.value))
+  }
+
+  provisioner "local-exec" {
+    on_failure = "fail"
+
+    command = <<-EOT
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "
+$ErrorActionPreference = 'Stop'
+
+$rid = '${each.key}'
+
+# SAFE: JSON as text -> ConvertFrom-Json
+$tagsJson = @'
+${jsonencode(each.value)}
+'@
+
+$tagsMap = $tagsJson | ConvertFrom-Json
+
+$tags = @()
+foreach ($p in $tagsMap.PSObject.Properties) {
+  $val = [string]$p.Value -replace \"`r|`n\", \" \"
+  $tags += (\"{0}={1}\" -f $p.Name, $val)
+}
+
+Write-Host \"Tagging Azure resource: $rid\"
+az resource tag --ids $rid --tags $tags | Out-Host
+
+Start-Sleep -Seconds ${var.adh_standard_tags_update_delay_in_seconds}
+"
+EOT
+  }
+}
+
+_________________________-\\\
+
+
+- powershell: |
+    Remove-Item -Force tfplan -ErrorAction SilentlyContinue
+    Remove-Item -Force tfplan* -ErrorAction SilentlyContinue
+  displayName: 'Delete old tfplan'
+  workingDirectory: '$(modulePath)/deployTest'
+
