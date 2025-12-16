@@ -1,7 +1,16 @@
 - powershell: |
+    Write-Host "Cleaning Terraform cache in $(Get-Location)"
     Remove-Item -Recurse -Force .terraform -ErrorAction SilentlyContinue
-    Write-Host "Cleaned .terraform directory"
+    Get-ChildItem -Force
   displayName: 'Clean Terraform cache'
+  workingDirectory: '$(modulePath)/deployTest'
+
+- task: TerraformTask@5
+  displayName: Run Terraform Init
+  inputs:
+    command: init
+    workingDirectory: '$(modulePath)/deployTest'
+    backendAzureRmUseEntraIdToken: true
 
 
 
