@@ -8,26 +8,35 @@ param(
     [string]$BranchName = ''
 )
 
-Import-Module Az.Accounts, Az.Resources, Az.DataFactory -ErrorAction Stop
+Import-Module Az.Accounts, Az.Resources, Az.ResourceGraph, Az.DataFactory -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
-function Throw-PermissionError([string]$SubName) {
-@"
-❌ PERMISSION CHECK FAILED
+Ensure-Dir -Path $OutputDir | Out-Null
 
-The Service Principal does NOT have permission to read Azure Data Factory.
+function Throw-PermissionError([string]$Context, [string]$Details) {
+    throw @"
+❌ PERMISSION / ACCESS ERROR ($Context)
 
-Grant temporarily (preferred):
+$Details
+
+Required (temporary, least privilege):
 • Role: Data Factory Reader
-• Scope: Resource Group OR Data Factory resource
+• Scope: Resource Group containing the Data Factory OR the Data Factory resource
 
-Subscription: $SubName
-
-Then re-run the pipeline. Use PIM/JIT and remove after scan.
-"@ | ForEach-Object { throw $_ }
+Then re-run pipeline. Use PIM/JIT and remove after scan.
+"@
 }
 
-Ensure-Dir -Path $OutputDir | Out-Null
+function IsAuthError([string]$msg) {
+    if ([string]::IsNullOrWhiteSpace($msg)) { return $false }
+    $m = $msg.ToLowerInvariant()
+    return ($m -match "authorizationfailed" -or
+            $m -match "does not have authorization" -or
+            $m -match "insufficient privileges" -or
+            $m -match "forbidden" -or
+            $m -match "statuscode:\s*403" -or
+            $m -match "permission")
+}
 
 # ---------------- AUTH ----------------
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
@@ -38,7 +47,7 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 try {
     az login --service-principal -u $ClientId -p $ClientSecret --tenant $TenantId --only-show-errors | Out-Null
 } catch {
-    Write-Warning "Azure CLI login failed; IR status may be missing. Error: $($_.Exception.Message)"
+    Throw-PermissionError -Context "Azure CLI login" -Details $_.Exception.Message
 }
 
 # ---------------- RESOLVE SUBS ----------------
@@ -52,20 +61,32 @@ $irRows   = @()
 foreach ($sub in $subs) {
 
     Write-Host "DEBUG: Processing subscription $($sub.Name) ($($sub.Id))"
-
     Set-ScContext -Subscription $sub
     try { Set-AzContext -SubscriptionId $sub.Id -Tenant $TenantId -ErrorAction Stop | Out-Null } catch {}
     try { az account set --subscription $sub.Id --only-show-errors | Out-Null } catch {}
 
-    # ---------------- PERMISSION PRECHECK ----------------
+    # ------------------------------------------------------------------
+    # 1) Discover ALL Data Factories in subscription using Resource Graph
+    #    (more reliable than Get-AzDataFactoryV2 for enterprise RBAC)
+    # ------------------------------------------------------------------
+    $adfRg = @()
     try {
-        $testDf = Get-AzDataFactoryV2 -ErrorAction Stop | Select-Object -First 1
-    } catch {
-        Throw-PermissionError -SubName $sub.Name
+        $q = @"
+resources
+| where type =~ 'microsoft.datafactory/factories'
+| project id, name, resourceGroup, subscriptionId, location
+"@
+        $adfRg = Search-AzGraph -Query $q -Subscription $sub.Id -First 1000 -ErrorAction Stop
+    }
+    catch {
+        $msg = $_.Exception.Message
+        if (IsAuthError $msg) {
+            Throw-PermissionError -Context "Resource Graph query (list factories)" -Details $msg
+        }
+        throw
     }
 
-    # If subscription truly has no ADF, still continue but add overview "Exists=No"
-    if (-not $testDf) {
+    if (-not $adfRg -or @($adfRg).Count -eq 0) {
         Write-Host "DEBUG: No Data Factories found in $($sub.Name)"
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
@@ -78,39 +99,36 @@ foreach ($sub in $subs) {
         continue
     }
 
-    $dfs = @(Get-AzDataFactoryV2 -ErrorAction Stop)
-    Write-Host "DEBUG: ADF count in $($sub.Name) = $($dfs.Count)"
+    Write-Host "DEBUG: ADFs found via ARG in $($sub.Name) = $(@($adfRg).Count)"
 
-    foreach ($df in $dfs) {
+    foreach ($df in $adfRg) {
 
-        $dfName = $df.DataFactoryName
-        if ([string]::IsNullOrWhiteSpace($dfName)) { $dfName = $df.FactoryName }
-        if ([string]::IsNullOrWhiteSpace($dfName)) { $dfName = $df.Name }
-
-        if ([string]::IsNullOrWhiteSpace($dfName)) {
-            Write-Warning "ADF has no detectable name; skipping"
-            continue
-        }
+        $dfName = $df.name
+        $rgName = $df.resourceGroup
 
         # ---------------- OVERVIEW ----------------
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
-            ResourceGroup    = $df.ResourceGroupName
+            ResourceGroup    = $rgName
             DataFactory      = $dfName
             Exists           = 'Yes'
-            Location         = $df.Location
+            Location         = $df.location
         }
 
         # ---------------- LINKED SERVICES ----------------
         $ls = @()
         try {
             $ls = @(Get-AzDataFactoryV2LinkedService `
-                    -ResourceGroupName $df.ResourceGroupName `
+                    -ResourceGroupName $rgName `
                     -DataFactoryName   $dfName `
                     -ErrorAction Stop)
         } catch {
-            Write-Warning "Failed to query Linked Services for ADF '$dfName' RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
+            $msg = $_.Exception.Message
+            if (IsAuthError $msg) {
+                Throw-PermissionError -Context "Get LinkedServices ($dfName / $rgName)" -Details $msg
+            }
+            Write-Warning "Failed LinkedServices for ADF '$dfName' RG '$rgName': $msg"
             $ls = @()
         }
 
@@ -125,7 +143,7 @@ foreach ($sub in $subs) {
 
             $lsRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
-                ResourceGroup    = $df.ResourceGroupName
+                ResourceGroup    = $rgName
                 DataFactory      = $dfName
                 LinkedService    = $l.Name
                 Type             = $lsType
@@ -136,27 +154,16 @@ foreach ($sub in $subs) {
         $irs = @()
         try {
             $irs = @(Get-AzDataFactoryV2IntegrationRuntime `
-                        -ResourceGroupName $df.ResourceGroupName `
+                        -ResourceGroupName $rgName `
                         -DataFactoryName   $dfName `
                         -ErrorAction Stop)
         } catch {
-            Write-Warning "Failed to query Integration Runtimes for ADF '$dfName' RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
-            $irs = @()
-        }
-
-        # IR Status from CLI (portal-like “Running / Not Found / Offline”)
-        $irStatusMap = @{}
-        try {
-            $statusJson = az datafactory integration-runtime list `
-                --resource-group "$($df.ResourceGroupName)" `
-                --factory-name "$dfName" `
-                -o json --only-show-errors | ConvertFrom-Json
-
-            foreach ($s in $statusJson) {
-                $irStatusMap[$s.name] = $s.properties.state
+            $msg = $_.Exception.Message
+            if (IsAuthError $msg) {
+                Throw-PermissionError -Context "Get IntegrationRuntimes ($dfName / $rgName)" -Details $msg
             }
-        } catch {
-            Write-Warning "CLI IR status list failed for ADF '$dfName': $($_.Exception.Message)"
+            Write-Warning "Failed IR list for ADF '$dfName' RG '$rgName': $msg"
+            $irs = @()
         }
 
         foreach ($ir in $irs) {
@@ -169,12 +176,26 @@ foreach ($sub in $subs) {
             $computeDesc = ""
             if ($ir.Properties -and $ir.Properties.Description) { $computeDesc = [string]$ir.Properties.Description }
 
-            $status = $irStatusMap[$ir.Name]
-            if ([string]::IsNullOrWhiteSpace($status)) { $status = "Unknown" }
+            # IR Status: use CLI show per IR (most reliable)
+            $status = "Unknown"
+            try {
+                $showJson = az datafactory integration-runtime show `
+                    --resource-group "$rgName" `
+                    --factory-name "$dfName" `
+                    --name "$($ir.Name)" `
+                    -o json --only-show-errors | ConvertFrom-Json
+
+                if ($showJson -and $showJson.properties -and $showJson.properties.state) {
+                    $status = [string]$showJson.properties.state
+                }
+            } catch {
+                # For SHIR agents you may see "Not Found" in portal; keep it informative
+                $status = "Not Found"
+            }
 
             $irRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
-                ResourceGroup    = $df.ResourceGroupName
+                ResourceGroup    = $rgName
                 DataFactory      = $dfName
                 IRName           = $ir.Name
                 IRType           = $irType
@@ -185,30 +206,26 @@ foreach ($sub in $subs) {
     }
 }
 
-# Ensure outputs always have at least one row
+# Ensure LS / IR outputs always have correct headers even if empty
 if (-not $lsRows) {
-    foreach ($sub in $subs) {
-        $lsRows += [pscustomobject]@{
-            SubscriptionName = $sub.Name
-            ResourceGroup    = ''
-            DataFactory      = ''
-            LinkedService    = ''
-            Type             = ''
-        }
+    $lsRows += [pscustomobject]@{
+        SubscriptionName = ''
+        ResourceGroup    = ''
+        DataFactory      = ''
+        LinkedService    = ''
+        Type             = ''
     }
 }
 
 if (-not $irRows) {
-    foreach ($sub in $subs) {
-        $irRows += [pscustomobject]@{
-            SubscriptionName = $sub.Name
-            ResourceGroup    = ''
-            DataFactory      = ''
-            IRName           = ''
-            IRType           = ''
-            ComputeDesc      = ''
-            Status           = ''
-        }
+    $irRows += [pscustomobject]@{
+        SubscriptionName = ''
+        ResourceGroup    = ''
+        DataFactory      = ''
+        IRName           = ''
+        IRType           = ''
+        ComputeDesc      = ''
+        Status           = ''
     }
 }
 
