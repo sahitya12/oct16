@@ -1,0 +1,13 @@
+az login
+az account set --subscription <SUBSCRIPTION_ID>
+SPN_NAME="ADH HHD CENCONNECT SPN prd"
+SPN_SECRET_NAME="ADH-HHD-CENCONNECT-SPN-prd-Secret"
+KV_NAME="ADH-HHD-KV-prd"
+SPN_OUTPUT=$(az ad sp create-for-rbac --name "$SPN_NAME" --skip-assignment -o json)
+APP_ID=$(echo $SPN_OUTPUT | jq -r .appId)
+SPN_SECRET=$(echo $SPN_OUTPUT | jq -r .password)
+TENANT_ID=$(echo $SPN_OUTPUT | jq -r .tenant)
+az keyvault secret set --vault-name "$KV_NAME" --name "$SPN_SECRET_NAME" --value "$SPN_SECRET"
+az role assignment create --assignee "$APP_ID" --role "Contributor" --scope "/subscriptions/<SUBSCRIPTION_ID>"
+az ad sp show --id "$APP_ID"
+az keyvault secret show --vault-name "$KV_NAME" --name "$SPN_SECRET_NAME"
