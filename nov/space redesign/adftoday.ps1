@@ -8,29 +8,62 @@ param(
     [string]$BranchName = ''
 )
 
-Import-Module Az.Accounts, Az.Resources, Az.DataFactory, Az.ResourceGraph -ErrorAction Stop
+Import-Module Az.Accounts, Az.Resources, Az.ResourceGraph -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
+
+# ---------------- helpers ----------------
+function To-OneString($v) {
+    if ($null -eq $v) { return "" }
+    if ($v -is [System.Array]) { return [string]($v | Select-Object -First 1) }
+    return [string]$v
+}
+
+function Add-LSRow {
+    param($subName, $rgName, $dfName, $lsName, $lsType, $status, $err)
+    return [pscustomobject]@{
+        SubscriptionName = $subName
+        ResourceGroup    = $rgName
+        DataFactory      = $dfName
+        LinkedService    = $lsName
+        Type             = $lsType
+        Status           = $status
+        Error            = $err
+    }
+}
+
+function Add-IRRow {
+    param($subName, $rgName, $dfName, $irName, $irType, $computeDesc, $status, $err)
+    return [pscustomobject]@{
+        SubscriptionName = $subName
+        ResourceGroup    = $rgName
+        DataFactory      = $dfName
+        IRName           = $irName
+        IRType           = $irType
+        ComputeDesc      = $computeDesc
+        Status           = $status
+        Error            = $err
+    }
+}
 
 Ensure-Dir -Path $OutputDir | Out-Null
 
-function To-OneString($v) {
-    if ($null -eq $v) { return "" }
-    if ($v -is [System.Array]) {
-        return [string]($v | Select-Object -First 1)
-    }
-    return [string]$v
-}
+Write-Host "DEBUG: TenantId              = $TenantId"
+Write-Host "DEBUG: ClientId              = $ClientId"
+Write-Host "DEBUG: adh_group             = $adh_group"
+Write-Host "DEBUG: adh_subscription_type = $adh_subscription_type"
+Write-Host "DEBUG: OutputDir             = $OutputDir"
+Write-Host "DEBUG: BranchName            = $BranchName"
 
 # ---------------- AUTH ----------------
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure login failed."
 }
 
-# Azure CLI login (needed for IR status)
+# Azure CLI login (needed for linked services / IR status)
 try {
     az login --service-principal -u $ClientId -p $ClientSecret --tenant $TenantId --only-show-errors | Out-Null
 } catch {
-    Write-Warning "Azure CLI login failed; IR status may be missing. Error: $($_.Exception.Message)"
+    throw "Azure CLI login failed: $($_.Exception.Message)"
 }
 
 # ---------------- RESOLVE SUBS ----------------
@@ -50,7 +83,7 @@ foreach ($sub in $subs) {
     try { az account set --subscription $sub.Id --only-show-errors | Out-Null } catch {}
 
     # ------------------------------------------------------
-    # Discover ADFs via Resource Graph (but normalize output)
+    # Discover ADFs via Resource Graph
     # ------------------------------------------------------
     $adfs = @()
     try {
@@ -65,6 +98,7 @@ resources
     }
 
     if (-not $adfs -or $adfs.Count -eq 0) {
+        Write-Host "DEBUG: No ADFs found in $($sub.Name)"
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -76,9 +110,10 @@ resources
         continue
     }
 
+    Write-Host "DEBUG: Found $($adfs.Count) ADF(s) in $($sub.Name)"
+
     foreach ($df in $adfs) {
 
-        # Normalize to string (avoid System.Object[])
         $dfName = To-OneString $df.name
         $rgName = To-OneString $df.resourceGroup
         $loc    = To-OneString $df.location
@@ -98,149 +133,65 @@ resources
             Location         = $loc
         }
 
-        # ---------------- LINKED SERVICES (with error row) ----------------
+        # ======================================================
+        # LINKED SERVICES via AZ CLI (reliable)
+        # ======================================================
         try {
-            $ls = @(Get-AzDataFactoryV2LinkedService -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop)
+            $lsJson = az datafactory linked-service list `
+                --resource-group "$rgName" `
+                --factory-name "$dfName" `
+                -o json --only-show-errors | ConvertFrom-Json
 
-            $ls = $ls | Group-Object Name | ForEach-Object { $_.Group | Select-Object -First 1 }
+            if (-not $lsJson -or $lsJson.Count -eq 0) {
+                $lsRows += Add-LSRow $sub.Name $rgName $dfName '' '' 'OK' 'No linked services returned by CLI'
+            } else {
+                foreach ($l in $lsJson) {
+                    $lsType = To-OneString $l.properties.type
+                    if ([string]::IsNullOrWhiteSpace($lsType)) { $lsType = 'Unknown' }
 
-            foreach ($l in $ls) {
-                $lsType = $null
-                if ($l.Properties -and $l.Properties.Type) { $lsType = $l.Properties.Type }
-                elseif ($l.Type) { $lsType = $l.Type }
-                elseif ($l.Properties) { $lsType = $l.Properties.GetType().Name }
-                if (-not $lsType) { $lsType = "Unknown" }
-
-                $lsRows += [pscustomobject]@{
-                    SubscriptionName = $sub.Name
-                    ResourceGroup    = $rgName
-                    DataFactory      = $dfName
-                    LinkedService    = $l.Name
-                    Type             = $lsType
-                    Status           = 'OK'
-                    Error            = ''
+                    $lsRows += Add-LSRow $sub.Name $rgName $dfName (To-OneString $l.name) $lsType 'OK' ''
                 }
             }
-
-            if ($ls.Count -eq 0) {
-                $lsRows += [pscustomobject]@{
-                    SubscriptionName = $sub.Name
-                    ResourceGroup    = $rgName
-                    DataFactory      = $dfName
-                    LinkedService    = ''
-                    Type             = ''
-                    Status           = 'OK'
-                    Error            = 'No linked services found'
-                }
-            }
-
         } catch {
-            $lsRows += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rgName
-                DataFactory      = $dfName
-                LinkedService    = ''
-                Type             = ''
-                Status           = 'ERROR'
-                Error            = $_.Exception.Message
-            }
+            $lsRows += Add-LSRow $sub.Name $rgName $dfName '' '' 'ERROR' $_.Exception.Message
         }
 
-        # ---------------- IRs (with status) ----------------
+        # ======================================================
+        # INTEGRATION RUNTIMES via AZ CLI (includes state)
+        # ======================================================
         try {
-            $irs = @(Get-AzDataFactoryV2IntegrationRuntime -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop)
+            $irJson = az datafactory integration-runtime list `
+                --resource-group "$rgName" `
+                --factory-name "$dfName" `
+                -o json --only-show-errors | ConvertFrom-Json
 
-            foreach ($ir in $irs) {
+            if (-not $irJson -or $irJson.Count -eq 0) {
+                $irRows += Add-IRRow $sub.Name $rgName $dfName '' '' '' 'OK' 'No integration runtimes returned by CLI'
+            } else {
+                foreach ($ir in $irJson) {
+                    $irType = To-OneString $ir.properties.type
+                    if ([string]::IsNullOrWhiteSpace($irType)) { $irType = 'Unknown' }
 
-                $irType = $null
-                if ($ir.Properties -and $ir.Properties.Type) { $irType = $ir.Properties.Type }
-                elseif ($ir.Type) { $irType = $ir.Type }
-                if (-not $irType) { $irType = "Unknown" }
+                    $state = To-OneString $ir.properties.state
+                    if ([string]::IsNullOrWhiteSpace($state)) { $state = 'Unknown' }
 
-                $computeDesc = ""
-                if ($ir.Properties -and $ir.Properties.Description) { $computeDesc = [string]$ir.Properties.Description }
+                    $desc = To-OneString $ir.properties.description
 
-                $status = "Unknown"
-                $statusErr = ""
-
-                try {
-                    $showJson = az datafactory integration-runtime show `
-                        --resource-group "$rgName" `
-                        --factory-name "$dfName" `
-                        --name "$($ir.Name)" `
-                        -o json --only-show-errors | ConvertFrom-Json
-
-                    if ($showJson -and $showJson.properties -and $showJson.properties.state) {
-                        $status = [string]$showJson.properties.state
-                    }
-                } catch {
-                    $status = "Not Found"
-                    $statusErr = $_.Exception.Message
-                }
-
-                $irRows += [pscustomobject]@{
-                    SubscriptionName = $sub.Name
-                    ResourceGroup    = $rgName
-                    DataFactory      = $dfName
-                    IRName           = $ir.Name
-                    IRType           = $irType
-                    ComputeDesc      = $computeDesc
-                    Status           = $status
-                    Error            = $statusErr
+                    $irRows += Add-IRRow $sub.Name $rgName $dfName (To-OneString $ir.name) $irType $desc $state ''
                 }
             }
-
-            if ($irs.Count -eq 0) {
-                $irRows += [pscustomobject]@{
-                    SubscriptionName = $sub.Name
-                    ResourceGroup    = $rgName
-                    DataFactory      = $dfName
-                    IRName           = ''
-                    IRType           = ''
-                    ComputeDesc      = ''
-                    Status           = 'OK'
-                    Error            = 'No integration runtimes found'
-                }
-            }
-
         } catch {
-            $irRows += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rgName
-                DataFactory      = $dfName
-                IRName           = ''
-                IRType           = ''
-                ComputeDesc      = ''
-                Status           = 'ERROR'
-                Error            = $_.Exception.Message
-            }
+            $irRows += Add-IRRow $sub.Name $rgName $dfName '' '' '' 'ERROR' $_.Exception.Message
         }
     }
 }
 
-# Ensure headers
+# Ensure headers even if empty
 if (-not $lsRows) {
-    $lsRows += [pscustomobject]@{
-        SubscriptionName = ''
-        ResourceGroup    = ''
-        DataFactory      = ''
-        LinkedService    = ''
-        Type             = ''
-        Status           = ''
-        Error            = ''
-    }
+    $lsRows += Add-LSRow '' '' '' '' '' '' ''
 }
 if (-not $irRows) {
-    $irRows += [pscustomobject]@{
-        SubscriptionName = ''
-        ResourceGroup    = ''
-        DataFactory      = ''
-        IRName           = ''
-        IRType           = ''
-        ComputeDesc      = ''
-        Status           = ''
-        Error            = ''
-    }
+    $irRows += Add-IRRow '' '' '' '' '' '' '' ''
 }
 
 # ---------------- OUTPUT ----------------
