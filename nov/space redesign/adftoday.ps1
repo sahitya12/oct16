@@ -11,55 +11,29 @@ param(
 Import-Module Az.Accounts, Az.Resources, Az.DataFactory, Az.ResourceGraph -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
-# ---------------- Helpers ----------------
-function IsAuthError([string]$msg) {
-    if ([string]::IsNullOrWhiteSpace($msg)) { return $false }
-    $m = $msg.ToLowerInvariant()
-    return ($m -match "authorizationfailed" -or
-            $m -match "does not have authorization" -or
-            $m -match "insufficient privileges" -or
-            $m -match "forbidden" -or
-            $m -match "statuscode:\s*403" -or
-            $m -match "permission")
-}
-
-function Throw-PermissionError([string]$Context, [string]$Details) {
-    throw @"
-❌ PERMISSION / ACCESS ERROR ($Context)
-
-$Details
-
-Required (temporary, least privilege):
-• Role: Data Factory Reader (or custom role allowing Microsoft.DataFactory/*/read)
-• Scope: Resource Group containing the Data Factory OR the Data Factory resource
-
-Then re-run pipeline. Use PIM/JIT and remove after scan.
-"@
-}
-
-# ---------------- Setup ----------------
-Write-Host "DEBUG: TenantId              = $TenantId"
-Write-Host "DEBUG: ClientId              = $ClientId"
-Write-Host "DEBUG: adh_group             = $adh_group"
-Write-Host "DEBUG: adh_subscription_type = $adh_subscription_type"
-Write-Host "DEBUG: OutputDir             = $OutputDir"
-Write-Host "DEBUG: BranchName            = $BranchName"
-
 Ensure-Dir -Path $OutputDir | Out-Null
+
+function To-OneString($v) {
+    if ($null -eq $v) { return "" }
+    if ($v -is [System.Array]) {
+        return [string]($v | Select-Object -First 1)
+    }
+    return [string]$v
+}
 
 # ---------------- AUTH ----------------
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure login failed."
 }
 
-# Azure CLI login (needed for IR Status)
+# Azure CLI login (needed for IR status)
 try {
     az login --service-principal -u $ClientId -p $ClientSecret --tenant $TenantId --only-show-errors | Out-Null
 } catch {
-    Throw-PermissionError -Context "Azure CLI login" -Details $_.Exception.Message
+    Write-Warning "Azure CLI login failed; IR status may be missing. Error: $($_.Exception.Message)"
 }
 
-# ---------------- Resolve subscriptions ----------------
+# ---------------- RESOLVE SUBS ----------------
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
@@ -76,26 +50,21 @@ foreach ($sub in $subs) {
     try { az account set --subscription $sub.Id --only-show-errors | Out-Null } catch {}
 
     # ------------------------------------------------------
-    # Discover ALL Data Factories via Resource Graph
-    # (more consistent than Get-AzDataFactoryV2 in some RBAC setups)
+    # Discover ADFs via Resource Graph (but normalize output)
     # ------------------------------------------------------
     $adfs = @()
     try {
         $query = @"
 resources
 | where type =~ 'microsoft.datafactory/factories'
-| project id, name, resourceGroup, subscriptionId, location
+| project name, resourceGroup, location
 "@
         $adfs = @(Search-AzGraph -Query $query -Subscription $sub.Id -First 1000 -ErrorAction Stop)
-    }
-    catch {
-        $msg = $_.Exception.Message
-        if (IsAuthError $msg) { Throw-PermissionError -Context "List factories via Resource Graph" -Details $msg }
-        throw
+    } catch {
+        throw "Failed to list ADFs via Resource Graph in subscription $($sub.Name): $($_.Exception.Message)"
     }
 
     if (-not $adfs -or $adfs.Count -eq 0) {
-        Write-Host "DEBUG: No ADFs found in subscription $($sub.Name)"
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -107,12 +76,17 @@ resources
         continue
     }
 
-    Write-Host "DEBUG: Found $($adfs.Count) ADF(s) via ARG in $($sub.Name)"
-
     foreach ($df in $adfs) {
 
-        $rgName = $df.resourceGroup
-        $dfName = $df.name
+        # Normalize to string (avoid System.Object[])
+        $dfName = To-OneString $df.name
+        $rgName = To-OneString $df.resourceGroup
+        $loc    = To-OneString $df.location
+
+        if ([string]::IsNullOrWhiteSpace($dfName) -or [string]::IsNullOrWhiteSpace($rgName)) {
+            Write-Warning "Skipping ADF row due to missing name/RG. Raw: $($df | Out-String)"
+            continue
+        }
 
         # ---------------- OVERVIEW ----------------
         $overview += [pscustomobject]@{
@@ -121,37 +95,13 @@ resources
             ResourceGroup    = $rgName
             DataFactory      = $dfName
             Exists           = 'Yes'
-            Location         = $df.location
+            Location         = $loc
         }
 
-        # ======================================================
-        # LINKED SERVICES (WITH STATUS + ERROR so Dev won't vanish)
-        # ======================================================
-        $ls = @()
-        $lsError = $null
+        # ---------------- LINKED SERVICES (with error row) ----------------
         try {
-            $ls = @(Get-AzDataFactoryV2LinkedService `
-                    -ResourceGroupName $rgName `
-                    -DataFactoryName   $dfName `
-                    -ErrorAction Stop)
-        }
-        catch {
-            $lsError = $_.Exception.Message
-            $ls = @()
-        }
+            $ls = @(Get-AzDataFactoryV2LinkedService -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop)
 
-        if ($lsError) {
-            # 1 row to show failure for that ADF
-            $lsRows += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rgName
-                DataFactory      = $dfName
-                LinkedService    = ''
-                Type             = ''
-                Status           = 'ERROR'
-                Error            = $lsError
-            }
-        } else {
             $ls = $ls | Group-Object Name | ForEach-Object { $_.Group | Select-Object -First 1 }
 
             foreach ($l in $ls) {
@@ -171,38 +121,34 @@ resources
                     Error            = ''
                 }
             }
-        }
 
-        # ======================================================
-        # INTEGRATION RUNTIMES (WITH STATUS)
-        # ======================================================
-        $irs = @()
-        $irListError = $null
+            if ($ls.Count -eq 0) {
+                $lsRows += [pscustomobject]@{
+                    SubscriptionName = $sub.Name
+                    ResourceGroup    = $rgName
+                    DataFactory      = $dfName
+                    LinkedService    = ''
+                    Type             = ''
+                    Status           = 'OK'
+                    Error            = 'No linked services found'
+                }
+            }
 
-        try {
-            $irs = @(Get-AzDataFactoryV2IntegrationRuntime `
-                    -ResourceGroupName $rgName `
-                    -DataFactoryName   $dfName `
-                    -ErrorAction Stop)
-        }
-        catch {
-            $irListError = $_.Exception.Message
-            $irs = @()
-        }
-
-        if ($irListError) {
-            # 1 row to show failure for that ADF
-            $irRows += [pscustomobject]@{
+        } catch {
+            $lsRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $rgName
                 DataFactory      = $dfName
-                IRName           = ''
-                IRType           = ''
-                ComputeDesc      = ''
+                LinkedService    = ''
+                Type             = ''
                 Status           = 'ERROR'
-                Error            = $irListError
+                Error            = $_.Exception.Message
             }
-        } else {
+        }
+
+        # ---------------- IRs (with status) ----------------
+        try {
+            $irs = @(Get-AzDataFactoryV2IntegrationRuntime -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop)
 
             foreach ($ir in $irs) {
 
@@ -214,9 +160,9 @@ resources
                 $computeDesc = ""
                 if ($ir.Properties -and $ir.Properties.Description) { $computeDesc = [string]$ir.Properties.Description }
 
-                # CLI show per IR => best chance to match portal "Running / Not Found"
                 $status = "Unknown"
                 $statusErr = ""
+
                 try {
                     $showJson = az datafactory integration-runtime show `
                         --resource-group "$rgName" `
@@ -243,11 +189,36 @@ resources
                     Error            = $statusErr
                 }
             }
+
+            if ($irs.Count -eq 0) {
+                $irRows += [pscustomobject]@{
+                    SubscriptionName = $sub.Name
+                    ResourceGroup    = $rgName
+                    DataFactory      = $dfName
+                    IRName           = ''
+                    IRType           = ''
+                    ComputeDesc      = ''
+                    Status           = 'OK'
+                    Error            = 'No integration runtimes found'
+                }
+            }
+
+        } catch {
+            $irRows += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                ResourceGroup    = $rgName
+                DataFactory      = $dfName
+                IRName           = ''
+                IRType           = ''
+                ComputeDesc      = ''
+                Status           = 'ERROR'
+                Error            = $_.Exception.Message
+            }
         }
     }
 }
 
-# Ensure headers exist even if lists empty
+# Ensure headers
 if (-not $lsRows) {
     $lsRows += [pscustomobject]@{
         SubscriptionName = ''
