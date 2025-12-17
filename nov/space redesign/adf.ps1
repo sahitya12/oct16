@@ -1,4 +1,4 @@
-# sanitychecks/scripts/Scan-DataFactory.ps1 
+# sanitychecks/scripts/Scan-DataFactory.ps1
 
 param(
     [Parameter(Mandatory = $true)][string]$TenantId,
@@ -13,6 +13,31 @@ param(
 Import-Module Az.Accounts, Az.Resources, Az.DataFactory -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
+function Ensure-RowLS([string]$subName,[string]$rg,[string]$df,[string]$ls,[string]$type,[string]$status,[string]$err) {
+    [pscustomobject]@{
+        SubscriptionName = $subName
+        ResourceGroup    = $rg
+        DataFactory      = $df
+        LinkedService    = $ls
+        Type             = $type
+        Status           = $status
+        Error            = $err
+    }
+}
+
+function Ensure-RowIR([string]$subName,[string]$rg,[string]$df,[string]$ir,[string]$type,[string]$compute,[string]$status,[string]$err) {
+    [pscustomobject]@{
+        SubscriptionName = $subName
+        ResourceGroup    = $rg
+        DataFactory      = $df
+        IRName           = $ir
+        IRType           = $type
+        ComputeDesc      = $compute
+        Status           = $status
+        Error            = $err
+    }
+}
+
 Write-Host "DEBUG: TenantId              = $TenantId"
 Write-Host "DEBUG: ClientId              = $ClientId"
 Write-Host "DEBUG: adh_group             = $adh_group"
@@ -26,8 +51,15 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
     throw "Azure connection failed."
 }
 
+# CLI login for getStatus (portal-like IR status)
+try {
+    az login --service-principal -u $ClientId -p $ClientSecret --tenant $TenantId --only-show-errors | Out-Null
+} catch {
+    throw "Azure CLI login failed: $($_.Exception.Message)"
+}
+
 # ----------------------------------------------------------------------
-# Resolve subscription from adh_group + environment
+# Resolve subscriptions
 # ----------------------------------------------------------------------
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
@@ -41,146 +73,127 @@ $irRows   = @()
 
 foreach ($sub in $subs) {
 
-    Write-Host "DEBUG: Processing subscription $($sub.Name)"
-
+    Write-Host "DEBUG: Processing subscription $($sub.Name) ($($sub.Id))"
     Set-ScContext -Subscription $sub
+    try { Set-AzContext -SubscriptionId $sub.Id -Tenant $TenantId -ErrorAction Stop | Out-Null } catch {}
+    try { az account set --subscription $sub.Id --only-show-errors | Out-Null } catch {}
 
     # Get ALL data factories in this subscription
-    $dfs = Get-AzDataFactoryV2 -ErrorAction SilentlyContinue
+    $dfs = @(Get-AzDataFactoryV2 -ErrorAction SilentlyContinue)
 
-    $adfCount = @($dfs).Count
-    if ($adfCount -eq 0) {
+    if ($dfs.Count -eq 0) {
         Write-Host "DEBUG: No DataFactories found in $($sub.Name)"
         continue
-    } else {
-        Write-Host "DEBUG: Found $adfCount DataFactory instance(s) in $($sub.Name)"
     }
+
+    Write-Host "DEBUG: Found $($dfs.Count) DataFactory instance(s) in $($sub.Name)"
 
     foreach ($df in $dfs) {
 
-        # ----------------- Determine a safe DataFactory name -------------
+        # Determine ADF name safely
         $dfName = $null
-
-        if ($df.PSObject.Properties.Match('DataFactoryName').Count -gt 0 -and
-            -not [string]::IsNullOrWhiteSpace($df.DataFactoryName)) {
+        if ($df.PSObject.Properties.Match('DataFactoryName').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($df.DataFactoryName)) {
             $dfName = $df.DataFactoryName
-        }
-        elseif ($df.PSObject.Properties.Match('FactoryName').Count -gt 0 -and
-                -not [string]::IsNullOrWhiteSpace($df.FactoryName)) {
+        } elseif ($df.PSObject.Properties.Match('FactoryName').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($df.FactoryName)) {
             $dfName = $df.FactoryName
-        }
-        else {
-            # fall back to Name if it exists
-            if ($df.PSObject.Properties.Match('Name').Count -gt 0) {
-                $dfName = $df.Name
-            }
+        } elseif ($df.PSObject.Properties.Match('Name').Count -gt 0) {
+            $dfName = $df.Name
         }
 
         if ([string]::IsNullOrWhiteSpace($dfName)) {
-            Write-Warning "DEBUG: DataFactory object in subscription '$($sub.Name)' has no detectable name. Skipping. Raw object: `n$($df | Out-String)"
+            Write-Warning "DEBUG: ADF object has no detectable name. Skipping. Raw: `n$($df | Out-String)"
             continue
         }
+
+        $rg = $df.ResourceGroupName
 
         # ----------------- Overview row -----------------
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
-            ResourceGroup    = $df.ResourceGroupName
+            ResourceGroup    = $rg
             DataFactory      = $dfName
             Exists           = 'Yes'
             Location         = $df.Location
         }
 
-        # ----------------- Linked services --------------
+        # ==========================================================
+        # LINKED SERVICES (add ERROR rows so dev won't disappear)
+        # ==========================================================
         try {
-            $ls = Get-AzDataFactoryV2LinkedService `
-                    -ResourceGroupName $df.ResourceGroupName `
-                    -DataFactoryName   $dfName `
-                    -ErrorAction Stop
-        }
-        catch {
-            Write-Warning "DEBUG: Failed to query Linked Services for ADF '$dfName' in RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
-            $ls = @()
-        }
+            $ls = @(Get-AzDataFactoryV2LinkedService -ResourceGroupName $rg -DataFactoryName $dfName -ErrorAction Stop)
 
-        foreach ($l in $ls) {
+            if ($ls.Count -eq 0) {
+                $lsRows += Ensure-RowLS $sub.Name $rg $dfName '' '' 'OK' 'No linked services returned'
+            } else {
+                foreach ($l in $ls) {
+                    $lsType = $null
+                    if ($l.Properties -and $l.Properties.Type) { $lsType = $l.Properties.Type }
+                    elseif ($l.Type) { $lsType = $l.Type }
+                    elseif ($l.Properties) { $lsType = $l.Properties.GetType().Name }
+                    if (-not $lsType) { $lsType = 'Unknown' }
 
-            # Try to resolve a useful Type for the linked service
-            $lsType = $null
-
-            # 1) Most common shape: .Properties.Type
-            if ($l.PSObject.Properties.Match('Properties').Count -gt 0 -and $l.Properties) {
-                if ($l.Properties.PSObject.Properties.Match('Type').Count -gt 0 -and
-                    -not [string]::IsNullOrWhiteSpace($l.Properties.Type)) {
-                    $lsType = $l.Properties.Type
+                    $lsRows += Ensure-RowLS $sub.Name $rg $dfName $l.Name $lsType 'OK' ''
                 }
             }
-
-            # 2) Some Az.DataFactory versions expose .Type directly
-            if (-not $lsType -and
-                $l.PSObject.Properties.Match('Type').Count -gt 0 -and
-                -not [string]::IsNullOrWhiteSpace($l.Type)) {
-                $lsType = $l.Type
-            }
-
-            # 3) Fallback: use the underlying .Properties .NET type name
-            if (-not $lsType -and $l.Properties) {
-                $lsType = $l.Properties.GetType().Name   # e.g. "AzureSqlDatabaseLinkedService"
-            }
-
-            # 4) Absolute fallback
-            if (-not $lsType) {
-                $lsType = 'Unknown'
-            }
-
-            $lsRows += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $df.ResourceGroupName
-                DataFactory      = $dfName
-                LinkedService    = $l.Name
-                Type             = $lsType
-            }
-        }
-
-        # ----------------- Integration runtimes ---------
-        try {
-            $irs = Get-AzDataFactoryV2IntegrationRuntime `
-                     -ResourceGroupName $df.ResourceGroupName `
-                     -DataFactoryName   $dfName `
-                     -ErrorAction Stop
         }
         catch {
-            Write-Warning "DEBUG: Failed to query Integration Runtimes for ADF '$dfName' in RG '$($df.ResourceGroupName)': $($_.Exception.Message)"
-            $irs = @()
+            $lsRows += Ensure-RowLS $sub.Name $rg $dfName '' '' 'ERROR' $_.Exception.Message
         }
 
-        foreach ($ir in $irs) {
+        # ==========================================================
+        # INTEGRATION RUNTIMES + STATUS (portal-like via getStatus)
+        # ==========================================================
+        try {
+            $irs = @(Get-AzDataFactoryV2IntegrationRuntime -ResourceGroupName $rg -DataFactoryName $dfName -ErrorAction Stop)
 
-            $computeDesc = $null
-            if ($ir.Properties.AdditionalProperties -and
-                $ir.Properties.AdditionalProperties.ClusterSize) {
-                $computeDesc = $ir.Properties.AdditionalProperties.ClusterSize
-            }
-            elseif ($ir.Properties.Description) {
-                $computeDesc = $ir.Properties.Description
-            }
+            if ($irs.Count -eq 0) {
+                $irRows += Ensure-RowIR $sub.Name $rg $dfName '' '' '' 'OK' 'No integration runtimes returned'
+            } else {
 
-            $irRows += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $df.ResourceGroupName
-                DataFactory      = $dfName
-                IRName           = $ir.Name
-                IRType           = $ir.Properties.Type
-                ComputeDesc      = $computeDesc
-                State            = $ir.Properties.State
+                foreach ($ir in $irs) {
+
+                    $irName = $ir.Name
+
+                    $irType = $null
+                    if ($ir.Properties -and $ir.Properties.Type) { $irType = $ir.Properties.Type }
+                    elseif ($ir.Type) { $irType = $ir.Type }
+                    if (-not $irType) { $irType = 'Unknown' }
+
+                    $computeDesc = ''
+                    if ($ir.Properties -and $ir.Properties.Description) { $computeDesc = [string]$ir.Properties.Description }
+
+                    # getStatus via ARM REST (most accurate for SHIR “Not Found / Online / Offline”)
+                    $status = 'Unknown'
+                    $statusErr = ''
+
+                    $uri = "https://management.azure.com/subscriptions/$($sub.Id)/resourceGroups/$rg/providers/Microsoft.DataFactory/factories/$dfName/integrationruntimes/$irName/getStatus?api-version=2018-06-01"
+
+                    try {
+                        $statusJson = az rest --method post --uri $uri -o json --only-show-errors | ConvertFrom-Json
+                        if ($statusJson -and $statusJson.properties -and $statusJson.properties.state) {
+                            $status = [string]$statusJson.properties.state
+                        } else {
+                            $status = 'Unknown'
+                        }
+                    }
+                    catch {
+                        # If SHIR is deleted / not registered, ARM often throws -> map to Not Found
+                        $status = 'Not Found'
+                        $statusErr = $_.Exception.Message
+                    }
+
+                    $irRows += Ensure-RowIR $sub.Name $rg $dfName $irName $irType $computeDesc $status $statusErr
+                }
             }
+        }
+        catch {
+            $irRows += Ensure-RowIR $sub.Name $rg $dfName '' '' '' 'ERROR' $_.Exception.Message
         }
     }
 }
 
-# ----------------------------------------------------------------------
-# If no ADFs were found at all, still emit one "Exists = No" per sub
-# ----------------------------------------------------------------------
+# Fallback rows so CSV headers always appear
 if (-not $overview) {
     foreach ($sub in $subs) {
         $overview += [pscustomobject]@{
@@ -193,37 +206,10 @@ if (-not $overview) {
         }
     }
 }
+if (-not $lsRows) { $lsRows += Ensure-RowLS '' '' '' '' '' '' '' }
+if (-not $irRows) { $irRows += Ensure-RowIR '' '' '' '' '' '' '' '' }
 
-# Ensure LS / IR CSVs always have at least one row
-if (-not $lsRows) {
-    foreach ($sub in $subs) {
-        $lsRows += [pscustomobject]@{
-            SubscriptionName = $sub.Name
-            ResourceGroup    = ''
-            DataFactory      = ''
-            LinkedService    = ''
-            Type             = ''
-        }
-    }
-}
-
-if (-not $irRows) {
-    foreach ($sub in $subs) {
-        $irRows += [pscustomobject]@{
-            SubscriptionName = $sub.Name
-            ResourceGroup    = ''
-            DataFactory      = ''
-            IRName           = ''
-            IRType           = ''
-            ComputeDesc      = ''
-            State            = ''
-        }
-    }
-}
-
-# ----------------------------------------------------------------------
-# Output CSV + HTML
-# ----------------------------------------------------------------------
+# ---------------- OUTPUT ----------------
 $csv1 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_overview_{0}_{1}" -f $adh_group, $adh_subscription_type)
 Write-CsvSafe -Rows $overview -Path $csv1
 Convert-CsvToHtml -CsvPath $csv1 -HtmlPath ($csv1 -replace '\.csv$','.html') -Title "ADF Overview ($adh_group / $adh_subscription_type) $BranchName"
