@@ -14,22 +14,14 @@ param(
 Import-Module Az.Accounts, Az.Resources, Az.DataFactory -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
-# -----------------------------
-# Helpers
-# -----------------------------
 function Write-DebugLine([string]$msg) { Write-Host "DEBUG: $msg" }
 
 function Ensure-AzCli {
-    try {
-        az --version | Out-Null
-    } catch {
-        throw "Azure CLI (az) not found on agent. Install Azure CLI on the agent to fetch IR Status."
-    }
+    try { az --version | Out-Null } catch { throw "Azure CLI (az) not found on agent." }
 }
 
 function Ensure-AzCliLogin {
     param([string]$TenantId,[string]$ClientId,[string]$ClientSecret)
-
     try {
         az login --service-principal -u $ClientId -p $ClientSecret --tenant $TenantId --only-show-errors | Out-Null
         return $true
@@ -41,7 +33,6 @@ function Ensure-AzCliLogin {
 
 function Set-ContextBoth {
     param([object]$Sub,[string]$TenantId)
-
     try { Set-ScContext -Subscription $Sub } catch {}
     try { Set-AzContext -SubscriptionId $Sub.Id -Tenant $TenantId -ErrorAction Stop | Out-Null } catch {}
     try { az account set --subscription $Sub.Id --only-show-errors | Out-Null } catch {}
@@ -49,27 +40,15 @@ function Set-ContextBoth {
 
 function Safe-ADFName {
     param($df)
-    $dfName = $null
-
-    if ($df.PSObject.Properties.Match('DataFactoryName').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($df.DataFactoryName)) {
-        $dfName = $df.DataFactoryName
-    } elseif ($df.PSObject.Properties.Match('FactoryName').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($df.FactoryName)) {
-        $dfName = $df.FactoryName
-    } elseif ($df.PSObject.Properties.Match('Name').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($df.Name)) {
-        $dfName = $df.Name
-    }
-
-    return $dfName
+    if ($df.PSObject.Properties.Match('DataFactoryName').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($df.DataFactoryName)) { return $df.DataFactoryName }
+    if ($df.PSObject.Properties.Match('FactoryName').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($df.FactoryName)) { return $df.FactoryName }
+    if ($df.PSObject.Properties.Match('Name').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($df.Name)) { return $df.Name }
+    return $null
 }
 
 function Get-LinkedServicesAz {
     param([string]$rg,[string]$dfName)
-    try {
-        $ls = @(Get-AzDataFactoryV2LinkedService -ResourceGroupName $rg -DataFactoryName $dfName -ErrorAction Stop)
-        return $ls
-    } catch {
-        return @()
-    }
+    try { return @(Get-AzDataFactoryV2LinkedService -ResourceGroupName $rg -DataFactoryName $dfName -ErrorAction Stop) } catch { return @() }
 }
 
 function Get-LinkedServicesCli {
@@ -78,21 +57,48 @@ function Get-LinkedServicesCli {
         $json = az datafactory linked-service list --resource-group $rg --factory-name $dfName -o json --only-show-errors
         if ([string]::IsNullOrWhiteSpace($json)) { return @() }
         return ($json | ConvertFrom-Json)
-    } catch {
-        return @()
-    }
+    } catch { return @() }
 }
 
 function Get-IntegrationRuntimesCli {
     param([string]$rg,[string]$dfName)
-
-    # CLI gives portal-like "state" and includes AutoResolveIntegrationRuntime
     try {
         $json = az datafactory integration-runtime list --resource-group $rg --factory-name $dfName -o json --only-show-errors
         if ([string]::IsNullOrWhiteSpace($json)) { return @() }
         return ($json | ConvertFrom-Json)
+    } catch { return @() }
+}
+
+# ✅ NEW: portal-like status per IR
+function Get-IntegrationRuntimeStatusCli {
+    param([string]$rg,[string]$dfName,[string]$irName)
+
+    # get-status usually returns an object with "properties" that includes a status/state
+    try {
+        $json = az datafactory integration-runtime get-status `
+            --resource-group $rg `
+            --factory-name $dfName `
+            --integration-runtime-name $irName `
+            -o json --only-show-errors
+
+        if ([string]::IsNullOrWhiteSpace($json)) { return "Unknown" }
+
+        $obj = $json | ConvertFrom-Json
+
+        # Different shapes exist; handle common ones safely:
+        if ($obj.properties) {
+            if ($obj.properties.state)  { return [string]$obj.properties.state }
+            if ($obj.properties.status) { return [string]$obj.properties.status }
+        }
+        if ($obj.state)  { return [string]$obj.state }
+        if ($obj.status) { return [string]$obj.status }
+
+        return "Unknown"
     } catch {
-        return @()
+        # When IR exists only in Git (not published), ADF portal shows Not Found
+        $m = $_.Exception.Message
+        if ($m -match 'NotFound|not found|404') { return "NotFound" }
+        return "Unknown"
     }
 }
 
@@ -115,14 +121,9 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 Ensure-AzCli
 $cliLoggedIn = Ensure-AzCliLogin -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
 
-# Resolve subscriptions
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 
-$subNames = ($subs | Select-Object -ExpandProperty Name) -join ', '
-Write-DebugLine "Resolved adh_group='$adh_group' env='$adh_subscription_type' -> subscriptions: $subNames"
-
-# Output rows
 $overview = @()
 $lsRows   = @()
 $irRows   = @()
@@ -132,17 +133,10 @@ foreach ($sub in $subs) {
     Write-DebugLine "Processing subscription $($sub.Name) ($($sub.Id))"
     Set-ContextBoth -Sub $sub -TenantId $TenantId
 
-    # Get ALL ADFs
     $dfs = @()
-    try {
-        $dfs = @(Get-AzDataFactoryV2 -ErrorAction Stop)
-    } catch {
-        Write-Warning "Failed to list Data Factories in subscription '$($sub.Name)': $($_.Exception.Message)"
-        $dfs = @()
-    }
+    try { $dfs = @(Get-AzDataFactoryV2 -ErrorAction Stop) } catch { $dfs = @() }
 
     if (@($dfs).Count -eq 0) {
-        Write-DebugLine "No DataFactories found in $($sub.Name)"
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -154,20 +148,14 @@ foreach ($sub in $subs) {
         continue
     }
 
-    Write-DebugLine "Found $(@($dfs).Count) DataFactory instance(s) in $($sub.Name)"
-
     foreach ($df in $dfs) {
 
         $dfName = Safe-ADFName -df $df
         $rg     = [string]$df.ResourceGroupName
         $loc    = [string]$df.Location
 
-        if ([string]::IsNullOrWhiteSpace($dfName) -or [string]::IsNullOrWhiteSpace($rg)) {
-            Write-Warning "ADF object missing name/RG in subscription '$($sub.Name)'. Raw:`n$($df | Out-String)"
-            continue
-        }
+        if ([string]::IsNullOrWhiteSpace($dfName) -or [string]::IsNullOrWhiteSpace($rg)) { continue }
 
-        # ---- Overview ----
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -177,20 +165,14 @@ foreach ($sub in $subs) {
             Location         = $loc
         }
 
-        # ---- Linked Services (Az first, then CLI fallback) ----
+        # -------- Linked Services (Az then CLI fallback) --------
         $ls = Get-LinkedServicesAz -rg $rg -dfName $dfName
-
         if (@($ls).Count -eq 0) {
-            # fallback to CLI
             $lsCli = Get-LinkedServicesCli -rg $rg -dfName $dfName
-
             if (@($lsCli).Count -gt 0) {
                 foreach ($l in $lsCli) {
-                    $typeName = $null
+                    $typeName = ""
                     if ($l.properties -and $l.properties.type) { $typeName = [string]$l.properties.type }
-                    if ([string]::IsNullOrWhiteSpace($typeName) -and $l.properties) {
-                        $typeName = [string]$l.properties.GetType().Name
-                    }
                     if ([string]::IsNullOrWhiteSpace($typeName)) { $typeName = "Unknown" }
 
                     $lsRows += [pscustomobject]@{
@@ -214,26 +196,14 @@ foreach ($sub in $subs) {
                     ErrorMessage     = 'No linked services returned'
                 }
             }
-        }
-        else {
-            # Deduplicate by Name
+        } else {
             $ls = $ls | Group-Object Name | ForEach-Object { $_.Group | Select-Object -First 1 }
-
             foreach ($l in $ls) {
                 $lsType = $null
-
-                if ($l.PSObject.Properties.Match('Properties').Count -gt 0 -and $l.Properties) {
-                    if ($l.Properties.PSObject.Properties.Match('Type').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($l.Properties.Type)) {
-                        $lsType = $l.Properties.Type
-                    }
-                }
-                if (-not $lsType -and $l.PSObject.Properties.Match('Type').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($l.Type)) {
-                    $lsType = $l.Type
-                }
-                if (-not $lsType -and $l.Properties) {
-                    $lsType = $l.Properties.GetType().Name
-                }
-                if (-not $lsType) { $lsType = 'Unknown' }
+                if ($l.Properties -and $l.Properties.Type) { $lsType = $l.Properties.Type }
+                elseif ($l.Type) { $lsType = $l.Type }
+                elseif ($l.Properties) { $lsType = $l.Properties.GetType().Name }
+                if (-not $lsType) { $lsType = "Unknown" }
 
                 $lsRows += [pscustomobject]@{
                     SubscriptionName = $sub.Name
@@ -247,7 +217,7 @@ foreach ($sub in $subs) {
             }
         }
 
-        # ---- Integration Runtimes (CLI - includes AutoResolve + status) ----
+        # -------- Integration Runtimes (CLI list + CLI get-status) --------
         if (-not $cliLoggedIn) {
             $irRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
@@ -262,7 +232,6 @@ foreach ($sub in $subs) {
         }
 
         $irsCli = Get-IntegrationRuntimesCli -rg $rg -dfName $dfName
-
         if (@($irsCli).Count -eq 0) {
             $irRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
@@ -277,17 +246,12 @@ foreach ($sub in $subs) {
             foreach ($ir in $irsCli) {
                 $irName = [string]$ir.name
 
-                $irType = ''
+                $irType = ""
                 if ($ir.properties -and $ir.properties.type) { $irType = [string]$ir.properties.type }
-                if ([string]::IsNullOrWhiteSpace($irType) -and $ir.properties -and $ir.properties.typeProperties -and $ir.properties.typeProperties.subtype) {
-                    $irType = [string]$ir.properties.typeProperties.subtype
-                }
-                if ([string]::IsNullOrWhiteSpace($irType)) { $irType = 'Unknown' }
+                if ([string]::IsNullOrWhiteSpace($irType)) { $irType = "Unknown" }
 
-                # state is what you want for portal-like column: Running / NotFound / etc.
-                $status = ''
-                if ($ir.properties -and $ir.properties.state) { $status = [string]$ir.properties.state }
-                if ([string]::IsNullOrWhiteSpace($status)) { $status = 'Unknown' }
+                # ✅ actual portal-like status
+                $status = Get-IntegrationRuntimeStatusCli -rg $rg -dfName $dfName -irName $irName
 
                 $irRows += [pscustomobject]@{
                     SubscriptionName = $sub.Name
@@ -303,31 +267,18 @@ foreach ($sub in $subs) {
     }
 }
 
-# Ensure at least one row exists in LS/IR outputs
+# Always emit at least one row
 if (-not $lsRows) {
     foreach ($sub in $subs) {
         $lsRows += [pscustomobject]@{
-            SubscriptionName = $sub.Name
-            ResourceGroup    = ''
-            DataFactory      = ''
-            LinkedService    = ''
-            Type             = ''
-            Status           = ''
-            ErrorMessage     = ''
+            SubscriptionName = $sub.Name; ResourceGroup=''; DataFactory=''; LinkedService=''; Type=''; Status=''; ErrorMessage=''
         }
     }
 }
-
 if (-not $irRows) {
     foreach ($sub in $subs) {
         $irRows += [pscustomobject]@{
-            SubscriptionName = $sub.Name
-            ResourceGroup    = ''
-            DataFactory      = ''
-            IRName           = ''
-            IRType           = ''
-            Status           = ''
-            ErrorMessage     = ''
+            SubscriptionName = $sub.Name; ResourceGroup=''; DataFactory=''; IRName=''; IRType=''; Status=''; ErrorMessage=''
         }
     }
 }
