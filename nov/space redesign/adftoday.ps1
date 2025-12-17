@@ -13,51 +13,6 @@ param(
 Import-Module Az.Accounts, Az.Resources, Az.DataFactory -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
-# ---------------- Helpers ----------------
-function Normalize-PortalStatus([string]$rawState) {
-    if ([string]::IsNullOrWhiteSpace($rawState)) { return 'Unknown' }
-
-    switch -Regex ($rawState) {
-        '^Online$' { return 'Running' }   # portal uses Running
-        default    { return $rawState }
-    }
-}
-
-function Get-IrPortalStateViaRest {
-    param(
-        [Parameter(Mandatory)][string]$SubscriptionId,
-        [Parameter(Mandatory)][string]$ResourceGroupName,
-        [Parameter(Mandatory)][string]$FactoryName,
-        [Parameter(Mandatory)][string]$IrName
-    )
-
-    # ADF IR status endpoint (ARM)
-    # Returns state-like values similar to portal column (or very close).
-    $apiVersion = "2018-06-01"
-    $path = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.DataFactory/factories/$FactoryName/integrationRuntimes/$IrName/status?api-version=$apiVersion"
-
-    try {
-        $resp = Invoke-AzRestMethod -Method GET -Path $path -ErrorAction Stop
-        $json = $resp.Content | ConvertFrom-Json
-
-        # Common shapes:
-        # - $json.properties.state
-        # - $json.properties.integrationRuntimeState
-        $state = $null
-        if ($json.properties.PSObject.Properties.Match('state').Count -gt 0) {
-            $state = $json.properties.state
-        }
-        elseif ($json.properties.PSObject.Properties.Match('integrationRuntimeState').Count -gt 0) {
-            $state = $json.properties.integrationRuntimeState
-        }
-
-        return (Normalize-PortalStatus -rawState $state)
-    }
-    catch {
-        return "Unknown"
-    }
-}
-
 Write-Host "DEBUG: TenantId              = $TenantId"
 Write-Host "DEBUG: ClientId              = $ClientId"
 Write-Host "DEBUG: adh_group             = $adh_group"
@@ -71,12 +26,62 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
     throw "Azure login failed."
 }
 
+function Invoke-ArmGetJson {
+    param([Parameter(Mandatory)][string]$Path)
+    $resp = Invoke-AzRestMethod -Method GET -Path $Path -ErrorAction Stop
+    return ($resp.Content | ConvertFrom-Json)
+}
+
+function Get-IrStatusAndMessage {
+    param(
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$ResourceGroupName,
+        [Parameter(Mandatory)][string]$FactoryName,
+        [Parameter(Mandatory)][string]$IrName
+    )
+
+    $apiVersion = "2018-06-01"
+    $path = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.DataFactory/factories/$FactoryName/integrationRuntimes/$IrName/status?api-version=$apiVersion"
+
+    try {
+        $json = Invoke-ArmGetJson -Path $path
+
+        # Typical: properties.state (Online / NeedRegistration / Starting / Stopped / etc)
+        $state = $null
+        if ($json.properties -and ($json.properties.PSObject.Properties.Name -contains 'state')) {
+            $state = $json.properties.state
+        }
+        elseif ($json.properties -and ($json.properties.PSObject.Properties.Name -contains 'integrationRuntimeState')) {
+            $state = $json.properties.integrationRuntimeState
+        }
+
+        if ([string]::IsNullOrWhiteSpace($state)) {
+            return @{ Status = 'Unknown'; ErrorMessage = 'Status endpoint returned no state field.' }
+        }
+
+        return @{ Status = [string]$state; ErrorMessage = '' }
+    }
+    catch {
+        $msg = $_.Exception.Message
+
+        # Make portal-like meaning explicit
+        if ($msg -match '\b404\b' -or $msg -match 'NotFound') {
+            return @{ Status = 'NotFound'; ErrorMessage = $msg }
+        }
+        if ($msg -match '\b403\b' -or $msg -match 'Forbidden') {
+            return @{ Status = 'Forbidden'; ErrorMessage = $msg }
+        }
+        if ($msg -match '\b401\b' -or $msg -match 'Unauthorized') {
+            return @{ Status = 'Unauthorized'; ErrorMessage = $msg }
+        }
+
+        return @{ Status = 'Unknown'; ErrorMessage = $msg }
+    }
+}
+
 # Resolve subscriptions
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
-
-$subNames = ($subs | Select-Object -ExpandProperty Name) -join ', '
-Write-Host "DEBUG: Resolved adh_group='$adh_group' env='$adh_subscription_type' -> subscriptions: $subNames"
 
 $overview = @()
 $lsRows   = @()
@@ -89,7 +94,7 @@ foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
     try { Set-AzContext -Tenant $TenantId -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null } catch {}
 
-    # Read ADFs (live mode)
+    # LIVE ADFs
     $dfs = @(Get-AzDataFactoryV2 -ErrorAction SilentlyContinue)
     if ($dfs.Count -eq 0) {
         Write-Host "DEBUG: No DataFactories found in $($sub.Name)"
@@ -107,7 +112,6 @@ foreach ($sub in $subs) {
 
         $rg = [string]$df.ResourceGroupName
 
-        # Overview row
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -117,9 +121,10 @@ foreach ($sub in $subs) {
             Location         = $df.Location
         }
 
-        # ---------- Linked Services ----------
+        # ----------------- Linked Services (live) -----------------
         try {
             $ls = @(Get-AzDataFactoryV2LinkedService -ResourceGroupName $rg -DataFactoryName $dfName -ErrorAction Stop)
+
             if ($ls.Count -eq 0) {
                 $lsRows += [pscustomobject]@{
                     SubscriptionName = $sub.Name
@@ -128,12 +133,10 @@ foreach ($sub in $subs) {
                     LinkedService    = ''
                     Type             = ''
                     Status           = 'OK'
-                    ErrorMessage     = 'No linked services returned (likely not published / validation failing).'
+                    ErrorMessage     = 'No linked services returned (likely not published / not in live).'
                 }
             } else {
-                # de-dupe
                 $ls = $ls | Group-Object Name | ForEach-Object { $_.Group | Select-Object -First 1 }
-
                 foreach ($l in $ls) {
                     $lsType = $null
                     if ($l.Properties -and $l.Properties.Type) { $lsType = $l.Properties.Type }
@@ -165,11 +168,18 @@ foreach ($sub in $subs) {
             }
         }
 
-        # ---------- Integration Runtimes ----------
+        # ----------------- Integration Runtimes (portal-like list via ARM REST) -----------------
         try {
-            $irs = @(Get-AzDataFactoryV2IntegrationRuntime -ResourceGroupName $rg -DataFactoryName $dfName -ErrorAction Stop)
+            $apiVersion = "2018-06-01"
+            $listPath = "/subscriptions/$($sub.Id)/resourceGroups/$rg/providers/Microsoft.DataFactory/factories/$dfName/integrationRuntimes?api-version=$apiVersion"
+            $listJson = Invoke-ArmGetJson -Path $listPath
 
-            if ($irs.Count -eq 0) {
+            $irItems = @()
+            if ($listJson -and ($listJson.PSObject.Properties.Name -contains 'value')) {
+                $irItems = @($listJson.value)
+            }
+
+            if ($irItems.Count -eq 0) {
                 $irRows += [pscustomobject]@{
                     SubscriptionName = $sub.Name
                     ResourceGroup    = $rg
@@ -177,31 +187,26 @@ foreach ($sub in $subs) {
                     IRName           = ''
                     IRType           = ''
                     Status           = 'OK'
-                    ErrorMessage     = 'No integration runtimes returned (likely not published / validation failing).'
+                    ErrorMessage     = 'No integration runtimes returned (likely not published / not in live).'
                 }
             } else {
-                foreach ($ir in $irs) {
+                foreach ($item in $irItems) {
+                    $irName = [string]$item.name
+                    $irType = 'Unknown'
+                    if ($item.properties -and ($item.properties.PSObject.Properties.Name -contains 'type')) {
+                        $irType = [string]$item.properties.type  # Managed / SelfHosted
+                    }
 
-                    $irType = $null
-                    if ($ir.Properties -and $ir.Properties.Type) { $irType = $ir.Properties.Type } # Managed / SelfHosted
-                    elseif ($ir.Type) { $irType = $ir.Type }
-                    if (-not $irType) { $irType = 'Unknown' }
-
-                    # Portal-like status via ARM status endpoint
-                    $portalStatus = Get-IrPortalStateViaRest `
-                        -SubscriptionId $sub.Id `
-                        -ResourceGroupName $rg `
-                        -FactoryName $dfName `
-                        -IrName $ir.Name
+                    $st = Get-IrStatusAndMessage -SubscriptionId $sub.Id -ResourceGroupName $rg -FactoryName $dfName -IrName $irName
 
                     $irRows += [pscustomobject]@{
                         SubscriptionName = $sub.Name
                         ResourceGroup    = $rg
                         DataFactory      = $dfName
-                        IRName           = $ir.Name
+                        IRName           = $irName
                         IRType           = $irType
-                        Status           = $portalStatus
-                        ErrorMessage     = ''
+                        Status           = $st.Status
+                        ErrorMessage     = $st.ErrorMessage
                     }
                 }
             }
@@ -220,7 +225,7 @@ foreach ($sub in $subs) {
     }
 }
 
-# If nothing found at all, still emit overview rows
+# If no ADFs were found at all, still emit one "Exists = No" per sub
 if (-not $overview) {
     foreach ($sub in $subs) {
         $overview += [pscustomobject]@{
@@ -230,6 +235,35 @@ if (-not $overview) {
             DataFactory      = ''
             Exists           = 'No'
             Location         = ''
+        }
+    }
+}
+
+# Ensure CSVs always have at least one row
+if (-not $lsRows) {
+    foreach ($sub in $subs) {
+        $lsRows += [pscustomobject]@{
+            SubscriptionName = $sub.Name
+            ResourceGroup    = ''
+            DataFactory      = ''
+            LinkedService    = ''
+            Type             = ''
+            Status           = 'OK'
+            ErrorMessage     = 'No data'
+        }
+    }
+}
+
+if (-not $irRows) {
+    foreach ($sub in $subs) {
+        $irRows += [pscustomobject]@{
+            SubscriptionName = $sub.Name
+            ResourceGroup    = ''
+            DataFactory      = ''
+            IRName           = ''
+            IRType           = ''
+            Status           = 'OK'
+            ErrorMessage     = 'No data'
         }
     }
 }
