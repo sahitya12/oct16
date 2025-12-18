@@ -1,11 +1,35 @@
+# sanitychecks/scripts/Scan-DataFactory.ps1
+# CSV ONLY (no HTML) + RBAC auto-grant (same pattern as KV script)
+#
+# Output filenames (short + yyyyMMdd):
+#   adf_overview_<adh_group>_<nonprd|prd>_yyyyMMdd.csv
+#   adf_ls_<adh_group>_<nonprd|prd>_yyyyMMdd.csv
+#   adf_ir_<adh_group>_<nonprd|prd>_yyyyMMdd.csv
+#
+# Naming convention:
+#   ADF  : ADH-<adh_group>-ADF-<env>
+#   RG   : adh_<adh_group>_adf_<env>
+# envs:
+#   nonprd => dev,tst,stg
+#   prd    => prd
+#
+# IMPORTANT:
+# - Az.DataFactory cmdlets read PUBLISHED artifacts (management plane).
+#   If portal shows Git branch, publish first.
+# - IR Status requires Data Factory Contributor (or Contributor) on the ADF RG.
+
 param(
     [Parameter(Mandatory = $true)][string]$TenantId,
     [Parameter(Mandatory = $true)][string]$ClientId,
     [Parameter(Mandatory = $true)][string]$ClientSecret,
+
     [Parameter(Mandatory = $true)][string]$adh_group,
     [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
+
     [Parameter(Mandatory = $true)][string]$OutputDir,
     [string]$BranchName = '',
+
+    # RBAC auto-grant like KV script
     [switch]$GrantRbac
 )
 
@@ -216,43 +240,35 @@ function Get-IRStatusAndVersion {
     return @($status,$version)
 }
 
-function Ensure-DataFactoryContributorOnRg {
+# ---- RBAC helpers (KV-like pattern) ----
+function Ensure-RbacRole {
     param(
-        [Parameter(Mandatory)][string]$SpObjectId,
-        [Parameter(Mandatory)][string]$SubscriptionId,
-        [Parameter(Mandatory)][string]$ResourceGroupName
+        [Parameter(Mandatory)][string]$ObjectId,
+        [Parameter(Mandatory)][string]$Scope,
+        [Parameter(Mandatory)][string]$RoleName
     )
 
-    $scope = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName"
-
     try {
-        $rg = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue
-        if (-not $rg) {
-            Write-Host "RBAC: RG not found (skip): $ResourceGroupName" -ForegroundColor Yellow
-            return
-        }
-
         $existing = Get-AzRoleAssignment `
-            -ObjectId $SpObjectId `
-            -RoleDefinitionName "Data Factory Contributor" `
-            -Scope $scope `
+            -ObjectId $ObjectId `
+            -RoleDefinitionName $RoleName `
+            -Scope $Scope `
             -ErrorAction SilentlyContinue
 
-        if ($existing) {
-            Write-Host "RBAC: Already assigned on $ResourceGroupName" -ForegroundColor DarkGreen
-            return
+        if (-not $existing) {
+            New-AzRoleAssignment `
+                -ObjectId $ObjectId `
+                -RoleDefinitionName $RoleName `
+                -Scope $Scope `
+                -ErrorAction Stop
+
+            Write-Host "RBAC: Assigned '$RoleName' on $Scope" -ForegroundColor Green
+            Start-Sleep -Seconds 20
+        } else {
+            Write-Host "RBAC: Already has '$RoleName' on $Scope" -ForegroundColor DarkGreen
         }
-
-        New-AzRoleAssignment `
-            -ObjectId $SpObjectId `
-            -RoleDefinitionName "Data Factory Contributor" `
-            -Scope $scope `
-            -ErrorAction Stop
-
-        Write-Host "RBAC: Assigned Data Factory Contributor on $ResourceGroupName" -ForegroundColor Green
-        Start-Sleep -Seconds 10
     } catch {
-        Write-Warning "RBAC: Failed on $ResourceGroupName : $($_.Exception.Message)"
+        Write-Warning "RBAC: Failed to ensure '$RoleName' on $Scope : $($_.Exception.Message)"
     }
 }
 
@@ -261,18 +277,18 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
     throw "Azure connection failed."
 }
 
-# ---------------- Resolve SPN ObjectId (for RBAC) ----------------
+# ---------------- Subscriptions ----------------
+$subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
+Write-Host "DEBUG: Subscriptions: $((($subs | Select-Object -ExpandProperty Name) -join ', '))"
+
+# SPN ObjectId for RBAC
 $spObjectId = $null
 if ($GrantRbac) {
     $sp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
     $spObjectId = $sp.Id
     Write-Host "DEBUG: SP ObjectId = $spObjectId" -ForegroundColor DarkCyan
 }
-
-# ---------------- Subscriptions ----------------
-$subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
-if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
-Write-Host "DEBUG: Subscriptions: $((($subs | Select-Object -ExpandProperty Name) -join ', '))"
 
 # ---------------- Output rows ----------------
 $overview = @()
@@ -285,17 +301,15 @@ foreach ($sub in $subs) {
 
     $targets = Get-ExpectedAdfTargets -adh_group $adh_group -adh_subscription_type $adh_subscription_type
 
-    # ---- RBAC auto-grant on expected ADF RGs ----
-    if ($GrantRbac) {
-        foreach ($t in $targets) {
-            Ensure-DataFactoryContributorOnRg -SpObjectId $spObjectId -SubscriptionId $sub.Id -ResourceGroupName $t.ResourceGroup
-        }
-        Start-Sleep -Seconds 15
-    }
-
     foreach ($t in $targets) {
         $dfName = $t.DataFactory
         $rgName = $t.ResourceGroup
+
+        # ---- Ensure RBAC on the ADF RG (KV-like) ----
+        if ($GrantRbac) {
+            $rgScope = "/subscriptions/$($sub.Id)/resourceGroups/$rgName"
+            Ensure-RbacRole -ObjectId $spObjectId -Scope $rgScope -RoleName "Data Factory Contributor"
+        }
 
         # ADF exists?
         $df = $null
@@ -345,7 +359,7 @@ foreach ($sub in $subs) {
             $portalType = Map-LSTypeToPortal -lsType ($rawType.ToString())
 
             $related = Count-LinkedServiceReferences -Datasets $datasets -Pipelines $pipelines -LinkedServiceName $l.Name
-            if ($related -le 0) { continue } # show only portal-visible LS
+            if ($related -le 0) { continue }
 
             $lsRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
@@ -362,7 +376,6 @@ foreach ($sub in $subs) {
         try { $irs = Get-AzDataFactoryV2IntegrationRuntime -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop } catch { $irs = @() }
 
         foreach ($ir in @($irs)) {
-
             $ts = Get-IRPortalTypeSubType -Ir $ir
             $portalType    = $ts[0]
             $portalSubType = $ts[1]
@@ -385,10 +398,7 @@ foreach ($sub in $subs) {
             $status  = $sv[0]
             $version = $sv[1]
 
-            # Related (portal-ish): linked services connectVia
             $relatedCount = Count-IRReferences -LinkedServices $ls -IRName $ir.Name
-
-            # Portal typically shows AutoResolve + referenced IRs
             if ($ir.Name -ne 'AutoResolveIntegrationRuntime' -and $relatedCount -le 0) { continue }
 
             $irRows += [pscustomobject]@{
@@ -465,8 +475,8 @@ Write-CsvSafe -Rows $irRows -Path $csvIR
 
 Write-Host "`nADF scan completed." -ForegroundColor Green
 Write-Host "Overview : $csvOverview"
-Write-Host "ADF LS   : $csvLS"
-Write-Host "ADF IR   : $csvIR"
+Write-Host "LS       : $csvLS"
+Write-Host "IR       : $csvIR"
 
 if ($GrantRbac) {
     Write-Host "`nRBAC note: If Status still shows 'Unknown', wait 2-5 minutes and rerun (RBAC propagation)." -ForegroundColor Yellow
