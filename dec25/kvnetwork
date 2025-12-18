@@ -1,0 +1,189 @@
+param(
+  [Parameter(Mandatory)][string]$TenantId,
+  [Parameter(Mandatory)][string]$ClientId,
+  [Parameter(Mandatory)][string]$ClientSecret,
+
+  [Parameter(Mandatory)][string]$adh_group,
+  [string]$adh_sub_group = '',
+
+  [ValidateSet('nonprd','prd')]
+  [string]$adh_subscription_type = 'nonprd',
+
+  [Parameter(Mandatory)][string]$OutputDir,
+  [string]$BranchName = ''
+)
+
+Import-Module Az.Accounts, Az.Resources, Az.KeyVault, Az.Network -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
+
+Ensure-Dir $OutputDir | Out-Null
+
+# ---------- Normalize custodian ----------
+$adh_sub_group = $adh_sub_group.Trim()
+$custodian = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
+    $adh_group
+} else {
+    "${adh_group}_${adh_sub_group}"
+}
+$custUpper = $custodian.ToUpper()
+
+# ---------- Connect ----------
+if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
+  throw "Azure connection failed."
+}
+
+$subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
+if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
+
+$rows = @()
+
+# SPN ObjectId
+$sp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
+$spObjectId = $sp.Id
+
+foreach ($sub in $subs) {
+
+  Set-ScContext -Subscription $sub
+  Write-Host "`n=== KV network scan: $($sub.Name) ===" -ForegroundColor Cyan
+
+  $kvs = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" |
+         Where-Object { $_.Name -like "*$custUpper*" }
+
+  foreach ($kv in $kvs) {
+
+    $scope = $kv.Id
+
+    # ---- Ensure temporary KV Admin ----
+    try {
+      if (-not (Get-AzRoleAssignment -ObjectId $spObjectId `
+              -RoleDefinitionName "Key Vault Administrator" `
+              -Scope $scope -ErrorAction SilentlyContinue)) {
+
+        New-AzRoleAssignment -ObjectId $spObjectId `
+          -RoleDefinitionName "Key Vault Administrator" `
+          -Scope $scope -ErrorAction Stop
+
+        Start-Sleep -Seconds 20
+      }
+    } catch {}
+
+    try {
+      $keyVault = Get-AzKeyVault -Name $kv.Name -ResourceGroupName $kv.ResourceGroupName
+
+      $defaultAction       = $keyVault.NetworkAcls.DefaultAction
+      $publicNetworkAccess = $keyVault.PublicNetworkAccess
+
+      # ---------- PRIVATE ENDPOINT DETECTION (FIXED) ----------
+      $hasPrivateEndpoints = $false
+      $peReadFailed        = $false
+      $privateEndpointsSummary = ''
+
+      try {
+        $pecs = Get-AzPrivateEndpointConnection `
+                  -PrivateLinkResourceId $keyVault.ResourceId `
+                  -ErrorAction Stop
+
+        if (@($pecs).Count -gt 0) {
+          $hasPrivateEndpoints = $true
+
+          $details = foreach ($pec in $pecs) {
+            $state = $pec.PrivateLinkServiceConnectionState.Status
+
+            if ($pec.PrivateEndpoint.Id) {
+              $peId = $pec.PrivateEndpoint.Id -split '/'
+              $peRg   = $peId[$peId.IndexOf('resourceGroups') + 1]
+              $peName = $peId[$peId.IndexOf('privateEndpoints') + 1]
+
+              $pe = Get-AzPrivateEndpoint -Name $peName -ResourceGroupName $peRg -ErrorAction SilentlyContinue
+
+              if ($pe) {
+                $subnetId   = $pe.Subnet.Id
+                $vnetName   = ($subnetId -split '/')[($subnetId.Split('/').IndexOf('virtualNetworks') + 1)]
+                $subnetName = ($subnetId -split '/')[($subnetId.Split('/').IndexOf('subnets') + 1)]
+
+                "PE=$peName; RG=$peRg; VNET=$vnetName; Subnet=$subnetName; Status=$state"
+              }
+              else {
+                "PE=$peName; RG=$peRg; Status=$state"
+              }
+            }
+            else {
+              "PE=<unknown>; Status=$state"
+            }
+          }
+
+          $privateEndpointsSummary = ($details -join " | ")
+        }
+        else {
+          $privateEndpointsSummary = "None"
+        }
+      }
+      catch {
+        $peReadFailed = $true
+        $privateEndpointsSummary = "PE lookup failed"
+      }
+
+      # ---------- Exposure classification ----------
+      if ($peReadFailed) {
+        $exposure = 'Unknown'
+      }
+      elseif ($publicNetworkAccess -eq 'Enabled' -and $hasPrivateEndpoints) {
+        $exposure = 'Public & Private'
+      }
+      elseif ($publicNetworkAccess -eq 'Enabled') {
+        $exposure = 'Public only'
+      }
+      elseif ($hasPrivateEndpoints) {
+        $exposure = 'Private only'
+      }
+      else {
+        $exposure = 'No network access'
+      }
+
+      $rows += [pscustomobject]@{
+        SubscriptionName           = $sub.Name
+        SubscriptionId             = $sub.Id
+        VaultName                  = $kv.Name
+        ResourceGroup              = $kv.ResourceGroupName
+        DefaultAction              = $defaultAction
+        PublicNetworkAccess        = $publicNetworkAccess
+        Exposure                   = $exposure
+        PrivateEndpointConnections = $privateEndpointsSummary
+      }
+    }
+    catch {
+      Write-Warning "Failed KV read: $($kv.Name)"
+    }
+
+    # ---- Cleanup role ----
+    try {
+      Get-AzRoleAssignment -ObjectId $spObjectId `
+        -RoleDefinitionName "Key Vault Administrator" `
+        -Scope $scope -ErrorAction SilentlyContinue |
+        Remove-AzRoleAssignment -Force
+    } catch {}
+  }
+}
+
+# ---------- Output ----------
+if (-not $rows) {
+  $rows = [pscustomobject]@{
+    SubscriptionName=''
+    SubscriptionId=''
+    VaultName=''
+    ResourceGroup=''
+    DefaultAction=''
+    PublicNetworkAccess=''
+    Exposure=''
+    PrivateEndpointConnections=''
+  }
+}
+
+$stamp   = Get-Date -Format 'yyyyMMdd'
+$csvName = "kv_networks_${custodian}_${adh_subscription_type}_${stamp}.csv"
+$csvOut  = Join-Path $OutputDir $csvName
+
+Write-CsvSafe -Rows $rows -Path $csvOut
+
+Write-Host "`nKV network scan completed"
+Write-Host "CSV: $csvOut"
