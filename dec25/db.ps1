@@ -1,15 +1,3 @@
-# sanitychecks/scripts/Scan-Databricks.ps1
-# Full working code:
-# - Enumerates Databricks workspaces via ARM
-# - Ensures SPN exists in Databricks workspace via SCIM (requires admin)
-# - Adds SPN to 'admins' group (workspace admin)
-# - Fetches: SQL Warehouses + perms, UC Catalogs + perms, External Locations
-# - Outputs CSVs + XLSX (if ImportExcel module exists)
-#
-# NOTE:
-# - Workspace admin is usually enough for /sql/warehouses.
-# - Unity Catalog endpoints require UC enabled + metastore attached; otherwise may return empty/403/404.
-
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$TenantId,
@@ -28,10 +16,10 @@ param(
     # Optional override
     [string[]]$SubscriptionIds = @(),
 
-    # Grant Azure RBAC (Reader) at subscription/RG scope to ensure enumeration works
+    # Optional: grant Azure RBAC like KV script style
     [switch]$GrantRbac,
 
-    # Ensure SPN exists in Databricks workspace + add to admins group (requires Databricks admin)
+    # Optional: ensure SPN exists inside each Databricks workspace via SCIM + add to admins
     [switch]$EnsureDbxAdmin
 )
 
@@ -52,12 +40,12 @@ Write-Host "INFO: BranchName            = $BranchName" -ForegroundColor Cyan
 Write-Host "INFO: GrantRbac             = $GrantRbac" -ForegroundColor Cyan
 Write-Host "INFO: EnsureDbxAdmin        = $EnsureDbxAdmin" -ForegroundColor Cyan
 
-# ---------------- Azure auth ----------------
+# ---------------- Connect Azure ----------------
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
 }
 
-# ---------------- Helpers ----------------
+# ---------------- RBAC helper ----------------
 function Ensure-RbacRole {
     param(
         [Parameter(Mandatory)][string]$ObjectId,
@@ -78,26 +66,12 @@ function Ensure-RbacRole {
     }
 }
 
-function Get-DbTokens {
-    # ✅ Correct resource for Databricks REST token
-    $dbx = Get-AzAccessToken -ResourceUrl "https://databricks.azure.net/" -ErrorAction Stop
-    $arm = Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop
-
-    if (-not $dbx.Token) { throw "Failed to acquire Databricks AAD token." }
-    if (-not $arm.Token) { throw "Failed to acquire ARM token." }
-
-    [pscustomobject]@{
-        DatabricksToken = $dbx.Token
-        ArmToken        = $arm.Token
-    }
-}
-
+# ---------------- Databricks REST (ARM token auth) ----------------
 function Invoke-DbRest {
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
         [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','PATCH','DELETE')][string]$Method,
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$DbxToken,
         [Parameter(Mandatory)][string]$ArmToken,
         [Parameter(Mandatory)][string]$WorkspaceResourceId,
         [string]$Body = $null
@@ -106,9 +80,9 @@ function Invoke-DbRest {
     $hostPart = $WorkspaceUrl -replace '^https://',''
     $uri = "https://$hostPart$Path"
 
+    # ✅ Correct model for SPN + secret: Use ARM token in Authorization
     $headers = @{
-        Authorization                              = "Bearer $DbxToken"
-        "X-Databricks-Azure-SP-Management-Token"   = $ArmToken
+        Authorization = "Bearer $ArmToken"
         "X-Databricks-Azure-Workspace-Resource-Id" = $WorkspaceResourceId
     }
 
@@ -130,7 +104,7 @@ function Invoke-DbRest {
             }
         } catch {}
 
-        Write-Warning ("DBX REST FAILED: {0} {1} :: HTTP={2} :: {3}" -f $Method, $uri, $statusCode, $_.Exception.Message)
+        Write-Warning ("DBX REST FAILED: {0} {1} :: HTTP={2} :: {3}" -f $Method, $Path, $statusCode, $_.Exception.Message)
         if ($respBody) {
             $oneLine = ($respBody -replace '\s+',' ')
             Write-Warning ("DBX REST BODY: {0}" -f $oneLine.Substring(0, [Math]::Min(800, $oneLine.Length)))
@@ -139,10 +113,10 @@ function Invoke-DbRest {
     }
 }
 
+# ---------------- SCIM: ensure SP exists + add to admins ----------------
 function Ensure-DbxServicePrincipal {
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
-        [Parameter(Mandatory)][string]$DbxToken,
         [Parameter(Mandatory)][string]$ArmToken,
         [Parameter(Mandatory)][string]$WorkspaceResourceId,
         [Parameter(Mandatory)][string]$ApplicationId,
@@ -152,7 +126,7 @@ function Ensure-DbxServicePrincipal {
     $filter = [uri]::EscapeDataString("applicationId eq `"$ApplicationId`"")
     $resp = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET `
             -Path "/api/2.0/preview/scim/v2/ServicePrincipals?filter=$filter" `
-            -DbxToken $DbxToken -ArmToken $ArmToken -WorkspaceResourceId $WorkspaceResourceId
+            -ArmToken $ArmToken -WorkspaceResourceId $WorkspaceResourceId
 
     if ($resp -and $resp.Resources -and $resp.Resources.Count -gt 0) {
         return $resp.Resources[0].id
@@ -166,7 +140,7 @@ function Ensure-DbxServicePrincipal {
 
     $created = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method POST `
               -Path "/api/2.0/preview/scim/v2/ServicePrincipals" `
-              -DbxToken $DbxToken -ArmToken $ArmToken -WorkspaceResourceId $WorkspaceResourceId `
+              -ArmToken $ArmToken -WorkspaceResourceId $WorkspaceResourceId `
               -Body $body
 
     if (-not $created -or -not $created.id) { throw "Failed to create Service Principal in Databricks workspace." }
@@ -176,7 +150,6 @@ function Ensure-DbxServicePrincipal {
 function Ensure-DbxAdminsMembership {
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
-        [Parameter(Mandatory)][string]$DbxToken,
         [Parameter(Mandatory)][string]$ArmToken,
         [Parameter(Mandatory)][string]$WorkspaceResourceId,
         [Parameter(Mandatory)][string]$ScimSpId
@@ -185,7 +158,7 @@ function Ensure-DbxAdminsMembership {
     $filter = [uri]::EscapeDataString('displayName eq "admins"')
     $g = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET `
          -Path "/api/2.0/preview/scim/v2/Groups?filter=$filter" `
-         -DbxToken $DbxToken -ArmToken $ArmToken -WorkspaceResourceId $WorkspaceResourceId
+         -ArmToken $ArmToken -WorkspaceResourceId $WorkspaceResourceId
 
     if (-not $g -or -not $g.Resources -or $g.Resources.Count -eq 0) {
         throw "Databricks SCIM group 'admins' not found."
@@ -215,14 +188,14 @@ function Ensure-DbxAdminsMembership {
 
     $null = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method PATCH `
             -Path "/api/2.0/preview/scim/v2/Groups/$adminsId" `
-            -DbxToken $DbxToken -ArmToken $ArmToken -WorkspaceResourceId $WorkspaceResourceId `
+            -ArmToken $ArmToken -WorkspaceResourceId $WorkspaceResourceId `
             -Body $patch
 
     Write-Host "DBX: Added SPN to 'admins' group." -ForegroundColor Green
     Start-Sleep -Seconds 10
 }
 
-# ---------------- Subscriptions ----------------
+# ---------------- Resolve subscriptions ----------------
 if ($SubscriptionIds.Count -gt 0) {
     $subs = foreach ($sid in $SubscriptionIds) { Get-AzSubscription -SubscriptionId $sid -ErrorAction Stop }
 } else {
@@ -242,8 +215,8 @@ if ($GrantRbac) {
     Write-Host "INFO: SP ObjectId = $spObjectId" -ForegroundColor Cyan
 }
 
-# Tokens for Databricks REST
-$tokens = Get-DbTokens
+# ARM token for Databricks REST
+$armToken = (Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop).Token
 
 # ---------------- Results ----------------
 $workspaces        = @()
@@ -270,10 +243,10 @@ foreach ($sub in $subs) {
 
     foreach ($ws in $wsResources) {
 
-        $wsName   = $ws.Name
-        $rg       = $ws.ResourceGroupName
-        $loc      = $ws.Location
-        $wsId     = $ws.ResourceId
+        $wsName = $ws.Name
+        $rg     = $ws.ResourceGroupName
+        $loc    = $ws.Location
+        $wsId   = $ws.ResourceId
 
         if ($GrantRbac -and $spObjectId) {
             Ensure-RbacRole -ObjectId $spObjectId -Scope "/subscriptions/$($sub.Id)/resourceGroups/$rg" -RoleName "Reader"
@@ -305,21 +278,19 @@ foreach ($sub in $subs) {
             BranchName          = $BranchName
         }
 
-        # Ensure SPN inside workspace + admin membership
+        # Ensure SPN exists inside workspace + admin membership
         if ($EnsureDbxAdmin) {
             try {
                 $scimSpId = Ensure-DbxServicePrincipal `
                     -WorkspaceUrl $wsUrl `
-                    -DbxToken $tokens.DatabricksToken `
-                    -ArmToken $tokens.ArmToken `
+                    -ArmToken $armToken `
                     -WorkspaceResourceId $wsId `
                     -ApplicationId $ClientId `
                     -DisplayName "SPN-$($adh_group)-scan"
 
                 Ensure-DbxAdminsMembership `
                     -WorkspaceUrl $wsUrl `
-                    -DbxToken $tokens.DatabricksToken `
-                    -ArmToken $tokens.ArmToken `
+                    -ArmToken $armToken `
                     -WorkspaceResourceId $wsId `
                     -ScimSpId $scimSpId
             } catch {
@@ -329,7 +300,7 @@ foreach ($sub in $subs) {
 
         # -------- SQL Warehouses --------
         $wh = Invoke-DbRest -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.0/sql/warehouses" `
-              -DbxToken $tokens.DatabricksToken -ArmToken $tokens.ArmToken -WorkspaceResourceId $wsId
+              -ArmToken $armToken -WorkspaceResourceId $wsId
 
         if ($wh -and $wh.warehouses) {
             foreach ($w in $wh.warehouses) {
@@ -345,13 +316,11 @@ foreach ($sub in $subs) {
                     AutoStopMins       = $w.auto_stop_mins
                     Serverless         = $w.enable_serverless_compute
                     SpotPolicy         = $w.spot_instance_policy
-                    adh_group          = $adh_group
-                    adh_sub_group      = $adh_sub_group
                 }
 
                 $whPerm = Invoke-DbRest -WorkspaceUrl $wsUrl -Method GET `
                     -Path ("/api/2.0/permissions/warehouses/{0}" -f $w.id) `
-                    -DbxToken $tokens.DatabricksToken -ArmToken $tokens.ArmToken -WorkspaceResourceId $wsId
+                    -ArmToken $armToken -WorkspaceResourceId $wsId
 
                 if ($whPerm -and $whPerm.access_control_list) {
                     foreach ($ace in $whPerm.access_control_list) {
@@ -385,7 +354,7 @@ foreach ($sub in $subs) {
 
         # -------- Unity Catalog: Catalogs --------
         $catResp = Invoke-DbRest -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/catalogs" `
-                    -DbxToken $tokens.DatabricksToken -ArmToken $tokens.ArmToken -WorkspaceResourceId $wsId
+                    -ArmToken $armToken -WorkspaceResourceId $wsId
 
         if ($catResp -and $catResp.catalogs) {
             foreach ($c in $catResp.catalogs) {
@@ -399,13 +368,11 @@ foreach ($sub in $subs) {
                     Comment          = $c.comment
                     CreatedAt        = $c.created_at
                     UpdatedAt        = $c.updated_at
-                    adh_group        = $adh_group
-                    adh_sub_group    = $adh_sub_group
                 }
 
                 $catPerm = Invoke-DbRest -WorkspaceUrl $wsUrl -Method GET `
                     -Path ("/api/2.1/unity-catalog/permissions/catalogs/{0}" -f $c.name) `
-                    -DbxToken $tokens.DatabricksToken -ArmToken $tokens.ArmToken -WorkspaceResourceId $wsId
+                    -ArmToken $armToken -WorkspaceResourceId $wsId
 
                 if ($catPerm -and $catPerm.privilege_assignments) {
                     foreach ($entry in $catPerm.privilege_assignments) {
@@ -427,7 +394,7 @@ foreach ($sub in $subs) {
 
         # -------- Unity Catalog: External locations --------
         $extResp = Invoke-DbRest -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/external-locations" `
-                   -DbxToken $tokens.DatabricksToken -ArmToken $tokens.ArmToken -WorkspaceResourceId $wsId
+                   -ArmToken $armToken -WorkspaceResourceId $wsId
 
         if ($extResp -and $extResp.external_locations) {
             foreach ($l in $extResp.external_locations) {
@@ -451,16 +418,16 @@ foreach ($sub in $subs) {
     }
 }
 
-# ---------------- Output ----------------
+# ---------------- Output (short names + yyyyMMdd) ----------------
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $base  = "{0}_{1}_{2}" -f $adh_group, $adh_subscription_type, $stamp
 
-$csvWs   = Join-Path $OutputDir "$base`_db_workspaces.csv"
-$csvWh   = Join-Path $OutputDir "$base`_db_sql_warehouses.csv"
-$csvWhP  = Join-Path $OutputDir "$base`_db_sql_warehouse_perms.csv"
-$csvCat  = Join-Path $OutputDir "$base`_db_catalogs.csv"
-$csvCatP = Join-Path $OutputDir "$base`_db_catalog_perms.csv"
-$csvExt  = Join-Path $OutputDir "$base`_db_external_locations.csv"
+$csvWs   = Join-Path $OutputDir "$base`_db_ws.csv"
+$csvWh   = Join-Path $OutputDir "$base`_db_wh.csv"
+$csvWhP  = Join-Path $OutputDir "$base`_db_whp.csv"
+$csvCat  = Join-Path $OutputDir "$base`_db_cat.csv"
+$csvCatP = Join-Path $OutputDir "$base`_db_catp.csv"
+$csvExt  = Join-Path $OutputDir "$base`_db_ext.csv"
 
 $workspaces        | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $csvWs
 $sqlWh             | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $csvWh
@@ -483,7 +450,6 @@ if (Get-Module -ListAvailable -Name ImportExcel) {
     $xlsx = Join-Path $OutputDir "$base`_db_inventory.xlsx"
     if (Test-Path $xlsx) { Remove-Item $xlsx -Force }
 
-    # Always write sheets (even if empty)
     $workspaces        | Export-Excel -Path $xlsx -WorksheetName "Workspaces"     -AutoSize -FreezeTopRow
     $sqlWh             | Export-Excel -Path $xlsx -WorksheetName "SQLWarehouses"  -AutoSize -FreezeTopRow
     $sqlWhPerms        | Export-Excel -Path $xlsx -WorksheetName "SQLWhPerms"     -AutoSize -FreezeTopRow
