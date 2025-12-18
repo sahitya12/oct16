@@ -1,21 +1,27 @@
+# Scan-Databricks.ps1
+# IMPORTANT: Save as UTF-8 (without BOM). BOM at byte 1 can break parsing in ADO.
+
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory)][string]$TenantId,
-  [Parameter(Mandatory)][string]$ClientId,
-  [Parameter(Mandatory)][string]$ClientSecret,
+  [Parameter(Mandatory=$true)][string]$TenantId,
+  [Parameter(Mandatory=$true)][string]$ClientId,
+  [Parameter(Mandatory=$true)][string]$ClientSecret,
 
-  [Parameter(Mandatory)][string]$adh_group,
+  [Parameter(Mandatory=$true)][string]$adh_group,
   [string]$adh_sub_group = '',
 
   [ValidateSet('nonprd','prd')]
   [string]$adh_subscription_type = 'nonprd',
 
-  [Parameter(Mandatory)][string]$OutputDir,
+  [Parameter(Mandatory=$true)][string]$OutputDir,
   [string]$BranchName = '',
 
   [switch]$GrantRbac,
   [switch]$RevokeRbacAfter
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
 Import-Module Az.Accounts, Az.Resources, Az.KeyVault -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
@@ -34,16 +40,19 @@ function Get-EnvList([string]$subType) {
 }
 
 function Build-InfraKvName([string]$group, [string]$subGroup, [string]$env) {
+  $g = $group.ToUpper()
+  $e = $env.ToLower()
   if ([string]::IsNullOrWhiteSpace($subGroup)) {
-    return ("ADH-{0}-Infra-KV-{1}" -f $group.ToUpper(), $env)
+    return ("ADH-{0}-Infra-KV-{1}" -f $g, $e)
   }
-  return ("ADH-{0}-{1}-Infra-KV-{2}" -f $group.ToUpper(), $subGroup.ToUpper(), $env)
+  $sg = $subGroup.ToUpper()
+  return ("ADH-{0}-{1}-Infra-KV-{2}" -f $g, $sg, $e)
 }
 
 function Get-SecretSafe {
   param(
-    [Parameter(Mandatory)][string]$VaultName,
-    [Parameter(Mandatory)][string]$SecretName
+    [Parameter(Mandatory=$true)][string]$VaultName,
+    [Parameter(Mandatory=$true)][string]$SecretName
   )
   try {
     $s = Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop
@@ -55,9 +64,9 @@ function Get-SecretSafe {
 
 function Ensure-RbacRole {
   param(
-    [Parameter(Mandatory)][string]$ObjectId,
-    [Parameter(Mandatory)][string]$Scope,
-    [Parameter(Mandatory)][string]$RoleName
+    [Parameter(Mandatory=$true)][string]$ObjectId,
+    [Parameter(Mandatory=$true)][string]$Scope,
+    [Parameter(Mandatory=$true)][string]$RoleName
   )
   try {
     $existing = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction SilentlyContinue
@@ -67,15 +76,15 @@ function Ensure-RbacRole {
       Start-Sleep -Seconds 20
     }
   } catch {
-    Write-Warning "RBAC: Failed assign '$RoleName' on $Scope : $($_.Exception.Message)"
+    Write-Warning ("RBAC assign failed: {0}" -f $_.Exception.Message)
   }
 }
 
 function Remove-RbacRole {
   param(
-    [Parameter(Mandatory)][string]$ObjectId,
-    [Parameter(Mandatory)][string]$Scope,
-    [Parameter(Mandatory)][string]$RoleName
+    [Parameter(Mandatory=$true)][string]$ObjectId,
+    [Parameter(Mandatory=$true)][string]$Scope,
+    [Parameter(Mandatory=$true)][string]$RoleName
   )
   try {
     $assignments = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction SilentlyContinue
@@ -86,16 +95,16 @@ function Remove-RbacRole {
       Write-Host "RBAC: Revoked '$RoleName' on $Scope" -ForegroundColor DarkYellow
     }
   } catch {
-    Write-Warning "RBAC: Failed revoke '$RoleName' on $Scope : $($_.Exception.Message)"
+    Write-Warning ("RBAC revoke failed: {0}" -f $_.Exception.Message)
   }
 }
 
 function Invoke-DbRestPat {
   param(
-    [Parameter(Mandatory)][string]$WorkspaceUrl,
-    [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','PATCH','DELETE')][string]$Method,
-    [Parameter(Mandatory)][string]$Path,
-    [Parameter(Mandatory)][string]$PatToken,
+    [Parameter(Mandatory=$true)][string]$WorkspaceUrl,
+    [Parameter(Mandatory=$true)][ValidateSet('GET','POST','PUT','PATCH','DELETE')][string]$Method,
+    [Parameter(Mandatory=$true)][string]$Path,
+    [Parameter(Mandatory=$true)][string]$PatToken,
     [string]$Body = $null
   )
 
@@ -124,7 +133,8 @@ function Invoke-DbRestPat {
     $msg = "HTTP=$statusCode; $($_.Exception.Message)"
     if ($respBody) {
       $one = ($respBody -replace '\s+',' ')
-      $msg = $msg + " | BODY=" + $one.Substring(0,[Math]::Min(400,$one.Length))
+      if ($one.Length -gt 400) { $one = $one.Substring(0,400) }
+      $msg = $msg + " | BODY=" + $one
     }
     Write-Warning ("DBX REST FAILED: {0} {1} :: {2}" -f $Method, $Path, $msg)
     return $null
@@ -140,13 +150,9 @@ function Ensure-AtLeastOneRow([ref]$arr, [hashtable]$row) {
 # ---------------- Start ----------------
 $adh_sub_group = Normalize-Text $adh_sub_group
 
-Write-Host "INFO: adh_group             = $adh_group"
-Write-Host "INFO: adh_sub_group         = '$adh_sub_group'"
-Write-Host "INFO: adh_subscription_type = $adh_subscription_type"
-Write-Host "INFO: OutputDir             = $OutputDir"
-Write-Host "INFO: BranchName            = $BranchName"
-Write-Host "INFO: GrantRbac             = $GrantRbac"
-Write-Host "INFO: RevokeRbacAfter       = $RevokeRbacAfter"
+Write-Host ("INFO: adh_group={0} adh_sub_group='{1}' envType={2}" -f $adh_group, $adh_sub_group, $adh_subscription_type)
+Write-Host ("INFO: OutputDir={0} BranchName={1}" -f $OutputDir, $BranchName)
+Write-Host ("INFO: GrantRbac={0} RevokeRbacAfter={1}" -f [bool]$GrantRbac, [bool]$RevokeRbacAfter)
 
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
   throw "Azure connection failed."
@@ -156,9 +162,9 @@ $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscript
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 if (-not $subs -or @($subs).Count -eq 0) { throw "No subscriptions resolved." }
 
-Write-Host "INFO: Subscriptions = $(($subs | Select-Object -ExpandProperty Name) -join ', ')"
+Write-Host ("INFO: Subscriptions = {0}" -f (($subs | Select-Object -ExpandProperty Name) -join ', '))
 
-# SP object id (for RBAC assignments to KV)
+# SP object id for RBAC grants (optional)
 $spObjectId = $null
 try {
   $sp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
@@ -169,7 +175,6 @@ try {
 
 $envs = Get-EnvList $adh_subscription_type
 
-# Results
 $wsRows   = @()
 $whRows   = @()
 $whPerms  = @()
@@ -177,17 +182,14 @@ $catRows  = @()
 $catPerms = @()
 $notes    = @()
 
-# Track RBAC scopes to optionally revoke later
 $rbacToRevoke = New-Object System.Collections.Generic.List[object]
 
 foreach ($sub in $subs) {
   Set-ScContext -Subscription $sub
-  Write-Host "`n=== Databricks scan: $($sub.Name) ($($sub.Id)) ===" -ForegroundColor Cyan
+  Write-Host ("`n=== Databricks scan: {0} ({1}) ===" -f $sub.Name, $sub.Id) -ForegroundColor Cyan
 
-  # ARM workspaces
   $wsResources = Get-AzResource -ResourceType "Microsoft.Databricks/workspaces" -ExpandProperties -ErrorAction SilentlyContinue
   if (-not $wsResources -or @($wsResources).Count -eq 0) {
-    Write-Warning "No Databricks workspaces in subscription $($sub.Name)"
     $notes += [pscustomobject]@{
       SubscriptionName = $sub.Name
       WorkspaceName    = ''
@@ -199,16 +201,17 @@ foreach ($sub in $subs) {
   }
 
   foreach ($ws in $wsResources) {
-
     $wsName = $ws.Name
     $rg     = $ws.ResourceGroupName
     $loc    = $ws.Location
     $wsId   = $ws.ResourceId
 
-    # workspace url
     $wsUrl = $null
-    if ($ws.Properties.workspaceUrl) { $wsUrl = $ws.Properties.workspaceUrl }
-    elseif ($ws.Properties.parameters.workspaceUrl.value) { $wsUrl = $ws.Properties.parameters.workspaceUrl.value }
+    if ($ws.Properties -and $ws.Properties.workspaceUrl) {
+      $wsUrl = $ws.Properties.workspaceUrl
+    } elseif ($ws.Properties -and $ws.Properties.parameters -and $ws.Properties.parameters.workspaceUrl -and $ws.Properties.parameters.workspaceUrl.value) {
+      $wsUrl = $ws.Properties.parameters.workspaceUrl.value
+    }
 
     $wsRows += [pscustomobject]@{
       SubscriptionName    = $sub.Name
@@ -216,7 +219,7 @@ foreach ($sub in $subs) {
       ResourceGroup       = $rg
       WorkspaceName       = $wsName
       Location            = $loc
-      WorkspaceUrl        = ($wsUrl ?? '')
+      WorkspaceUrl        = (if ($wsUrl) { $wsUrl } else { '' })
       WorkspaceResourceId = $wsId
       Note                = (if ($wsUrl) { '' } else { 'workspaceUrl missing' })
     }
@@ -232,7 +235,7 @@ foreach ($sub in $subs) {
       continue
     }
 
-    # Infer env from workspace name (best effort), otherwise try all envs
+    # Candidate envs: if name ends with -dev/-tst/-stg/-prd else try all
     $candidateEnvs = @()
     foreach ($e in $envs) {
       if ($wsName -match ("-{0}$" -f [Regex]::Escape($e)) -or $wsName -match ("_{0}$" -f [Regex]::Escape($e))) {
@@ -247,13 +250,11 @@ foreach ($sub in $subs) {
     foreach ($env in $candidateEnvs) {
       $kvName = Build-InfraKvName -group $adh_group -subGroup $adh_sub_group -env $env
 
-      # KV exists in this subscription?
       $kvRes = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" -Name $kvName -ErrorAction SilentlyContinue
       if (-not $kvRes) { continue }
 
       $kvScope = $kvRes.ResourceId
 
-      # RBAC grant if requested
       if ($GrantRbac -and $spObjectId) {
         Ensure-RbacRole -ObjectId $spObjectId -Scope $kvScope -RoleName "Key Vault Secrets User"
         if ($RevokeRbacAfter) {
@@ -261,7 +262,7 @@ foreach ($sub in $subs) {
         }
       }
 
-      # ✅ ONLY token secret you requested
+      # ✅ Use only this secret
       $patToken = Get-SecretSafe -VaultName $kvName -SecretName "SPN-TOKEN-CUSTODIAN-GEN"
       if ($patToken) {
         $kvUsed = $kvName
@@ -274,13 +275,13 @@ foreach ($sub in $subs) {
         SubscriptionName = $sub.Name
         WorkspaceName    = $wsName
         WorkspaceUrl     = $wsUrl
-        InfraKVUsed      = ($kvUsed ?? '')
-        Note             = "Missing secret 'SPN-TOKEN-CUSTODIAN-GEN' in Infra KV for env(s): $($candidateEnvs -join ', ')"
+        InfraKVUsed      = (if ($kvUsed) { $kvUsed } else { '' })
+        Note             = ("Missing secret 'SPN-TOKEN-CUSTODIAN-GEN' in Infra KV for env(s): {0}" -f ($candidateEnvs -join ', '))
       }
       continue
     }
 
-    # ---------------- Sanity check /Me ----------------
+    # Sanity check: /Me
     $me = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.0/preview/scim/v2/Me" -PatToken $patToken
     if (-not $me) {
       $notes += [pscustomobject]@{
@@ -288,17 +289,16 @@ foreach ($sub in $subs) {
         WorkspaceName    = $wsName
         WorkspaceUrl     = $wsUrl
         InfraKVUsed      = $kvUsed
-        Note             = "Token works for ARM but failed for DBX /Me. Token invalid / expired / not authorized for workspace."
+        Note             = "Token failed for DBX /Me. Token invalid/expired/not authorized."
       }
       continue
     }
 
-    Write-Host "DBX /Me OK: $($me.userName) | Workspace=$wsName | KV=$kvUsed" -ForegroundColor DarkGreen
+    Write-Host ("DBX /Me OK: {0} | Workspace={1} | KV={2}" -f $me.userName, $wsName, $kvUsed) -ForegroundColor DarkGreen
 
-    # ---------------- SQL Warehouses ----------------
+    # SQL Warehouses
     $wh = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.0/sql/warehouses" -PatToken $patToken
     if ($wh -and $wh.warehouses -and @($wh.warehouses).Count -gt 0) {
-
       foreach ($w in $wh.warehouses) {
         $whRows += [pscustomobject]@{
           SubscriptionName = $sub.Name
@@ -307,23 +307,18 @@ foreach ($sub in $subs) {
           WarehouseName    = $w.name
           WarehouseId      = $w.id
           Status           = $w.state
-          Region           = ($w.spot_instance_policy ?? '') # not always present; safe
-          Version          = ($w.enable_serverless_compute ?? '') # safe placeholder
-          RelatedCount     = '' # portal shows "Related" - not always obtainable via this API
-          IRType           = 'Azure'
-          IRSubType        = 'SQL Warehouse'
           Note             = ''
         }
 
-        # Warehouse permissions
         $perm = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.0/permissions/warehouses/{0}" -f $w.id) -PatToken $patToken
         if ($perm -and $perm.access_control_list -and @($perm.access_control_list).Count -gt 0) {
           foreach ($ace in $perm.access_control_list) {
-            $ptype = 'unknown'
-            $pname = $null
+            $ptype = ''
+            $pname = ''
             if ($ace.user_name) { $ptype='user'; $pname=$ace.user_name }
             elseif ($ace.group_name) { $ptype='group'; $pname=$ace.group_name }
             elseif ($ace.service_principal_name) { $ptype='service_principal'; $pname=$ace.service_principal_name }
+            else { $ptype='unknown' }
 
             foreach ($p in @($ace.all_permissions)) {
               $whPerms += [pscustomobject]@{
@@ -353,9 +348,7 @@ foreach ($sub in $subs) {
           }
         }
       }
-
     } else {
-      # Put a note row instead of leaving sheet empty
       $whRows += [pscustomobject]@{
         SubscriptionName = $sub.Name
         ResourceGroup    = $rg
@@ -363,19 +356,13 @@ foreach ($sub in $subs) {
         WarehouseName    = ''
         WarehouseId      = ''
         Status           = ''
-        Region           = ''
-        Version          = ''
-        RelatedCount     = ''
-        IRType           = ''
-        IRSubType        = ''
         Note             = 'No SQL Warehouses OR SQL API blocked'
       }
     }
 
-    # ---------------- Unity Catalog: Catalogs + Permissions ----------------
+    # Unity Catalog: Catalogs + Permissions
     $cats = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/catalogs" -PatToken $patToken
     if ($cats -and $cats.catalogs -and @($cats.catalogs).Count -gt 0) {
-
       foreach ($c in $cats.catalogs) {
         $catRows += [pscustomobject]@{
           SubscriptionName = $sub.Name
@@ -383,7 +370,6 @@ foreach ($sub in $subs) {
           WorkspaceName    = $wsName
           CatalogName      = $c.name
           Owner            = $c.owner
-          Comment          = $c.comment
           Note             = ''
         }
 
@@ -410,7 +396,6 @@ foreach ($sub in $subs) {
           }
         }
       }
-
     } else {
       $catRows += [pscustomobject]@{
         SubscriptionName = $sub.Name
@@ -418,12 +403,10 @@ foreach ($sub in $subs) {
         WorkspaceName    = $wsName
         CatalogName      = ''
         Owner            = ''
-        Comment          = ''
         Note             = 'Unity Catalog not enabled / metastore not attached OR UC API blocked'
       }
     }
 
-    # Notes row (shows what KV and token were used)
     $notes += [pscustomobject]@{
       SubscriptionName = $sub.Name
       WorkspaceName    = $wsName
@@ -434,7 +417,7 @@ foreach ($sub in $subs) {
   }
 }
 
-# ---------------- Revoke RBAC if asked ----------------
+# Revoke RBAC if asked
 if ($RevokeRbacAfter -and $rbacToRevoke.Count -gt 0) {
   Write-Host "`nRevoking temporary RBAC..." -ForegroundColor Yellow
   foreach ($r in $rbacToRevoke) {
@@ -442,37 +425,24 @@ if ($RevokeRbacAfter -and $rbacToRevoke.Count -gt 0) {
   }
 }
 
-# ---------------- Ensure not-empty outputs ----------------
-Ensure-AtLeastOneRow ([ref]$wsRows)   @{
-  SubscriptionName=''; SubscriptionId=''; ResourceGroup=''; WorkspaceName=''; Location=''; WorkspaceUrl=''; WorkspaceResourceId=''; Note=''
-}
-Ensure-AtLeastOneRow ([ref]$whRows)   @{
-  SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; WarehouseName=''; WarehouseId=''; Status=''; RelatedCount=''; Region=''; Version=''; IRType=''; IRSubType=''; Note=''
-}
-Ensure-AtLeastOneRow ([ref]$whPerms)  @{
-  SubscriptionName=''; WorkspaceName=''; WarehouseName=''; WarehouseId=''; PrincipalType=''; PrincipalName=''; PermissionLevel=''; Inherited=''; Note=''
-}
-Ensure-AtLeastOneRow ([ref]$catRows)  @{
-  SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; CatalogName=''; Owner=''; Comment=''; Note=''
-}
-Ensure-AtLeastOneRow ([ref]$catPerms) @{
-  SubscriptionName=''; WorkspaceName=''; CatalogName=''; PrincipalName=''; Privileges=''; Note=''
-}
-Ensure-AtLeastOneRow ([ref]$notes)    @{
-  SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; Note=''
-}
+# Ensure outputs not empty
+Ensure-AtLeastOneRow ([ref]$wsRows)   @{ SubscriptionName=''; SubscriptionId=''; ResourceGroup=''; WorkspaceName=''; Location=''; WorkspaceUrl=''; WorkspaceResourceId=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$whRows)   @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; WarehouseName=''; WarehouseId=''; Status=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$whPerms)  @{ SubscriptionName=''; WorkspaceName=''; WarehouseName=''; WarehouseId=''; PrincipalType=''; PrincipalName=''; PermissionLevel=''; Inherited=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$catRows)  @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; CatalogName=''; Owner=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$catPerms) @{ SubscriptionName=''; WorkspaceName=''; CatalogName=''; PrincipalName=''; Privileges=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$notes)    @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; Note='' }
 
-# ---------------- Output files ----------------
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+# Output (short names, yyyyMMdd)
+$stamp = Get-Date -Format 'yyyyMMdd'
 $base  = "{0}_{1}_{2}" -f $adh_group, $adh_subscription_type, $stamp
 
-# short names (as you requested)
-$csvWs   = Join-Path $OutputDir "$base`_db_ws.csv"
-$csvWh   = Join-Path $OutputDir "$base`_db_wh.csv"
-$csvWhP  = Join-Path $OutputDir "$base`_db_whp.csv"
-$csvCat  = Join-Path $OutputDir "$base`_db_cat.csv"
-$csvCatP = Join-Path $OutputDir "$base`_db_catp.csv"
-$csvNote = Join-Path $OutputDir "$base`_db_note.csv"
+$csvWs   = Join-Path $OutputDir ($base + "_db_ws.csv")
+$csvWh   = Join-Path $OutputDir ($base + "_db_wh.csv")
+$csvWhP  = Join-Path $OutputDir ($base + "_db_whp.csv")
+$csvCat  = Join-Path $OutputDir ($base + "_db_cat.csv")
+$csvCatP = Join-Path $OutputDir ($base + "_db_catp.csv")
+$csvNote = Join-Path $OutputDir ($base + "_db_note.csv")
 
 $wsRows   | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $csvWs
 $whRows   | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $csvWh
@@ -489,28 +459,20 @@ Write-Host " - $csvCat"
 Write-Host " - $csvCatP"
 Write-Host " - $csvNote"
 
-# XLSX (optional)
+# Optional XLSX
 if (Get-Module -ListAvailable -Name ImportExcel) {
   Import-Module ImportExcel -ErrorAction SilentlyContinue
-  $xlsx = Join-Path $OutputDir "$base`_db_inventory.xlsx"
+  $xlsx = Join-Path $OutputDir ($base + "_db_inventory.xlsx")
   if (Test-Path $xlsx) { Remove-Item $xlsx -Force }
 
-  $wsRows   | Export-Excel -Path $xlsx -WorksheetName "Workspaces"    -AutoSize -FreezeTopRow
+  $wsRows   | Export-Excel -Path $xlsx -WorksheetName "Workspaces"   -AutoSize -FreezeTopRow
   $whRows   | Export-Excel -Path $xlsx -WorksheetName "SQLWarehouses" -AutoSize -FreezeTopRow
-  $whPerms  | Export-Excel -Path $xlsx -WorksheetName "SQLWhPerms"    -AutoSize -FreezeTopRow
-  $catRows  | Export-Excel -Path $xlsx -WorksheetName "Catalogs"      -AutoSize -FreezeTopRow
-  $catPerms | Export-Excel -Path $xlsx -WorksheetName "CatalogPerms"  -AutoSize -FreezeTopRow
-  $notes    | Export-Excel -Path $xlsx -WorksheetName "Notes"         -AutoSize -FreezeTopRow
+  $whPerms  | Export-Excel -Path $xlsx -WorksheetName "SQLWhPerms"   -AutoSize -FreezeTopRow
+  $catRows  | Export-Excel -Path $xlsx -WorksheetName "Catalogs"     -AutoSize -FreezeTopRow
+  $catPerms | Export-Excel -Path $xlsx -WorksheetName "CatalogPerms" -AutoSize -FreezeTopRow
+  $notes    | Export-Excel -Path $xlsx -WorksheetName "Notes"        -AutoSize -FreezeTopRow
 
   Write-Host "XLSX: $xlsx" -ForegroundColor Green
 } else {
   Write-Warning "ImportExcel not found; XLSX skipped."
 }
-
-Write-Host "`nCounts:" -ForegroundColor Yellow
-Write-Host " Workspaces    = $($wsRows.Count)"
-Write-Host " Warehouses    = $($whRows.Count)"
-Write-Host " WhPerms       = $($whPerms.Count)"
-Write-Host " Catalogs      = $($catRows.Count)"
-Write-Host " CatalogPerms  = $($catPerms.Count)"
-Write-Host " Notes         = $($notes.Count)"
