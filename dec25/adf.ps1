@@ -1,18 +1,3 @@
-# sanitychecks/scripts/Scan-DataFactory.ps1
-# CSV ONLY (no HTML) + RBAC auto-grant (Data Factory Contributor)
-#
-# Naming convention:
-#   ADF  : ADH-<adh_group>-ADF-<env>
-#   RG   : adh_<adh_group>_adf_<env>
-# envs:
-#   nonprd => dev,tst,stg
-#   prd    => prd
-#
-# Notes:
-# - Az.DataFactory cmdlets read PUBLISHED artifacts (management plane).
-#   If your portal is showing a Git branch (e.g., "develop branch"), publish first.
-# - IR Status requires Data Factory Contributor (or Contributor) on the ADF RG.
-
 param(
     [Parameter(Mandatory = $true)][string]$TenantId,
     [Parameter(Mandatory = $true)][string]$ClientId,
@@ -21,8 +6,6 @@ param(
     [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
     [Parameter(Mandatory = $true)][string]$OutputDir,
     [string]$BranchName = '',
-
-    # RBAC auto-grant (recommended)
     [switch]$GrantRbac
 )
 
@@ -62,34 +45,6 @@ function Get-PropValue {
     return $null
 }
 
-# Deep reference counter:
-# Counts occurrences of any property named "referenceName" with value == $Name
-# Recurses through objects/arrays.
-function Count-ReferenceNameInObject {
-    param([Parameter(Mandatory)]$Obj, [Parameter(Mandatory)][string]$Name)
-
-    $count = 0
-    if ($null -eq $Obj) { return 0 }
-
-    if ($Obj -is [System.Collections.IEnumerable] -and $Obj -isnot [string]) {
-        foreach ($i in $Obj) { $count += Count-ReferenceNameInObject -Obj $i -Name $Name }
-        return $count
-    }
-
-    $props = $Obj.PSObject.Properties
-    foreach ($p in $props) {
-        $v = $p.Value
-        if ($null -eq $v) { continue }
-
-        if ($p.Name -match 'referenceName' -and ($v -is [string]) -and ($v -eq $Name)) {
-            $count++
-        } else {
-            $count += Count-ReferenceNameInObject -Obj $v -Name $Name
-        }
-    }
-    return $count
-}
-
 function Get-ExpectedAdfTargets {
     param(
         [Parameter(Mandatory)][string]$adh_group,
@@ -120,6 +75,63 @@ function Map-LSTypeToPortal {
         '^Http'                  { return 'HTTP' }
         default                  { return $lsType }
     }
+}
+
+# Safe counter: Linked service "Related" like portal (datasets + pipeline activities)
+function Count-LinkedServiceReferences {
+    param(
+        [Parameter(Mandatory)]$Datasets,
+        [Parameter(Mandatory)]$Pipelines,
+        [Parameter(Mandatory)][string]$LinkedServiceName
+    )
+
+    $count = 0
+
+    foreach ($d in @($Datasets)) {
+        $ref = Get-PropValue -Obj $d -Paths @(
+            'Properties.LinkedServiceName.ReferenceName',
+            'Properties.linkedServiceName.referenceName',
+            'Properties.linkedServiceName.ReferenceName'
+        )
+        if ($ref -and ($ref.ToString() -eq $LinkedServiceName)) { $count++ }
+    }
+
+    foreach ($p in @($Pipelines)) {
+        $acts = Get-PropValue -Obj $p -Paths @('Properties.Activities','properties.activities')
+        foreach ($a in @($acts)) {
+            $lsRef = Get-PropValue -Obj $a -Paths @(
+                'LinkedServiceName.ReferenceName',
+                'linkedServiceName.referenceName',
+                'linkedServiceName.ReferenceName',
+                'typeProperties.linkedServiceName.referenceName',
+                'typeProperties.linkedServiceName.ReferenceName'
+            )
+            if ($lsRef -and ($lsRef.ToString() -eq $LinkedServiceName)) { $count++ }
+        }
+    }
+
+    return $count
+}
+
+# Safe counter: IR "Related" like portal (linked services connectVia)
+function Count-IRReferences {
+    param(
+        [Parameter(Mandatory)]$LinkedServices,
+        [Parameter(Mandatory)][string]$IRName
+    )
+
+    $count = 0
+
+    foreach ($ls in @($LinkedServices)) {
+        $irRef = Get-PropValue -Obj $ls -Paths @(
+            'Properties.ConnectVia.ReferenceName',
+            'Properties.connectVia.referenceName',
+            'Properties.connectVia.ReferenceName'
+        )
+        if ($irRef -and ($irRef.ToString() -eq $IRName)) { $count++ }
+    }
+
+    return $count
 }
 
 function Get-IRPortalTypeSubType {
@@ -273,17 +285,15 @@ foreach ($sub in $subs) {
 
     $targets = Get-ExpectedAdfTargets -adh_group $adh_group -adh_subscription_type $adh_subscription_type
 
-    # ---- RBAC auto-grant on all expected ADF RGs in this subscription ----
+    # ---- RBAC auto-grant on expected ADF RGs ----
     if ($GrantRbac) {
         foreach ($t in $targets) {
             Ensure-DataFactoryContributorOnRg -SpObjectId $spObjectId -SubscriptionId $sub.Id -ResourceGroupName $t.ResourceGroup
         }
-        # Give RBAC a moment
         Start-Sleep -Seconds 15
     }
 
     foreach ($t in $targets) {
-
         $dfName = $t.DataFactory
         $rgName = $t.ResourceGroup
 
@@ -326,21 +336,16 @@ foreach ($sub in $subs) {
         $pipelines = @()
         try { $pipelines = Get-AzDataFactoryV2Pipeline -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop } catch { $pipelines = @() }
 
-        # ---------------- Linked Services (Portal-like: used only) ----------------
-        foreach ($l in $ls) {
+        # ---------------- Linked Services (Portal-like: USED only) ----------------
+        foreach ($l in @($ls)) {
             $rawType = Get-PropValue -Obj $l -Paths @('Properties.Type','Type')
             if (-not $rawType -and $l.Properties) { $rawType = $l.Properties.GetType().Name }
             if (-not $rawType) { $rawType = 'Unknown' }
 
             $portalType = Map-LSTypeToPortal -lsType ($rawType.ToString())
 
-            # Portal-ish "Related": count occurrences of LS name as referenceName
-            # (Datasets + Pipelines)
-            $related = (Count-ReferenceNameInObject -Obj $datasets -Name $l.Name) +
-                       (Count-ReferenceNameInObject -Obj $pipelines -Name $l.Name)
-
-            # Keep only LS that appear in portal list (used)
-            if ($related -le 0) { continue }
+            $related = Count-LinkedServiceReferences -Datasets $datasets -Pipelines $pipelines -LinkedServiceName $l.Name
+            if ($related -le 0) { continue } # show only portal-visible LS
 
             $lsRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
@@ -356,7 +361,7 @@ foreach ($sub in $subs) {
         $irs = @()
         try { $irs = Get-AzDataFactoryV2IntegrationRuntime -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop } catch { $irs = @() }
 
-        foreach ($ir in $irs) {
+        foreach ($ir in @($irs)) {
 
             $ts = Get-IRPortalTypeSubType -Ir $ir
             $portalType    = $ts[0]
@@ -380,11 +385,10 @@ foreach ($sub in $subs) {
             $status  = $sv[0]
             $version = $sv[1]
 
-            # Related (portal-ish): references to IR name across LS + pipelines
-            $relatedCount = (Count-ReferenceNameInObject -Obj $ls -Name $ir.Name) +
-                            (Count-ReferenceNameInObject -Obj $pipelines -Name $ir.Name)
+            # Related (portal-ish): linked services connectVia
+            $relatedCount = Count-IRReferences -LinkedServices $ls -IRName $ir.Name
 
-            # Portal usually shows AutoResolve + IRs actually referenced
+            # Portal typically shows AutoResolve + referenced IRs
             if ($ir.Name -ne 'AutoResolveIntegrationRuntime' -and $relatedCount -le 0) { continue }
 
             $irRows += [pscustomobject]@{
@@ -447,20 +451,22 @@ if (-not $irRows) {
     }
 }
 
-# ---------------- Output CSVs ONLY ----------------
-$csv1 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_overview_{0}_{1}" -f $adh_group, $adh_subscription_type)
-Write-CsvSafe -Rows $overview -Path $csv1
+# ---------------- Output CSVs ONLY (short names + yyyyMMdd) ----------------
+$stamp = Get-Date -Format 'yyyyMMdd'
 
-$csv2 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_linkedservices_{0}_{1}" -f $adh_group, $adh_subscription_type)
-Write-CsvSafe -Rows $lsRows -Path $csv2
+$csvOverview = Join-Path $OutputDir ("adf_overview_{0}_{1}_{2}.csv" -f $adh_group, $adh_subscription_type, $stamp)
+Write-CsvSafe -Rows $overview -Path $csvOverview
 
-$csv3 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_integrationruntimes_{0}_{1}" -f $adh_group, $adh_subscription_type)
-Write-CsvSafe -Rows $irRows -Path $csv3
+$csvLS = Join-Path $OutputDir ("adf_ls_{0}_{1}_{2}.csv" -f $adh_group, $adh_subscription_type, $stamp)
+Write-CsvSafe -Rows $lsRows -Path $csvLS
+
+$csvIR = Join-Path $OutputDir ("adf_ir_{0}_{1}_{2}.csv" -f $adh_group, $adh_subscription_type, $stamp)
+Write-CsvSafe -Rows $irRows -Path $csvIR
 
 Write-Host "`nADF scan completed." -ForegroundColor Green
-Write-Host "Overview CSV : $csv1"
-Write-Host "Linked Svc   : $csv2"
-Write-Host "IRs          : $csv3"
+Write-Host "Overview : $csvOverview"
+Write-Host "ADF LS   : $csvLS"
+Write-Host "ADF IR   : $csvIR"
 
 if ($GrantRbac) {
     Write-Host "`nRBAC note: If Status still shows 'Unknown', wait 2-5 minutes and rerun (RBAC propagation)." -ForegroundColor Yellow
