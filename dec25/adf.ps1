@@ -1,3 +1,4 @@
+# sanitychecks/scripts/Scan-DataFactory.ps1
 param(
     [Parameter(Mandatory = $true)][string]$TenantId,
     [Parameter(Mandatory = $true)][string]$ClientId,
@@ -10,7 +11,6 @@ param(
 
 Import-Module Az.Accounts, Az.Resources, Az.DataFactory -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
-
 Ensure-Dir -Path $OutputDir | Out-Null
 
 Write-Host "DEBUG: TenantId              = $TenantId"
@@ -20,9 +20,7 @@ Write-Host "DEBUG: adh_subscription_type = $adh_subscription_type"
 Write-Host "DEBUG: OutputDir             = $OutputDir"
 Write-Host "DEBUG: BranchName            = $BranchName"
 
-# ------------------------------------------------------------
-# Helper: safe property getter for multiple object shapes
-# ------------------------------------------------------------
+# ---------------- Helpers ----------------
 function Get-PropValue {
     param([object]$Obj, [string[]]$Paths)
 
@@ -46,11 +44,6 @@ function Get-PropValue {
     return $null
 }
 
-# ------------------------------------------------------------
-# Expected ADF targets based on your naming convention
-# ADH-<GROUP>-ADF-<env> / adh_<group>_adf_<env>
-# nonprd => dev,tst,stg ; prd => prd
-# ------------------------------------------------------------
 function Get-ExpectedAdfTargets {
     param(
         [Parameter(Mandatory)][string]$adh_group,
@@ -59,39 +52,16 @@ function Get-ExpectedAdfTargets {
 
     $gUpper = $adh_group.Trim().ToUpper()
     $gLower = $adh_group.Trim().ToLower()
-
     $envs = if ($adh_subscription_type -eq 'prd') { @('prd') } else { @('dev','tst','stg') }
 
     foreach ($env in $envs) {
-        $envLower = $env.ToLower()
+        $e = $env.ToLower()
         [pscustomobject]@{
-            Env           = $envLower
-            DataFactory   = "ADH-$gUpper-ADF-$envLower"
-            ResourceGroup = ("adh_{0}_adf_{1}" -f $gLower, $envLower)
+            Env           = $e
+            DataFactory   = "ADH-$gUpper-ADF-$e"
+            ResourceGroup = ("adh_{0}_adf_{1}" -f $gLower, $e)
         }
     }
-}
-
-# ------------------------------------------------------------
-# Linked Service: Related count (Portal "Related") from Datasets
-# ------------------------------------------------------------
-function Get-LSRelatedCountFromDatasets {
-    param(
-        [Parameter(Mandatory)][array]$Datasets,
-        [Parameter(Mandatory)][string]$LinkedServiceName
-    )
-
-    $count = 0
-    foreach ($ds in $Datasets) {
-        $ref = Get-PropValue -Obj $ds -Paths @(
-            'Properties.LinkedServiceName.ReferenceName',
-            'Properties.linkedServiceName.referenceName',
-            'Properties.linkedServiceName.ReferenceName',
-            'Properties.LinkedServiceName.referenceName'
-        )
-        if ($ref -and ($ref.ToString() -eq $LinkedServiceName)) { $count++ }
-    }
-    return $count
 }
 
 function Map-LSTypeToPortal {
@@ -107,9 +77,45 @@ function Map-LSTypeToPortal {
     }
 }
 
-# ------------------------------------------------------------
-# IR: count linked services using connectVia.referenceName
-# ------------------------------------------------------------
+function Get-LSRelatedCount {
+    param(
+        [Parameter(Mandatory)][array]$Datasets,
+        [Parameter(Mandatory)][array]$Pipelines,
+        [Parameter(Mandatory)][string]$LinkedServiceName
+    )
+
+    $count = 0
+
+    # (A) Datasets -> Linked Service
+    foreach ($ds in $Datasets) {
+        $ref = Get-PropValue -Obj $ds -Paths @(
+            'Properties.LinkedServiceName.ReferenceName',
+            'Properties.linkedServiceName.referenceName',
+            'Properties.linkedServiceName.ReferenceName',
+            'Properties.LinkedServiceName.referenceName'
+        )
+        if ($ref -and ($ref.ToString() -eq $LinkedServiceName)) { $count++ }
+    }
+
+    # (B) Pipeline activities -> Linked Service (closer to Portal "Related")
+    foreach ($pl in $Pipelines) {
+        $acts = Get-PropValue -Obj $pl -Paths @('Properties.Activities','properties.activities')
+        if (-not $acts) { continue }
+        foreach ($a in $acts) {
+            $lsRef = Get-PropValue -Obj $a -Paths @(
+                'LinkedServiceName.ReferenceName',
+                'linkedServiceName.referenceName',
+                'linkedServiceName.ReferenceName',
+                'typeProperties.linkedServiceName.referenceName',
+                'typeProperties.linkedServiceName.ReferenceName'
+            )
+            if ($lsRef -and ($lsRef.ToString() -eq $LinkedServiceName)) { $count++ }
+        }
+    }
+
+    return $count
+}
+
 function Get-IRRelatedCount {
     param([array]$LinkedServices, [string]$IrName)
 
@@ -128,9 +134,6 @@ function Get-IRRelatedCount {
     return $count
 }
 
-# ------------------------------------------------------------
-# IR: Portal-like Type/SubType
-# ------------------------------------------------------------
 function Get-IRPortalTypeSubType {
     param([object]$Ir)
 
@@ -152,7 +155,7 @@ function Get-IRPortalTypeSubType {
         }
     }
 
-    # Managed VNet detection (object shape varies)
+    # Managed VNet detection (shape varies)
     $mvnet = Get-PropValue -Obj $Ir -Paths @(
         'Properties.TypeProperties.VNetProperties',
         'Properties.TypeProperties.VnetProperties',
@@ -170,9 +173,6 @@ function Get-IRPortalTypeSubType {
     return @($portalType,$portalSub)
 }
 
-# ------------------------------------------------------------
-# IR: Status + Version via IR Status API
-# ------------------------------------------------------------
 function Get-IRStatusAndVersion {
     param(
         [string]$Rg,
@@ -218,28 +218,24 @@ function Get-IRStatusAndVersion {
     return @($status,$version)
 }
 
-# ------------------------------------------------------------
-# Connect
-# ------------------------------------------------------------
+# ---------------- Connect ----------------
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
 }
 
-# ------------------------------------------------------------
-# Resolve subscriptions
-# ------------------------------------------------------------
+# ---------------- Subscriptions ----------------
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 Write-Host "DEBUG: Subscriptions: $((($subs | Select-Object -ExpandProperty Name) -join ', '))"
 
+# ---------------- Output rows ----------------
 $overview = @()
 $lsRows   = @()
 $irRows   = @()
 
 foreach ($sub in $subs) {
-
-    Write-Host "DEBUG: Processing subscription $($sub.Name)"
     Set-ScContext -Subscription $sub
+    Write-Host "`n=== ADF scan: $($sub.Name) / $($sub.Id) ===" -ForegroundColor Cyan
 
     $targets = Get-ExpectedAdfTargets -adh_group $adh_group -adh_subscription_type $adh_subscription_type
 
@@ -248,17 +244,14 @@ foreach ($sub in $subs) {
         $dfName = $t.DataFactory
         $rgName = $t.ResourceGroup
 
-        # Check ADF existence by querying the specific one
+        # ADF exists?
         $df = $null
         try {
             $df = Get-AzDataFactoryV2 -ResourceGroupName $rgName -Name $dfName -ErrorAction Stop
-        } catch {
-            $df = $null
-        }
+        } catch { $df = $null }
 
         if (-not $df) {
             Write-Host "DEBUG: Expected ADF NOT found: $dfName in RG $rgName" -ForegroundColor Yellow
-
             $overview += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 SubscriptionId   = $sub.Id
@@ -270,7 +263,7 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # ----------------- Overview -----------------
+        # Overview
         $overview += [pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -280,35 +273,33 @@ foreach ($sub in $subs) {
             Location         = $df.Location
         }
 
-        # ----------------- Linked Services -----------------
+        # Linked services
         $ls = @()
         try {
-            $ls = Get-AzDataFactoryV2LinkedService `
-                    -ResourceGroupName $rgName `
-                    -DataFactoryName   $dfName `
-                    -ErrorAction Stop
+            $ls = Get-AzDataFactoryV2LinkedService -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop
         } catch { $ls = @() }
 
-        # Datasets (to compute LS "Related" like portal)
+        # Datasets (for LS related)
         $datasets = @()
         try {
-            $datasets = Get-AzDataFactoryV2Dataset `
-                -ResourceGroupName $rgName `
-                -DataFactoryName   $dfName `
-                -ErrorAction Stop
+            $datasets = Get-AzDataFactoryV2Dataset -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop
         } catch { $datasets = @() }
 
-        foreach ($l in $ls) {
+        # Pipelines (for LS related)
+        $pipelines = @()
+        try {
+            $pipelines = Get-AzDataFactoryV2Pipeline -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop
+        } catch { $pipelines = @() }
 
+        foreach ($l in $ls) {
             $rawType = Get-PropValue -Obj $l -Paths @('Properties.Type','Type')
             if (-not $rawType -and $l.Properties) { $rawType = $l.Properties.GetType().Name }
             if (-not $rawType) { $rawType = 'Unknown' }
 
             $portalType = Map-LSTypeToPortal -lsType ($rawType.ToString())
+            $related = Get-LSRelatedCount -Datasets $datasets -Pipelines $pipelines -LinkedServiceName $l.Name
 
-            $related = Get-LSRelatedCountFromDatasets -Datasets $datasets -LinkedServiceName $l.Name
-
-            # ✅ Portal-only linked services
+            # ✅ Portal-like: keep only ones actually used
             if ($related -le 0) { continue }
 
             $lsRows += [pscustomobject]@{
@@ -321,13 +312,10 @@ foreach ($sub in $subs) {
             }
         }
 
-        # ----------------- Integration Runtimes -----------------
+        # Integration runtimes
         $irs = @()
         try {
-            $irs = Get-AzDataFactoryV2IntegrationRuntime `
-                     -ResourceGroupName $rgName `
-                     -DataFactoryName   $dfName `
-                     -ErrorAction Stop
+            $irs = Get-AzDataFactoryV2IntegrationRuntime -ResourceGroupName $rgName -DataFactoryName $dfName -ErrorAction Stop
         } catch { $irs = @() }
 
         foreach ($ir in $irs) {
@@ -336,7 +324,6 @@ foreach ($sub in $subs) {
             $portalType    = $ts[0]
             $portalSubType = $ts[1]
 
-            # Region
             $region = ''
             if ($ir.Name -eq 'AutoResolveIntegrationRuntime') {
                 $region = 'Auto Resolve'
@@ -349,21 +336,13 @@ foreach ($sub in $subs) {
                 if (-not $region) { $region = '' }
             }
 
-            # Status + Version
             $sv = Get-IRStatusAndVersion -Rg $rgName -DfName $dfName -IrName $ir.Name
             $status  = $sv[0]
             $version = $sv[1]
 
-            # Related (portal)
             $relatedCount = Get-IRRelatedCount -LinkedServices $ls -IrName $ir.Name
 
-            # ✅ Portal-only IRs:
-            # - Always keep AutoResolveIntegrationRuntime (even if related=0)
-            # - Keep others only if related > 0
-            if ($ir.Name -ne 'AutoResolveIntegrationRuntime' -and $relatedCount -le 0) {
-                continue
-            }
-
+            # ✅ Do NOT filter IRs out (so you always see them)
             $irRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $rgName
@@ -380,9 +359,7 @@ foreach ($sub in $subs) {
     }
 }
 
-# ------------------------------------------------------------
-# Ensure CSVs always have at least one row (headers visible)
-# ------------------------------------------------------------
+# ---------------- Ensure at least one row in each CSV ----------------
 if (-not $overview) {
     foreach ($sub in $subs) {
         $overview += [pscustomobject]@{
@@ -426,12 +403,9 @@ if (-not $irRows) {
     }
 }
 
-# ------------------------------------------------------------
-# Output CSV + HTML
-# ------------------------------------------------------------
+# ---------------- Output CSVs ONLY (no HTML) ----------------
 $csv1 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_overview_{0}_{1}" -f $adh_group, $adh_subscription_type)
 Write-CsvSafe -Rows $overview -Path $csv1
-Convert-CsvToHtml -CsvPath $csv1 -HtmlPath ($csv1 -replace '\.csv$','.html') -Title "ADF Overview ($adh_group / $adh_subscription_type) $BranchName"
 
 $csv2 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_linkedservices_{0}_{1}" -f $adh_group, $adh_subscription_type)
 Write-CsvSafe -Rows $lsRows -Path $csv2
@@ -439,7 +413,7 @@ Write-CsvSafe -Rows $lsRows -Path $csv2
 $csv3 = New-StampedPath -BaseDir $OutputDir -Prefix ("adf_integrationruntimes_{0}_{1}" -f $adh_group, $adh_subscription_type)
 Write-CsvSafe -Rows $irRows -Path $csv3
 
-Write-Host "ADF scan completed." -ForegroundColor Green
+Write-Host "`nADF scan completed." -ForegroundColor Green
 Write-Host "Overview CSV : $csv1"
 Write-Host "Linked Svc   : $csv2"
 Write-Host "IRs          : $csv3"
