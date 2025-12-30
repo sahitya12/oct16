@@ -1,3 +1,20 @@
+# sanitychecks/scripts/Scan-Databricks-UC.ps1
+# FULL WORKING CODE
+# - Discovers Databricks workspaces in resolved subscriptions
+# - Fetches Databricks SPN PAT token from KV secret:
+#     SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION OR
+#     SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION
+# - Uses PAT to query:
+#     SQL Warehouses + permissions
+#     Unity Catalog metastore probe
+#     Catalogs + catalog permissions
+#     External locations + external location permissions
+# - Writes clear HTTP errors into CSV (no silent “empty output”)
+#
+# IMPORTANT: The SPN behind the PAT must be added to the workspace and have:
+#   - Workspace Admin (for permissions endpoints)
+#   - Metastore admin (for UC endpoints)
+#
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$TenantId,
@@ -83,11 +100,17 @@ function Get-SecretSafe {
         [Parameter(Mandatory)][string]$SecretName
     )
     try {
-        $s = Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop
-        return $s.SecretValueText
+        (Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop).SecretValueText
     } catch {
-        return $null
+        $null
     }
+}
+
+function Test-DatabricksPat {
+    param([string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $false }
+    if ($Token.Length -lt 10) { return $false }
+    return $Token.StartsWith('dapi')
 }
 
 # Global last error from DBX REST (so we can write it into CSV)
@@ -165,7 +188,7 @@ if (-not $subs -or @($subs).Count -eq 0) { throw "No subscriptions resolved." }
 
 Write-Host "INFO: Subscriptions = $(($subs | Select-Object -ExpandProperty Name) -join ', ')"
 
-# SP object id (for RBAC assignments)
+# SP object id (for KV RBAC assignment)
 $spObjectId = $null
 try {
     $sp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
@@ -200,12 +223,12 @@ foreach ($sub in $subs) {
     }
 
     foreach ($ws in $wsResources) {
-
         $wsName = $ws.Name
         $rg     = $ws.ResourceGroupName
         $loc    = $ws.Location
         $wsId   = $ws.ResourceId
 
+        # workspaceUrl
         $wsUrl = $null
         if ($ws.Properties.workspaceUrl) {
             $wsUrl = $ws.Properties.workspaceUrl
@@ -269,43 +292,61 @@ foreach ($sub in $subs) {
                 }
             }
 
-            $patToken = Get-SecretSafe -VaultName $kvName -SecretName "SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION"
-            if ($patToken) {
-                $tokenSecretUsed = "SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION"
-            } else {
-                $patToken = Get-SecretSafe -VaultName $kvName -SecretName "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
-                if ($patToken) { $tokenSecretUsed = "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION" }
+            # REQUIRED: PAT must come from either of the two secrets
+            $candidateSecrets = @(
+                "SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION",
+                "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
+            )
+
+            foreach ($sec in $candidateSecrets) {
+                $tmp = Get-SecretSafe -VaultName $kvName -SecretName $sec
+                if (Test-DatabricksPat $tmp) {
+                    $patToken = $tmp
+                    $tokenSecretUsed = $sec
+                    break
+                }
             }
 
+            # Optional: presence check only (for notes)
             $genSpnClientId     = Get-SecretSafe -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientID"
             $genSpnClientSecret = Get-SecretSafe -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientSecret"
 
-            if ($patToken) { $kvUsed = $kvName; break }
+            if ($patToken) {
+                $kvUsed = $kvName
+                break
+            } else {
+                Write-Host "DEBUG: KV '$kvName' found but no VALID Databricks PAT in the two secrets." -ForegroundColor Yellow
+            }
         }
 
         if (-not $patToken) {
             $notes += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                WorkspaceName    = $wsName
-                WorkspaceUrl     = $wsUrl
-                Note             = "No Databricks PAT token found in Infra KV for env(s): $($candidateEnvs -join ', ')"
+                SubscriptionName           = $sub.Name
+                WorkspaceName              = $wsName
+                WorkspaceUrl               = $wsUrl
+                InfraKVUsed                = ''
+                TokenSecretUsed            = ''
+                PatLooksLikeDatabricksPAT  = $false
+                GenSpnClientIdPresent      = $false
+                GenSpnClientSecretPresent  = $false
+                Note                       = "No VALID Databricks PAT found in KV secrets for env(s): $($candidateEnvs -join ', ')"
             }
             continue
         }
 
-        Write-Host "Workspace REST auth: using KV='$kvUsed' tokenSecret='$tokenSecretUsed'" -ForegroundColor DarkGreen
+        Write-Host "Workspace REST auth: KV='$kvUsed' secret='$tokenSecretUsed' (PAT=dapi*)" -ForegroundColor Green
 
-        # -------- UC probe: metastore attachment (THIS tells you why catalogs/external-locs are empty) --------
+        # -------- UC probe: metastore attachment --------
         $ms = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/metastore" -PatToken $patToken
         if ($ms) {
             $ucProbe += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 WorkspaceName    = $wsName
                 WorkspaceUrl     = $wsUrl
+                Status           = 'OK'
                 UcMetastoreId    = $ms.metastore_id
                 UcMetastoreName  = $ms.metastore_name
                 DefaultCatalog    = $ms.default_catalog_name
-                Status           = 'OK'
                 Note             = ''
             }
         } else {
@@ -313,12 +354,16 @@ foreach ($sub in $subs) {
                 SubscriptionName = $sub.Name
                 WorkspaceName    = $wsName
                 WorkspaceUrl     = $wsUrl
+                Status           = 'UC_NOT_ACCESSIBLE'
                 UcMetastoreId    = ''
                 UcMetastoreName  = ''
                 DefaultCatalog    = ''
-                Status           = 'ERROR'
-                Note             = ("UC metastore probe failed. " + $script:LastDbxError)
+                Note             = $script:LastDbxError
             }
+
+            # If UC is not accessible, don't attempt catalogs/external locations for this workspace
+            # (prevents misleading “empty”)
+            # Still allow warehouses (SQL) to run
         }
 
         # -------- SQL Warehouses --------
@@ -386,44 +431,9 @@ foreach ($sub in $subs) {
             }
         }
 
-        # -------- Unity Catalog: Catalogs + Permissions --------
-        $cats = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/catalogs" -PatToken $patToken
-        if ($cats -and $cats.catalogs) {
-            foreach ($c in $cats.catalogs) {
-                $catRows += [pscustomobject]@{
-                    SubscriptionName = $sub.Name
-                    ResourceGroup    = $rg
-                    WorkspaceName    = $wsName
-                    CatalogName      = $c.name
-                    Owner            = $c.owner
-                    Comment          = $c.comment
-                    Note             = ''
-                }
-
-                $cp = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.1/unity-catalog/permissions/catalogs/{0}" -f $c.name) -PatToken $patToken
-                if ($cp -and $cp.privilege_assignments) {
-                    foreach ($pa in $cp.privilege_assignments) {
-                        $catPerms += [pscustomobject]@{
-                            SubscriptionName = $sub.Name
-                            WorkspaceName    = $wsName
-                            CatalogName      = $c.name
-                            PrincipalName    = $pa.principal
-                            Privileges       = ($pa.privileges -join ',')
-                            Note             = ''
-                        }
-                    }
-                } else {
-                    $catPerms += [pscustomobject]@{
-                        SubscriptionName = $sub.Name
-                        WorkspaceName    = $wsName
-                        CatalogName      = $c.name
-                        PrincipalName    = ''
-                        Privileges       = ''
-                        Note             = ("Catalog permission API blocked. " + $script:LastDbxError)
-                    }
-                }
-            }
-        } else {
+        # If UC probe failed, skip UC objects (catalogs/ext-locs)
+        $ucOk = $ucProbe | Where-Object { $_.SubscriptionName -eq $sub.Name -and $_.WorkspaceName -eq $wsName -and $_.Status -eq 'OK' } | Select-Object -First 1
+        if (-not $ucOk) {
             $catRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $rg
@@ -431,49 +441,8 @@ foreach ($sub in $subs) {
                 CatalogName      = ''
                 Owner            = ''
                 Comment          = ''
-                Note             = ("No catalogs OR UC API blocked. " + $script:LastDbxError)
+                Note             = 'Skipped UC calls because UC metastore not accessible (see _db_uc_metastore.csv)'
             }
-        }
-
-        # -------- Unity Catalog: External Locations + Permissions --------
-        $ext = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/external-locations" -PatToken $patToken
-        if ($ext -and $ext.external_locations) {
-            foreach ($l in $ext.external_locations) {
-                $extRows += [pscustomobject]@{
-                    SubscriptionName = $sub.Name
-                    ResourceGroup    = $rg
-                    WorkspaceName    = $wsName
-                    ExternalLocation = $l.name
-                    Url              = $l.url
-                    Owner            = $l.owner
-                    Comment          = $l.comment
-                    Note             = ''
-                }
-
-                $lp = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.1/unity-catalog/permissions/external-locations/{0}" -f $l.name) -PatToken $patToken
-                if ($lp -and $lp.privilege_assignments) {
-                    foreach ($pa in $lp.privilege_assignments) {
-                        $extPerms += [pscustomobject]@{
-                            SubscriptionName = $sub.Name
-                            WorkspaceName    = $wsName
-                            ExternalLocation = $l.name
-                            PrincipalName    = $pa.principal
-                            Privileges       = ($pa.privileges -join ',')
-                            Note             = ''
-                        }
-                    }
-                } else {
-                    $extPerms += [pscustomobject]@{
-                        SubscriptionName = $sub.Name
-                        WorkspaceName    = $wsName
-                        ExternalLocation = $l.name
-                        PrincipalName    = ''
-                        Privileges       = ''
-                        Note             = ("External location permission API blocked. " + $script:LastDbxError)
-                    }
-                }
-            }
-        } else {
             $extRows += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $rg
@@ -482,7 +451,107 @@ foreach ($sub in $subs) {
                 Url              = ''
                 Owner            = ''
                 Comment          = ''
-                Note             = ("No external locations OR UC API blocked. " + $script:LastDbxError)
+                Note             = 'Skipped UC calls because UC metastore not accessible (see _db_uc_metastore.csv)'
+            }
+        } else {
+            # -------- Unity Catalog: Catalogs + Permissions --------
+            $cats = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/catalogs" -PatToken $patToken
+            if ($cats -and $cats.catalogs) {
+                foreach ($c in $cats.catalogs) {
+                    $catRows += [pscustomobject]@{
+                        SubscriptionName = $sub.Name
+                        ResourceGroup    = $rg
+                        WorkspaceName    = $wsName
+                        CatalogName      = $c.name
+                        Owner            = $c.owner
+                        Comment          = $c.comment
+                        Note             = ''
+                    }
+
+                    $cp = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.1/unity-catalog/permissions/catalogs/{0}" -f $c.name) -PatToken $patToken
+                    if ($cp -and $cp.privilege_assignments) {
+                        foreach ($pa in $cp.privilege_assignments) {
+                            $catPerms += [pscustomobject]@{
+                                SubscriptionName = $sub.Name
+                                WorkspaceName    = $wsName
+                                CatalogName      = $c.name
+                                PrincipalName    = $pa.principal
+                                Privileges       = ($pa.privileges -join ',')
+                                Note             = ''
+                            }
+                        }
+                    } else {
+                        $catPerms += [pscustomobject]@{
+                            SubscriptionName = $sub.Name
+                            WorkspaceName    = $wsName
+                            CatalogName      = $c.name
+                            PrincipalName    = ''
+                            Privileges       = ''
+                            Note             = ("Catalog permission API blocked. " + $script:LastDbxError)
+                        }
+                    }
+                }
+            } else {
+                $catRows += [pscustomobject]@{
+                    SubscriptionName = $sub.Name
+                    ResourceGroup    = $rg
+                    WorkspaceName    = $wsName
+                    CatalogName      = ''
+                    Owner            = ''
+                    Comment          = ''
+                    Note             = ("No catalogs OR UC API blocked. " + $script:LastDbxError)
+                }
+            }
+
+            # -------- Unity Catalog: External Locations + Permissions --------
+            $ext = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/external-locations" -PatToken $patToken
+            if ($ext -and $ext.external_locations) {
+                foreach ($l in $ext.external_locations) {
+                    $extRows += [pscustomobject]@{
+                        SubscriptionName = $sub.Name
+                        ResourceGroup    = $rg
+                        WorkspaceName    = $wsName
+                        ExternalLocation = $l.name
+                        Url              = $l.url
+                        Owner            = $l.owner
+                        Comment          = $l.comment
+                        Note             = ''
+                    }
+
+                    $lp = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.1/unity-catalog/permissions/external-locations/{0}" -f $l.name) -PatToken $patToken
+                    if ($lp -and $lp.privilege_assignments) {
+                        foreach ($pa in $lp.privilege_assignments) {
+                            $extPerms += [pscustomobject]@{
+                                SubscriptionName = $sub.Name
+                                WorkspaceName    = $wsName
+                                ExternalLocation = $l.name
+                                PrincipalName    = $pa.principal
+                                Privileges       = ($pa.privileges -join ',')
+                                Note             = ''
+                            }
+                        }
+                    } else {
+                        $extPerms += [pscustomobject]@{
+                            SubscriptionName = $sub.Name
+                            WorkspaceName    = $wsName
+                            ExternalLocation = $l.name
+                            PrincipalName    = ''
+                            Privileges       = ''
+                            Note             = ("External location permission API blocked. " + $script:LastDbxError)
+                        }
+                    }
+                }
+            } else {
+                $extRows += [pscustomobject]@{
+                    SubscriptionName = $sub.Name
+                    ResourceGroup    = $rg
+                    WorkspaceName    = $wsName
+                    ExternalLocation = ''
+                    Url              = ''
+                    Owner            = ''
+                    Comment          = ''
+                    Note             = ("No external locations OR UC API blocked. " + $script:LastDbxError)
+                }
             }
         }
 
@@ -492,7 +561,7 @@ foreach ($sub in $subs) {
             WorkspaceUrl               = $wsUrl
             InfraKVUsed                = $kvUsed
             TokenSecretUsed            = $tokenSecretUsed
-            PatLooksLikeDatabricksPAT  = [bool]($patToken -like "dapi*")
+            PatLooksLikeDatabricksPAT  = (Test-DatabricksPat $patToken)
             GenSpnClientIdPresent      = [bool]$genSpnClientId
             GenSpnClientSecretPresent  = [bool]$genSpnClientSecret
             Note                       = ''
@@ -509,18 +578,14 @@ if ($RevokeRbacAfter -and $rbacToRevoke.Count -gt 0) {
 }
 
 # -------- Ensure not-empty outputs --------
-Ensure-AtLeastOneRow ([ref]$wsRows)  @{ SubscriptionName=''; SubscriptionId=''; ResourceGroup=''; WorkspaceName=''; Location=''; WorkspaceUrl=''; WorkspaceResourceId=''; Note='' }
-Ensure-AtLeastOneRow ([ref]$ucProbe) @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; UcMetastoreId=''; UcMetastoreName=''; DefaultCatalog=''; Status=''; Note='' }
-
-Ensure-AtLeastOneRow ([ref]$whRows)  @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; WarehouseId=''; WarehouseName=''; State=''; ClusterSize=''; Note='' }
-Ensure-AtLeastOneRow ([ref]$whPerms) @{ SubscriptionName=''; WorkspaceName=''; WarehouseName=''; WarehouseId=''; PrincipalType=''; PrincipalName=''; PermissionLevel=''; Inherited=''; Note='' }
-
+Ensure-AtLeastOneRow ([ref]$wsRows)   @{ SubscriptionName=''; SubscriptionId=''; ResourceGroup=''; WorkspaceName=''; Location=''; WorkspaceUrl=''; WorkspaceResourceId=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$ucProbe)  @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; Status=''; UcMetastoreId=''; UcMetastoreName=''; DefaultCatalog=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$whRows)   @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; WarehouseId=''; WarehouseName=''; State=''; ClusterSize=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$whPerms)  @{ SubscriptionName=''; WorkspaceName=''; WarehouseName=''; WarehouseId=''; PrincipalType=''; PrincipalName=''; PermissionLevel=''; Inherited=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$catRows)  @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; CatalogName=''; Owner=''; Comment=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$catPerms) @{ SubscriptionName=''; WorkspaceName=''; CatalogName=''; PrincipalName=''; Privileges=''; Note='' }
-
 Ensure-AtLeastOneRow ([ref]$extRows)  @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; ExternalLocation=''; Url=''; Owner=''; Comment=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$extPerms) @{ SubscriptionName=''; WorkspaceName=''; ExternalLocation=''; PrincipalName=''; Privileges=''; Note='' }
-
 Ensure-AtLeastOneRow ([ref]$notes)    @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed=''; PatLooksLikeDatabricksPAT=''; GenSpnClientIdPresent=''; GenSpnClientSecretPresent=''; Note='' }
 
 # -------- Output files (yyyyMMdd) --------
