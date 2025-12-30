@@ -1,12 +1,23 @@
-# Scan-ADLS-Acls.ps1
-# ADLS Gen2 ACL validator (WORKING + robust)
-# Fixes:
-#  - Works even when root ACL read needs Path "/"
-#  - Resolves identities reliably via Microsoft Graph (no Directory Readers role needed)
-#  - Accepts Identity as: DisplayName OR ObjectId GUID OR AppId(ClientId) GUID
-#  - Supports comma-separated identities in CSV
-#  - Checks: folder -> parents -> container root
-#  - Optional: restrict subscriptions via -SubscriptionIds (recommended)
+<#
+Scan-ADLS-Acls.ps1
+ADLS Gen2 ACL validator (works in ADO pipeline)
+
+Fixes included:
+- ✅ BranchName param is OPTIONAL (prevents "parameter cannot be found BranchName" error)
+- ✅ Subscription filtering is STRICT:
+     adh_subscription_type=prd    -> only subscriptions starting with "prd_" or "prd-"
+     adh_subscription_type=nonprd -> only subscriptions starting with "dev_" or "dev-"
+- ✅ Identity resolution does NOT require Directory Readers if Graph app-perms exist:
+     Uses Microsoft Graph client_credentials token (https://graph.microsoft.com/.default)
+     Then resolves Group/SPN displayName -> objectId
+     Accepts GUIDs directly (objectId OR appId -> converts appId->objectId using Graph)
+- ✅ Checks ACLs on folder + parents + container root
+- ✅ Supports comma-separated Identity list in CSV
+- ✅ Writes CSV output always (adds NO_RESULTS row if nothing)
+
+CSV columns expected (minimum):
+ResourceGroupName, StorageAccountName, ContainerName, AccessPath, Identity, PermissionType
+#>
 
 [CmdletBinding()]
 param(
@@ -23,16 +34,15 @@ param(
     [Parameter(Mandatory = $true)][string]$InputCsvPath,
     [Parameter(Mandatory = $true)][string]$OutputDir,
 
-    # OPTIONAL: Comma-separated subscription IDs to scan (best way to avoid “first subscription selected” issues)
-    [string]$SubscriptionIds = '',
-
-    # OPTIONAL: kept for pipeline compatibility; not required for logic
+    # Keep OPTIONAL to avoid pipeline error
     [string]$BranchName = '',
+
+    # Optional: force exact sub(s) if you ever need it (comma-separated subscriptionIds)
+    [string]$SubscriptionIds = '',
 
     [switch]$DebugAcls
 )
 
-# ---------------- Modules ----------------
 Import-Module Az.Accounts, Az.Resources, Az.Storage -ErrorAction Stop
 
 # ---------------- Helpers ----------------
@@ -41,18 +51,52 @@ function Ensure-Dir([string]$Path) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
 }
+
 function Write-CsvSafe {
     param([Parameter(Mandatory)][object[]]$Rows,[Parameter(Mandatory)][string]$Path)
     Ensure-Dir -Path (Split-Path -Parent $Path)
     $Rows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $Path -Force
 }
+
 function Connect-ScAz {
     param([string]$TenantId,[string]$ClientId,[string]$ClientSecret)
     $sec  = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
     $cred = New-Object System.Management.Automation.PSCredential($ClientId, $sec)
     Connect-AzAccount -ServicePrincipal -Tenant $TenantId -Credential $cred -ErrorAction Stop | Out-Null
 }
+
 function Set-ScContext { param($Subscription) Set-AzContext -SubscriptionId $Subscription.Id -ErrorAction Stop | Out-Null }
+
+# STRICT subscription selection by prefix (your requirement)
+function Resolve-Subscriptions {
+    param(
+        [ValidateSet('nonprd','prd')]$adh_subscription_type,
+        [string]$SubscriptionIds = ''
+    )
+
+    $all = Get-AzSubscription -ErrorAction Stop
+
+    if (-not [string]::IsNullOrWhiteSpace($SubscriptionIds)) {
+        $wanted = $SubscriptionIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        $subs = $all | Where-Object { $wanted -contains $_.Id }
+        if (-not $subs -or $subs.Count -eq 0) { throw "No matching subscriptions found for SubscriptionIds: $SubscriptionIds" }
+        return $subs
+    }
+
+    if ($adh_subscription_type -eq 'prd') {
+        $subs = $all | Where-Object { $_.Name -match '^(?i)prd[_-]' }
+        if (-not $subs -or $subs.Count -eq 0) {
+            throw "No subscriptions found with prefix 'prd_' or 'prd-' for adh_subscription_type=prd"
+        }
+        return $subs
+    } else {
+        $subs = $all | Where-Object { $_.Name -match '^(?i)dev[_-]' }
+        if (-not $subs -or $subs.Count -eq 0) {
+            throw "No subscriptions found with prefix 'dev_' or 'dev-' for adh_subscription_type=nonprd"
+        }
+        return $subs
+    }
+}
 
 function Perm-Ok {
     param([string]$acePerm, [string]$permType)
@@ -64,155 +108,26 @@ function Perm-Ok {
     }
 }
 
-function Normalize-PathForGen2([string]$p) {
-    if ([string]::IsNullOrWhiteSpace($p) -or $p -eq '/') { return '' }
-    $p = $p.Trim()
-    $p = $p -replace '\\','/'         # backslash -> slash
-    $p = $p.TrimStart('/')            # Gen2 expects no leading /
-    $p = $p -replace '//+','/'        # collapse //
-    return $p
-}
-
 function Get-PathsToCheck {
-    param([string]$NormalizedPath) # '' => root
-    if ([string]::IsNullOrWhiteSpace($NormalizedPath)) { return @('') }
+    param([string]$NormalizedPath)
 
-    $p = Normalize-PathForGen2 $NormalizedPath
-    if ($p -eq '') { return @('') }
+    # '' means root (container)
+    if ([string]::IsNullOrWhiteSpace($NormalizedPath) -or $NormalizedPath -eq '/') {
+        return @('')  # root only
+    }
 
+    $p = $NormalizedPath.Trim().TrimStart('/') -replace '//+','/'
     $parts = $p.Split('/', [System.StringSplitOptions]::RemoveEmptyEntries)
-    $paths = New-Object System.Collections.Generic.List[string]
 
+    # Build path list from deepest -> parents -> root
+    $paths = New-Object System.Collections.Generic.List[string]
     for ($i = $parts.Length; $i -ge 1; $i--) {
         $paths.Add( ($parts[0..($i-1)] -join '/') )
     }
-    $paths.Add('')  # root last
+    $paths.Add('') # root at end
     return $paths.ToArray()
 }
 
-# ---------------- Microsoft Graph token + GET ----------------
-function Get-GraphToken {
-    param([string]$TenantId,[string]$ClientId,[string]$ClientSecret)
-    $body = @{
-        client_id     = $ClientId
-        client_secret = $ClientSecret
-        grant_type    = 'client_credentials'
-        scope         = 'https://graph.microsoft.com/.default'
-    }
-    $resp = Invoke-RestMethod -Method Post `
-        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-        -Body $body -ContentType 'application/x-www-form-urlencoded'
-    return $resp.access_token
-}
-
-function Invoke-GraphGet {
-    param([string]$Token,[string]$Uri)
-    $headers = @{ Authorization = "Bearer $Token" }
-    return Invoke-RestMethod -Method Get -Uri $Uri -Headers $headers
-}
-
-function Escape-OData([string]$s) {
-    # OData string literal escape: single quote doubled
-    return $s.Replace("'", "''")
-}
-
-# ---------------- Identity resolver ----------------
-$script:IdentityCache = @{}
-$script:GraphToken = $null
-
-function Resolve-IdentityObjectId {
-    param([Parameter(Mandatory)][string]$Identity)
-
-    $Identity = $Identity.Trim()
-    if ([string]::IsNullOrWhiteSpace($Identity)) { return $null }
-
-    if ($script:IdentityCache.ContainsKey($Identity)) { return $script:IdentityCache[$Identity] }
-
-    $guidRef = [ref]([Guid]::Empty)
-
-    # If GUID provided: could be ObjectId OR AppId.
-    if ([Guid]::TryParse($Identity, $guidRef)) {
-
-        # 1) If Graph available, try treat GUID as appId -> get SP objectId
-        if ($script:GraphToken) {
-            try {
-                $uri = "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$Identity'&`$select=id,appId"
-                $sp = Invoke-GraphGet -Token $script:GraphToken -Uri $uri
-                if ($sp.value.Count -eq 1) {
-                    $script:IdentityCache[$Identity] = $sp.value[0].id
-                    return $sp.value[0].id
-                }
-            } catch { }
-        }
-
-        # 2) Otherwise assume it is already objectId (this matches ADLS EntityId format)
-        $script:IdentityCache[$Identity] = $Identity
-        return $Identity
-    }
-
-    # Name resolution via Graph (preferred)
-    if ($script:GraphToken) {
-
-        # Exact displayName match - Service Principals
-        try {
-            $nameEsc = Escape-OData $Identity
-            $uri = "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=displayName eq '$nameEsc'&`$select=id,displayName"
-            $sp = Invoke-GraphGet -Token $script:GraphToken -Uri $uri
-            if ($sp.value.Count -eq 1) {
-                $script:IdentityCache[$Identity] = $sp.value[0].id
-                return $sp.value[0].id
-            }
-        } catch { }
-
-        # Exact displayName match - Groups
-        try {
-            $nameEsc = Escape-OData $Identity
-            $uri = "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$nameEsc'&`$select=id,displayName"
-            $g = Invoke-GraphGet -Token $script:GraphToken -Uri $uri
-            if ($g.value.Count -eq 1) {
-                $script:IdentityCache[$Identity] = $g.value[0].id
-                return $g.value[0].id
-            }
-        } catch { }
-
-        # Fallback: startswith (works without $search headers/consistencyLevel)
-        try {
-            $nameEsc = Escape-OData $Identity
-            $uri = "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=startsWith(displayName,'$nameEsc')&`$select=id,displayName"
-            $sp2 = Invoke-GraphGet -Token $script:GraphToken -Uri $uri
-            if ($sp2.value.Count -eq 1) {
-                $script:IdentityCache[$Identity] = $sp2.value[0].id
-                return $sp2.value[0].id
-            }
-        } catch { }
-
-        try {
-            $nameEsc = Escape-OData $Identity
-            $uri = "https://graph.microsoft.com/v1.0/groups?`$filter=startsWith(displayName,'$nameEsc')&`$select=id,displayName"
-            $g2 = Invoke-GraphGet -Token $script:GraphToken -Uri $uri
-            if ($g2.value.Count -eq 1) {
-                $script:IdentityCache[$Identity] = $g2.value[0].id
-                return $g2.value[0].id
-            }
-        } catch { }
-    }
-
-    # Fallback to AzAD (may fail if Entra read is blocked in your tenant)
-    $matches = @()
-    try { $matches += Get-AzADServicePrincipal -SearchString $Identity -ErrorAction SilentlyContinue } catch { }
-    try { $matches += Get-AzADGroup -SearchString $Identity -ErrorAction SilentlyContinue } catch { }
-
-    $matches = $matches | Sort-Object DisplayName -Unique
-    if ($matches.Count -eq 1) {
-        $script:IdentityCache[$Identity] = $matches[0].Id
-        return $matches[0].Id
-    }
-
-    $script:IdentityCache[$Identity] = $null
-    return $null
-}
-
-# ---------------- ACL reader (ROOT FIX) ----------------
 function Read-AclEntries {
     param(
         [Parameter(Mandatory)][string]$FileSystem,
@@ -220,42 +135,16 @@ function Read-AclEntries {
         [string]$Path
     )
 
+    $p = @{ FileSystem = $FileSystem; Context = $Context; ErrorAction = 'Stop' }
+    if ($Path -and $Path.Trim() -ne '') { $p['Path'] = $Path }
+
+    $item = Get-AzDataLakeGen2Item @p
+
     $entries = @()
+    if ($item.Acl)        { $entries += $item.Acl }
+    if ($item.DefaultAcl) { $entries += $item.DefaultAcl }
 
-    # IMPORTANT:
-    # Root ACL retrieval is inconsistent across Az.Storage versions.
-    # We try both: -Path '/' and “no -Path”, and also ''.
-    $pathNorm = Normalize-PathForGen2 $Path
-
-    $tryList = @()
-    if ($pathNorm -eq '') {
-        $tryList += '/'   # explicit root
-        $tryList += ''    # empty path
-        $tryList += $null # no Path parameter
-    } else {
-        $tryList += $pathNorm
-    }
-
-    $lastErr = $null
-
-    foreach ($pTry in $tryList) {
-        try {
-            $params = @{ FileSystem = $FileSystem; Context = $Context; ErrorAction = 'Stop' }
-            if ($null -ne $pTry) { $params['Path'] = $pTry }
-
-            $item = Get-AzDataLakeGen2Item @params
-
-            if ($item.Acl)        { $entries += $item.Acl }
-            if ($item.DefaultAcl) { $entries += $item.DefaultAcl }
-
-            return $entries
-        } catch {
-            $lastErr = $_
-            continue
-        }
-    }
-
-    throw $lastErr
+    return ,@($entries)  # ensure array
 }
 
 function Has-MatchingAce {
@@ -267,121 +156,217 @@ function Has-MatchingAce {
 
     foreach ($ace in $Entries) {
         if ($ace.AccessControlType -notin @('user','group')) { continue }
-        if (-not $ace.EntityId) { continue }
-        if ($ace.EntityId -ne $ObjectId) { continue }
-        if (Perm-Ok -acePerm $ace.Permissions.ToString() -permType $PermType) { return $true }
+
+        $acePerm = $ace.Permissions.ToString()
+        if (-not (Perm-Ok -acePerm $acePerm -permType $PermType)) { continue }
+
+        # Main match: EntityId == objectId
+        if ($ace.EntityId -and ($ace.EntityId -eq $ObjectId)) {
+            return $true
+        }
     }
     return $false
 }
 
-# ---------------- Normalize + validate inputs ----------------
+# ---------------- Graph token + identity lookup ----------------
+function Get-GraphToken {
+    param([string]$TenantId,[string]$ClientId,[string]$ClientSecret)
+
+    $body = @{
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        grant_type    = 'client_credentials'
+        scope         = 'https://graph.microsoft.com/.default'
+    }
+
+    $resp = Invoke-RestMethod -Method Post `
+        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+        -Body $body -ContentType 'application/x-www-form-urlencoded'
+
+    return $resp.access_token
+}
+
+function Invoke-GraphGet {
+    param([string]$Token,[string]$Uri)
+    $headers = @{ Authorization = "Bearer $Token" }
+    Invoke-RestMethod -Method Get -Uri $Uri -Headers $headers
+}
+
+function Escape-ODataString {
+    param([string]$s)
+    # OData filter strings need single quotes doubled.
+    return ($s -replace "'", "''")
+}
+
+# Returns objectId string or $null
+function Resolve-IdentityViaGraph {
+    param([string]$Token,[string]$Name)
+
+    $n = Escape-ODataString $Name
+
+    # 1) SPN exact displayName
+    try {
+        $u = "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=displayName eq '$n'&`$select=id,displayName"
+        $r = Invoke-GraphGet -Token $Token -Uri $u
+        if ($r.value.Count -eq 1) { return $r.value[0].id }
+    } catch {}
+
+    # 2) Group exact displayName
+    try {
+        $u = "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$n'&`$select=id,displayName"
+        $r = Invoke-GraphGet -Token $Token -Uri $u
+        if ($r.value.Count -eq 1) { return $r.value[0].id }
+    } catch {}
+
+    # 3) StartsWith fallback (helps when names have suffix/prefix)
+    try {
+        $u = "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=startsWith(displayName,'$n')&`$select=id,displayName"
+        $r = Invoke-GraphGet -Token $Token -Uri $u
+        if ($r.value.Count -eq 1) { return $r.value[0].id }
+    } catch {}
+
+    try {
+        $u = "https://graph.microsoft.com/v1.0/groups?`$filter=startsWith(displayName,'$n')&`$select=id,displayName"
+        $r = Invoke-GraphGet -Token $Token -Uri $u
+        if ($r.value.Count -eq 1) { return $r.value[0].id }
+    } catch {}
+
+    return $null
+}
+
+# Converts appId -> SP objectId (if GUID in CSV is appId)
+function Resolve-ServicePrincipalObjectIdFromAppId {
+    param([string]$Token,[string]$AppIdGuid)
+
+    try {
+        $u = "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$AppIdGuid'&`$select=id,appId"
+        $r = Invoke-GraphGet -Token $Token -Uri $u
+        if ($r.value.Count -eq 1) { return $r.value[0].id }
+    } catch {}
+    return $null
+}
+
+# ---------------- Normalize inputs ----------------
 if ($null -ne $adh_sub_group) { $adh_sub_group = $adh_sub_group.Trim() }
 if ([string]::IsNullOrWhiteSpace($adh_sub_group)) { $adh_sub_group = '' }
 
 Ensure-Dir -Path $OutputDir | Out-Null
 if (-not (Test-Path -LiteralPath $InputCsvPath)) { throw "Input CSV not found: $InputCsvPath" }
 
-Write-Host "DEBUG: BranchName          = $BranchName"
-Write-Host "DEBUG: SubscriptionIds     = $SubscriptionIds"
-Write-Host "DEBUG: TenantId            = $TenantId"
-Write-Host "DEBUG: ClientId            = $ClientId"
-Write-Host "DEBUG: adh_group           = $adh_group"
-Write-Host "DEBUG: adh_sub_group       = '$adh_sub_group'"
-Write-Host "DEBUG: adh_subscription_type = $adh_subscription_type"
-Write-Host "DEBUG: InputCsvPath        = $InputCsvPath"
-Write-Host "DEBUG: OutputDir           = $OutputDir"
+Write-Host "DEBUG: BranchName = '$BranchName'" -ForegroundColor DarkGray
 
 # ---------------- Connect Azure ----------------
 Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
 Write-Host "Authenticated to Azure." -ForegroundColor Green
 
-# ---------------- Graph token ----------------
+# ---------------- Graph token (for identity resolution) ----------------
+$graphToken = $null
 try {
-    $script:GraphToken = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
+    $graphToken = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
     Write-Host "Graph token acquired." -ForegroundColor Green
 } catch {
-    Write-Warning "Graph token NOT acquired. Identity resolution by name may fail. Error: $($_.Exception.Message)"
-    $script:GraphToken = $null
+    Write-Warning "Could not acquire Graph token. Identity name resolution may fail. Error: $($_.Exception.Message)"
 }
 
-# ---------------- Custodian placeholder helpers ----------------
+# ---------------- Custodian placeholders ----------------
 $BaseCustodian = $adh_group
 $BaseCustLower = $adh_group.ToLower() -replace '_',''
 $CustIdentity  = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) { $adh_group } else { "${adh_group}_${adh_sub_group}" }
 
-# ---------------- Load CSV ----------------
-$rows = Import-Csv -LiteralPath $InputCsvPath
-Write-Host ("DEBUG: CSV rows loaded: {0}" -f $rows.Count)
+# ---------------- Identity cache ----------------
+$script:IdentityCache = @{}
 
-# ---------------- Subscriptions ----------------
-$subs = @()
+function Resolve-IdentityObjectId {
+    param([Parameter(Mandatory)][string]$IdentityName)
 
-if (-not [string]::IsNullOrWhiteSpace($SubscriptionIds)) {
-    $wanted = $SubscriptionIds.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-    $all = Get-AzSubscription -ErrorAction Stop
-    $subs = $all | Where-Object { $wanted -contains $_.Id }
-    if (-not $subs -or $subs.Count -eq 0) { throw "No matching subscriptions found for SubscriptionIds: $SubscriptionIds" }
-} else {
-    # Best-effort selection
-    $all = Get-AzSubscription -ErrorAction Stop
-    $byGroup = $all | Where-Object { $_.Name -match [regex]::Escape($adh_group) }
-    $subs = if ($byGroup) { $byGroup } else { $all }
+    if ($script:IdentityCache.ContainsKey($IdentityName)) { return $script:IdentityCache[$IdentityName] }
 
-    if ($adh_subscription_type -eq 'prd') {
-        $envFiltered = $subs | Where-Object { $_.Name -match '(?i)\b(prd|prod|production)\b' }
-    } else {
-        $envFiltered = $subs | Where-Object { $_.Name -match '(?i)\b(nonprd|non-prd|dev|tst|test|qa|uat)\b' }
+    $IdentityName = $IdentityName.Trim()
+    $id = $null
+
+    # GUID? could be objectId OR appId
+    $guidRef = [ref]([Guid]::Empty)
+    if ([Guid]::TryParse($IdentityName, $guidRef)) {
+        # If Graph is available, try to treat this GUID as appId and map to objectId
+        if ($graphToken) {
+            $maybeObjId = Resolve-ServicePrincipalObjectIdFromAppId -Token $graphToken -AppIdGuid $IdentityName
+            if ($maybeObjId) {
+                $script:IdentityCache[$IdentityName] = $maybeObjId
+                return $maybeObjId
+            }
+        }
+        # Otherwise accept GUID as objectId
+        $script:IdentityCache[$IdentityName] = $IdentityName
+        return $IdentityName
     }
-    if ($envFiltered) { $subs = $envFiltered }
+
+    # Prefer Graph resolution (doesn't need Directory Readers role if app perms exist)
+    if ($graphToken) {
+        $id = Resolve-IdentityViaGraph -Token $graphToken -Name $IdentityName
+        if ($id) {
+            $script:IdentityCache[$IdentityName] = $id
+            return $id
+        }
+    }
+
+    # Fallback AzAD (may fail without Entra read permissions)
+    try { $g = Get-AzADGroup -DisplayName $IdentityName -ErrorAction Stop; if ($g.Id) { $id = $g.Id } } catch {}
+    if (-not $id) {
+        try { $sp = Get-AzADServicePrincipal -DisplayName $IdentityName -ErrorAction Stop; if ($sp.Id) { $id = $sp.Id } } catch {}
+    }
+    if (-not $id) {
+        try {
+            $sp2 = Get-AzADServicePrincipal -SearchString $IdentityName -ErrorAction Stop
+            if ($sp2 -and $sp2.Count -ge 1) { $id = $sp2[0].Id }
+        } catch {}
+    }
+
+    $script:IdentityCache[$IdentityName] = $id
+    return $id
 }
 
-Write-Host "DEBUG: Subscriptions selected = $($subs.Name -join ', ')"
+# ---------------- Load CSV ----------------
+$rows = Import-Csv -LiteralPath $InputCsvPath
+Write-Host ("DEBUG: CSV rows loaded: {0}" -f $rows.Count) -ForegroundColor DarkGray
+if ($rows.Count -gt 0) {
+    Write-Host ("DEBUG: CSV headers: " + ($rows[0].psobject.Properties.Name -join ', ')) -ForegroundColor DarkGray
+}
 
-# ---------------- Main ----------------
+# ---------------- Subscriptions (STRICT) ----------------
+$subs = Resolve-Subscriptions -adh_subscription_type $adh_subscription_type -SubscriptionIds $SubscriptionIds
+Write-Host "DEBUG: Subscriptions selected = $($subs.Name -join ', ')" -ForegroundColor Cyan
+
 $out = @()
 
 foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
     Write-Host ""
-    Write-Host "=== Subscription: $($sub.Name) ($($sub.Id)) ===" -ForegroundColor Cyan
+    Write-Host "=== Subscription: $($sub.Name) ===" -ForegroundColor Cyan
 
     foreach ($r in $rows) {
 
-        # ---- placeholders ----
+        # Placeholders
         $rgName = ($r.ResourceGroupName -replace '<Custodian>', $BaseCustodian).Trim()
 
         $saName = ($r.StorageAccountName -replace '<Custodian>', $BaseCustodian)
         $saName = ($saName -replace '<Cust>', $BaseCustLower).Trim()
 
-        $cont  = ($r.ContainerName -replace '<Custodian>', $BaseCustodian)
-        $cont  = ($cont -replace '<Cust>', $BaseCustLower).Trim()
+        $cont = ($r.ContainerName -replace '<Custodian>', $BaseCustodian)
+        $cont = ($cont -replace '<Cust>', $BaseCustLower).Trim()
 
-        # Identity: allow comma-separated
-        $identities = @()
-        if ($r.Identity) {
-            $identities = $r.Identity.Split(',') |
-                ForEach-Object { ($_ -replace '<Custodian>', $CustIdentity).Trim() } |
-                Where-Object { $_ }
-        }
-
-        # env filter (optional naming convention)
-        if ($adh_subscription_type -eq 'prd') {
-            if ($saName -match 'adlsnonprd$') { continue }
-        } else {
-            if ($saName -match 'adlsprd$') { continue }
-        }
-
-        # ---- AccessPath normalization + catalog rewrite ----
+        # AccessPath normalize
         $accessPath = ($r.AccessPath -replace '<Custodian>', $BaseCustodian)
         $accessPath = ($accessPath -replace '<Cust>', $BaseCustLower).Trim()
 
+        # If CSV uses /catalog... rewrite to /adh_<group>...
         if ($accessPath -like '/catalog*') {
             $suffix = $accessPath.Substring('/catalog'.Length)
-            $gLower = $adh_group.ToLower()
+            $groupLower = $adh_group.ToLower()
+
             if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
-                $accessPath = "/adh_${gLower}${suffix}"
+                $accessPath = "/adh_${groupLower}${suffix}"
             } else {
-                $accessPath = "/adh_${gLower}_$($adh_sub_group.ToLower())${suffix}"
+                $accessPath = "/adh_${groupLower}_$($adh_sub_group.ToLower())${suffix}"
             }
         }
 
@@ -389,13 +374,29 @@ foreach ($sub in $subs) {
         if ($normalizedPath -eq '/') { $normalizedPath = '' }
         $folderForReport = if ([string]::IsNullOrWhiteSpace($normalizedPath)) { '/' } else { $normalizedPath }
 
-        # Validate basics
-        if ([string]::IsNullOrWhiteSpace($rgName) -or [string]::IsNullOrWhiteSpace($saName) -or [string]::IsNullOrWhiteSpace($cont)) {
-            foreach ($iden in ($identities | ForEach-Object { $_ } )) {
+        # Identity list: support comma-separated identities in one row
+        $identities = @()
+        if ($r.Identity) {
+            $identities = $r.Identity.Split(',') |
+                ForEach-Object { ($_ -replace '<Custodian>', $CustIdentity).Trim() } |
+                Where-Object { $_ }
+        }
+
+        if (-not $identities -or $identities.Count -eq 0) {
+            $out += [pscustomobject]@{
+                SubscriptionName=$sub.Name; ResourceGroup=$rgName; Storage=$saName; Container=$cont; Folder=$folderForReport
+                Identity=''; Permission=$r.PermissionType; Status='ERROR'
+                Notes="Identity column empty in CSV row."
+            }
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($rgName) -or [string]::IsNullOrWhiteSpace($saName)) {
+            foreach ($iden in $identities) {
                 $out += [pscustomobject]@{
                     SubscriptionName=$sub.Name; ResourceGroup=$rgName; Storage=$saName; Container=$cont; Folder=$folderForReport
                     Identity=$iden; Permission=$r.PermissionType; Status='ERROR'
-                    Notes='Missing RG/Storage/Container after placeholder replacement.'
+                    Notes="After placeholder replacement, RG or Storage is empty."
                 }
             }
             continue
@@ -430,18 +431,20 @@ foreach ($sub in $subs) {
             continue
         }
 
+        # ACL validation per identity
         $permType = $r.PermissionType
         $pathsToCheck = Get-PathsToCheck -NormalizedPath $normalizedPath
 
         foreach ($iden in $identities) {
 
-            $objectId = Resolve-IdentityObjectId -Identity $iden
+            $objectId = Resolve-IdentityObjectId -IdentityName $iden
 
             if (-not $objectId) {
                 $out += [pscustomobject]@{
                     SubscriptionName=$sub.Name; ResourceGroup=$rgName; Storage=$saName; Container=$cont; Folder=$folderForReport
-                    Identity=$iden; Permission=$permType; Status='UNRESOLVED_IDENTITY'
-                    Notes="Cannot resolve '$iden' to Entra objectId. Put GUID objectId/appId in CSV, or fix Graph app-permissions + admin consent."
+                    Identity=$iden; Permission=$permType
+                    Status='UNRESOLVED_IDENTITY'
+                    Notes="Cannot resolve '$iden' to Entra objectId. (Graph/AzAD lookup failed). Prefer using GUID objectId/appId in CSV."
                 }
                 continue
             }
@@ -452,25 +455,25 @@ foreach ($sub in $subs) {
                     $entries = Read-AclEntries -FileSystem $cont -Context $ctx -Path $p
 
                     if ($DebugAcls) {
-                        $disp = if ([string]::IsNullOrWhiteSpace($p)) { "/" } else { "/$p" }
-                        Write-Host "DEBUG ACLs for '$disp': entries=$($entries.Count)" -ForegroundColor DarkGray
+                        $disp = if ($p -and $p.Trim() -ne '') { "/$p" } else { "/" }
+                        Write-Host "DEBUG ACLs for '$disp' (Identity=$iden ObjectId=$objectId Perm=$permType):" -ForegroundColor DarkGray
                         foreach ($ace in $entries) {
                             Write-Host ("ACE => Type={0} EntityId={1} Perm={2}" -f $ace.AccessControlType, $ace.EntityId, $ace.Permissions) -ForegroundColor DarkGray
                         }
                     }
 
                     if (Has-MatchingAce -Entries $entries -ObjectId $objectId -PermType $permType) {
-                        $matchedAt = if ([string]::IsNullOrWhiteSpace($p)) { "/" } else { "/$p" }
+                        $matchedAt = if ($p -and $p.Trim() -ne '') { "/$p" } else { "/" }
                         break
                     }
                 }
 
                 if ($matchedAt) {
                     $status = 'OK'
-                    $notes  = "ACL requirement satisfied (matched at '$matchedAt')"
+                    $notes  = "ACL matched at '$matchedAt' (folder/parents/root checked)"
                 } else {
                     $status = 'MISSING'
-                    $notes  = "No matching ACL entry found on folder, parents, or container root"
+                    $notes  = "No matching ACE for objectId '$objectId' with perm '$permType' on folder/parents/root"
                 }
             } catch {
                 $status = 'ERROR'
@@ -492,6 +495,7 @@ foreach ($sub in $subs) {
     }
 }
 
+# Safety: always output something
 if (-not $out -or $out.Count -eq 0) {
     $out += [pscustomobject]@{
         SubscriptionName=''; ResourceGroup=''; Storage=''; Container=''; Folder=''
@@ -499,6 +503,7 @@ if (-not $out -or $out.Count -eq 0) {
     }
 }
 
+# Export
 $groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) { $adh_group } else { "${adh_group}-${adh_sub_group}" }
 $stamp  = Get-Date -Format 'yyyyMMdd'
 $csvOut = Join-Path $OutputDir ("adls_acl_{0}_{1}_{2}.csv" -f $groupForFile, $adh_subscription_type, $stamp)
