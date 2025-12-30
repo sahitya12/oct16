@@ -1,20 +1,4 @@
 # sanitychecks/scripts/Scan-Databricks-UC.ps1
-# FULL WORKING CODE
-# - Discovers Databricks workspaces in resolved subscriptions
-# - Fetches Databricks SPN PAT token from KV secret:
-#     SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION OR
-#     SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION
-# - Uses PAT to query:
-#     SQL Warehouses + permissions
-#     Unity Catalog metastore probe
-#     Catalogs + catalog permissions
-#     External locations + external location permissions
-# - Writes clear HTTP errors into CSV (no silent “empty output”)
-#
-# IMPORTANT: The SPN behind the PAT must be added to the workspace and have:
-#   - Workspace Admin (for permissions endpoints)
-#   - Metastore admin (for UC endpoints)
-#
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$TenantId,
@@ -40,35 +24,26 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 Ensure-Dir -Path $OutputDir | Out-Null
 
 # ---------------- Helpers ----------------
-function Normalize-Text([string]$s) {
-    if ($null -eq $s) { return '' }
-    return $s.Trim()
-}
+function Normalize-Text([string]$s) { if ($null -eq $s) { '' } else { $s.Trim() } }
 
-function Get-EnvList([string]$subType) {
-    if ($subType -eq 'prd') { return @('prd') }
-    return @('dev','tst','stg')
-}
+function Get-EnvList([string]$subType) { if ($subType -eq 'prd') { @('prd') } else { @('dev','tst','stg') } }
 
 function Build-InfraKvName([string]$group, [string]$subGroup, [string]$env) {
     if ([string]::IsNullOrWhiteSpace($subGroup)) {
-        return ("ADH-{0}-Infra-KV-{1}" -f $group.ToUpper(), $env)
+        "ADH-{0}-Infra-KV-{1}" -f $group.ToUpper(), $env
+    } else {
+        "ADH-{0}-{1}-Infra-KV-{2}" -f $group.ToUpper(), $subGroup.ToUpper(), $env
     }
-    return ("ADH-{0}-{1}-Infra-KV-{2}" -f $group.ToUpper(), $subGroup.ToUpper(), $env)
 }
 
 function Ensure-RbacRole {
-    param(
-        [Parameter(Mandatory)][string]$ObjectId,
-        [Parameter(Mandatory)][string]$Scope,
-        [Parameter(Mandatory)][string]$RoleName
-    )
+    param([Parameter(Mandatory)][string]$ObjectId,[Parameter(Mandatory)][string]$Scope,[Parameter(Mandatory)][string]$RoleName)
     try {
         $existing = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction SilentlyContinue
         if (-not $existing) {
             New-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction Stop | Out-Null
             Write-Host "RBAC: Assigned '$RoleName' on $Scope" -ForegroundColor Green
-            Start-Sleep -Seconds 20
+            Start-Sleep -Seconds 15
         }
     } catch {
         Write-Warning "RBAC: Failed assign '$RoleName' on $Scope : $($_.Exception.Message)"
@@ -76,44 +51,27 @@ function Ensure-RbacRole {
 }
 
 function Remove-RbacRole {
-    param(
-        [Parameter(Mandatory)][string]$ObjectId,
-        [Parameter(Mandatory)][string]$Scope,
-        [Parameter(Mandatory)][string]$RoleName
-    )
+    param([Parameter(Mandatory)][string]$ObjectId,[Parameter(Mandatory)][string]$Scope,[Parameter(Mandatory)][string]$RoleName)
     try {
         $assignments = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction SilentlyContinue
-        foreach ($a in @($assignments)) {
-            Remove-AzRoleAssignment -RoleAssignmentId $a.Id -ErrorAction SilentlyContinue
-        }
-        if ($assignments) {
-            Write-Host "RBAC: Revoked '$RoleName' on $Scope" -ForegroundColor DarkYellow
-        }
+        foreach ($a in @($assignments)) { Remove-AzRoleAssignment -RoleAssignmentId $a.Id -ErrorAction SilentlyContinue }
     } catch {
         Write-Warning "RBAC: Failed revoke '$RoleName' on $Scope : $($_.Exception.Message)"
     }
 }
 
 function Get-SecretSafe {
-    param(
-        [Parameter(Mandatory)][string]$VaultName,
-        [Parameter(Mandatory)][string]$SecretName
-    )
-    try {
-        (Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop).SecretValueText
-    } catch {
-        $null
-    }
+    param([Parameter(Mandatory)][string]$VaultName,[Parameter(Mandatory)][string]$SecretName)
+    try { (Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop).SecretValueText } catch { $null }
 }
 
-function Test-DatabricksPat {
-    param([string]$Token)
+function Test-DatabricksPat([string]$Token) {
     if ([string]::IsNullOrWhiteSpace($Token)) { return $false }
-    if ($Token.Length -lt 10) { return $false }
-    return $Token.StartsWith('dapi')
+    $t = $Token.Trim()
+    return ($t.Length -ge 10 -and $t.StartsWith('dapi'))
 }
 
-# Global last error from DBX REST (so we can write it into CSV)
+# Global last REST error
 $script:LastDbxError = ''
 
 function Invoke-DbRestPat {
@@ -126,11 +84,13 @@ function Invoke-DbRestPat {
     )
 
     $script:LastDbxError = ''
+    $tok = $PatToken.Trim()
 
-    $hostPart = $WorkspaceUrl -replace '^https://',''
+    # WorkspaceUrl sometimes is "adb-xxx.azuredatabricks.net"
+    $hostPart = ($WorkspaceUrl -replace '^https://','').Trim().TrimEnd('/')
     $uri = "https://$hostPart$Path"
 
-    $headers = @{ Authorization = "Bearer $PatToken" }
+    $headers = @{ Authorization = "Bearer $tok" }
 
     try {
         if ($Body) {
@@ -152,19 +112,15 @@ function Invoke-DbRestPat {
         $msg = "HTTP=$statusCode; $($_.Exception.Message)"
         if ($respBody) {
             $one = ($respBody -replace '\s+',' ')
-            $msg = $msg + " | BODY=" + $one.Substring(0,[Math]::Min(400,$one.Length))
+            $msg = $msg + " | BODY=" + $one.Substring(0,[Math]::Min(300,$one.Length))
         }
-
         $script:LastDbxError = $msg
-        Write-Warning ("DBX REST FAILED: {0} {1} :: {2}" -f $Method, $Path, $msg)
         return $null
     }
 }
 
 function Ensure-AtLeastOneRow([ref]$arr, [hashtable]$row) {
-    if (-not $arr.Value -or @($arr.Value).Count -eq 0) {
-        $arr.Value = @([pscustomobject]$row)
-    }
+    if (-not $arr.Value -or @($arr.Value).Count -eq 0) { $arr.Value = @([pscustomobject]$row) }
 }
 
 # ---------------- Start ----------------
@@ -174,9 +130,6 @@ Write-Host "INFO: adh_group             = $adh_group"
 Write-Host "INFO: adh_sub_group         = '$adh_sub_group'"
 Write-Host "INFO: adh_subscription_type = $adh_subscription_type"
 Write-Host "INFO: OutputDir             = $OutputDir"
-Write-Host "INFO: BranchName            = $BranchName"
-Write-Host "INFO: GrantRbac             = $GrantRbac"
-Write-Host "INFO: RevokeRbacAfter       = $RevokeRbacAfter"
 
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
@@ -191,10 +144,9 @@ Write-Host "INFO: Subscriptions = $(($subs | Select-Object -ExpandProperty Name)
 # SP object id (for KV RBAC assignment)
 $spObjectId = $null
 try {
-    $sp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
-    $spObjectId = $sp.Id
+    $spObjectId = (Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop).Id
 } catch {
-    Write-Warning "Unable to resolve SP object id from ClientId. RBAC grant may fail."
+    Write-Warning "Unable to resolve SP object id from ClientId. KV RBAC grant may fail."
 }
 
 $envs = Get-EnvList $adh_subscription_type
@@ -216,9 +168,33 @@ foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
     Write-Host "`n=== Databricks scan: $($sub.Name) ($($sub.Id)) ===" -ForegroundColor Cyan
 
-    $wsResources = Get-AzResource -ResourceType "Microsoft.Databricks/workspaces" -ExpandProperties -ErrorAction SilentlyContinue
+    # IMPORTANT: don't swallow errors here
+    $wsResources = $null
+    try {
+        $wsResources = Get-AzResource -ResourceType "Microsoft.Databricks/workspaces" -ExpandProperties -ErrorAction Stop
+    } catch {
+        $notes += [pscustomobject]@{
+            SubscriptionName = $sub.Name
+            WorkspaceName    = ''
+            WorkspaceUrl     = ''
+            InfraKVUsed      = ''
+            TokenSecretUsed  = ''
+            PatValid         = $false
+            Note             = "Get-AzResource(workspaces) FAILED: $($_.Exception.Message)"
+        }
+        continue
+    }
+
     if (-not $wsResources -or @($wsResources).Count -eq 0) {
-        Write-Warning "No Databricks workspaces in subscription $($sub.Name)"
+        $notes += [pscustomobject]@{
+            SubscriptionName = $sub.Name
+            WorkspaceName    = ''
+            WorkspaceUrl     = ''
+            InfraKVUsed      = ''
+            TokenSecretUsed  = ''
+            PatValid         = $false
+            Note             = "No Databricks workspaces found in this subscription (or no RBAC permission to list them)."
+        }
         continue
     }
 
@@ -230,26 +206,10 @@ foreach ($sub in $subs) {
 
         # workspaceUrl
         $wsUrl = $null
-        if ($ws.Properties.workspaceUrl) {
-            $wsUrl = $ws.Properties.workspaceUrl
-        } elseif ($ws.Properties.parameters.workspaceUrl.value) {
-            $wsUrl = $ws.Properties.parameters.workspaceUrl.value
-        }
-
-        if (-not $wsUrl) {
-            Write-Warning "WorkspaceUrl not found for $wsName; skipping REST."
-            $wsRows += [pscustomobject]@{
-                SubscriptionName    = $sub.Name
-                SubscriptionId      = $sub.Id
-                ResourceGroup       = $rg
-                WorkspaceName       = $wsName
-                Location            = $loc
-                WorkspaceUrl        = ''
-                WorkspaceResourceId = $wsId
-                Note                = 'workspaceUrl missing'
-            }
-            continue
-        }
+        try {
+            if ($ws.Properties.workspaceUrl) { $wsUrl = $ws.Properties.workspaceUrl }
+            elseif ($ws.Properties.parameters.workspaceUrl.value) { $wsUrl = $ws.Properties.parameters.workspaceUrl.value }
+        } catch {}
 
         $wsRows += [pscustomobject]@{
             SubscriptionName    = $sub.Name
@@ -257,9 +217,22 @@ foreach ($sub in $subs) {
             ResourceGroup       = $rg
             WorkspaceName       = $wsName
             Location            = $loc
-            WorkspaceUrl        = $wsUrl
+            WorkspaceUrl        = ($wsUrl ?? '')
             WorkspaceResourceId = $wsId
-            Note                = ''
+            Note                = (if ($wsUrl) { '' } else { 'workspaceUrl missing in ARM properties' })
+        }
+
+        if (-not $wsUrl) {
+            $notes += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                WorkspaceName    = $wsName
+                WorkspaceUrl     = ''
+                InfraKVUsed      = ''
+                TokenSecretUsed  = ''
+                PatValid         = $false
+                Note             = "Skipping REST: workspaceUrl not available from ARM for this workspace."
+            }
+            continue
         }
 
         # -------- determine env for KV lookup --------
@@ -274,14 +247,14 @@ foreach ($sub in $subs) {
         $patToken = $null
         $kvUsed   = $null
         $tokenSecretUsed = $null
-        $genSpnClientId = $null
-        $genSpnClientSecret = $null
 
         foreach ($env in $candidateEnvs) {
             $kvName = Build-InfraKvName -group $adh_group -subGroup $adh_sub_group -env $env
 
-            $kvRes = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" -Name $kvName -ErrorAction SilentlyContinue
-            if (-not $kvRes) { continue }
+            $kvRes = $null
+            try {
+                $kvRes = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" -Name $kvName -ErrorAction Stop
+            } catch { continue }
 
             $kvScope = $kvRes.ResourceId
 
@@ -292,7 +265,7 @@ foreach ($sub in $subs) {
                 }
             }
 
-            # REQUIRED: PAT must come from either of the two secrets
+            # MUST use PAT from either of these secrets
             $candidateSecrets = @(
                 "SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION",
                 "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
@@ -300,43 +273,32 @@ foreach ($sub in $subs) {
 
             foreach ($sec in $candidateSecrets) {
                 $tmp = Get-SecretSafe -VaultName $kvName -SecretName $sec
+                if ($tmp) { $tmp = $tmp.Trim() }
                 if (Test-DatabricksPat $tmp) {
                     $patToken = $tmp
                     $tokenSecretUsed = $sec
+                    $kvUsed = $kvName
                     break
                 }
             }
 
-            # Optional: presence check only (for notes)
-            $genSpnClientId     = Get-SecretSafe -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientID"
-            $genSpnClientSecret = Get-SecretSafe -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientSecret"
-
-            if ($patToken) {
-                $kvUsed = $kvName
-                break
-            } else {
-                Write-Host "DEBUG: KV '$kvName' found but no VALID Databricks PAT in the two secrets." -ForegroundColor Yellow
-            }
+            if ($patToken) { break }
         }
 
         if (-not $patToken) {
             $notes += [pscustomobject]@{
-                SubscriptionName           = $sub.Name
-                WorkspaceName              = $wsName
-                WorkspaceUrl               = $wsUrl
-                InfraKVUsed                = ''
-                TokenSecretUsed            = ''
-                PatLooksLikeDatabricksPAT  = $false
-                GenSpnClientIdPresent      = $false
-                GenSpnClientSecretPresent  = $false
-                Note                       = "No VALID Databricks PAT found in KV secrets for env(s): $($candidateEnvs -join ', ')"
+                SubscriptionName = $sub.Name
+                WorkspaceName    = $wsName
+                WorkspaceUrl     = $wsUrl
+                InfraKVUsed      = ($kvUsed ?? '')
+                TokenSecretUsed  = ''
+                PatValid         = $false
+                Note             = "No VALID Databricks PAT found in KV secrets (must start with 'dapi'). Checked env(s): $($candidateEnvs -join ', ')"
             }
             continue
         }
 
-        Write-Host "Workspace REST auth: KV='$kvUsed' secret='$tokenSecretUsed' (PAT=dapi*)" -ForegroundColor Green
-
-        # -------- UC probe: metastore attachment --------
+        # ---------- UC probe ----------
         $ms = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/metastore" -PatToken $patToken
         if ($ms) {
             $ucProbe += [pscustomobject]@{
@@ -354,19 +316,15 @@ foreach ($sub in $subs) {
                 SubscriptionName = $sub.Name
                 WorkspaceName    = $wsName
                 WorkspaceUrl     = $wsUrl
-                Status           = 'UC_NOT_ACCESSIBLE'
+                Status           = 'ERROR'
                 UcMetastoreId    = ''
                 UcMetastoreName  = ''
                 DefaultCatalog    = ''
                 Note             = $script:LastDbxError
             }
-
-            # If UC is not accessible, don't attempt catalogs/external locations for this workspace
-            # (prevents misleading “empty”)
-            # Still allow warehouses (SQL) to run
         }
 
-        # -------- SQL Warehouses --------
+        # ---------- SQL Warehouses ----------
         $wh = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.0/sql/warehouses" -PatToken $patToken
         if ($wh -and $wh.warehouses) {
             foreach ($w in $wh.warehouses) {
@@ -414,7 +372,7 @@ foreach ($sub in $subs) {
                         PrincipalName    = ''
                         PermissionLevel  = ''
                         Inherited        = ''
-                        Note             = ("Warehouse permissions blocked. " + $script:LastDbxError)
+                        Note             = $script:LastDbxError
                     }
                 }
             }
@@ -427,34 +385,14 @@ foreach ($sub in $subs) {
                 WarehouseName    = ''
                 State            = ''
                 ClusterSize      = ''
-                Note             = ("No warehouses OR SQL API blocked. " + $script:LastDbxError)
+                Note             = $script:LastDbxError
             }
         }
 
-        # If UC probe failed, skip UC objects (catalogs/ext-locs)
-        $ucOk = $ucProbe | Where-Object { $_.SubscriptionName -eq $sub.Name -and $_.WorkspaceName -eq $wsName -and $_.Status -eq 'OK' } | Select-Object -First 1
-        if (-not $ucOk) {
-            $catRows += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rg
-                WorkspaceName    = $wsName
-                CatalogName      = ''
-                Owner            = ''
-                Comment          = ''
-                Note             = 'Skipped UC calls because UC metastore not accessible (see _db_uc_metastore.csv)'
-            }
-            $extRows += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rg
-                WorkspaceName    = $wsName
-                ExternalLocation = ''
-                Url              = ''
-                Owner            = ''
-                Comment          = ''
-                Note             = 'Skipped UC calls because UC metastore not accessible (see _db_uc_metastore.csv)'
-            }
-        } else {
-            # -------- Unity Catalog: Catalogs + Permissions --------
+        # ---------- UC objects only if metastore probe OK ----------
+        $ucIsOk = ($ucProbe | Where-Object { $_.SubscriptionName -eq $sub.Name -and $_.WorkspaceName -eq $wsName -and $_.Status -eq 'OK' } | Select-Object -First 1)
+
+        if ($ucIsOk) {
             $cats = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/catalogs" -PatToken $patToken
             if ($cats -and $cats.catalogs) {
                 foreach ($c in $cats.catalogs) {
@@ -487,7 +425,7 @@ foreach ($sub in $subs) {
                             CatalogName      = $c.name
                             PrincipalName    = ''
                             Privileges       = ''
-                            Note             = ("Catalog permission API blocked. " + $script:LastDbxError)
+                            Note             = $script:LastDbxError
                         }
                     }
                 }
@@ -499,11 +437,10 @@ foreach ($sub in $subs) {
                     CatalogName      = ''
                     Owner            = ''
                     Comment          = ''
-                    Note             = ("No catalogs OR UC API blocked. " + $script:LastDbxError)
+                    Note             = $script:LastDbxError
                 }
             }
 
-            # -------- Unity Catalog: External Locations + Permissions --------
             $ext = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/external-locations" -PatToken $patToken
             if ($ext -and $ext.external_locations) {
                 foreach ($l in $ext.external_locations) {
@@ -537,7 +474,7 @@ foreach ($sub in $subs) {
                             ExternalLocation = $l.name
                             PrincipalName    = ''
                             Privileges       = ''
-                            Note             = ("External location permission API blocked. " + $script:LastDbxError)
+                            Note             = $script:LastDbxError
                         }
                     }
                 }
@@ -550,34 +487,52 @@ foreach ($sub in $subs) {
                     Url              = ''
                     Owner            = ''
                     Comment          = ''
-                    Note             = ("No external locations OR UC API blocked. " + $script:LastDbxError)
+                    Note             = $script:LastDbxError
                 }
+            }
+        } else {
+            $catRows += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                ResourceGroup    = $rg
+                WorkspaceName    = $wsName
+                CatalogName      = ''
+                Owner            = ''
+                Comment          = ''
+                Note             = "Skipped: UC metastore not accessible. See _db_uc_metastore.csv"
+            }
+            $extRows += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                ResourceGroup    = $rg
+                WorkspaceName    = $wsName
+                ExternalLocation = ''
+                Url              = ''
+                Owner            = ''
+                Comment          = ''
+                Note             = "Skipped: UC metastore not accessible. See _db_uc_metastore.csv"
             }
         }
 
+        # Always log note per workspace (so you never get “all null” again)
         $notes += [pscustomobject]@{
-            SubscriptionName           = $sub.Name
-            WorkspaceName              = $wsName
-            WorkspaceUrl               = $wsUrl
-            InfraKVUsed                = $kvUsed
-            TokenSecretUsed            = $tokenSecretUsed
-            PatLooksLikeDatabricksPAT  = (Test-DatabricksPat $patToken)
-            GenSpnClientIdPresent      = [bool]$genSpnClientId
-            GenSpnClientSecretPresent  = [bool]$genSpnClientSecret
-            Note                       = ''
+            SubscriptionName = $sub.Name
+            WorkspaceName    = $wsName
+            WorkspaceUrl     = $wsUrl
+            InfraKVUsed      = $kvUsed
+            TokenSecretUsed  = $tokenSecretUsed
+            PatValid         = $true
+            Note             = ''
         }
     }
 }
 
-# -------- Revoke RBAC if requested --------
+# revoke temp RBAC
 if ($RevokeRbacAfter -and $rbacToRevoke.Count -gt 0) {
-    Write-Host "`nRevoking temporary RBAC..." -ForegroundColor Yellow
     foreach ($r in $rbacToRevoke) {
         Remove-RbacRole -ObjectId $r.ObjectId -Scope $r.Scope -RoleName $r.Role
     }
 }
 
-# -------- Ensure not-empty outputs --------
+# Ensure not-empty outputs
 Ensure-AtLeastOneRow ([ref]$wsRows)   @{ SubscriptionName=''; SubscriptionId=''; ResourceGroup=''; WorkspaceName=''; Location=''; WorkspaceUrl=''; WorkspaceResourceId=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$ucProbe)  @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; Status=''; UcMetastoreId=''; UcMetastoreName=''; DefaultCatalog=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$whRows)   @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; WarehouseId=''; WarehouseName=''; State=''; ClusterSize=''; Note='' }
@@ -586,9 +541,9 @@ Ensure-AtLeastOneRow ([ref]$catRows)  @{ SubscriptionName=''; ResourceGroup=''; 
 Ensure-AtLeastOneRow ([ref]$catPerms) @{ SubscriptionName=''; WorkspaceName=''; CatalogName=''; PrincipalName=''; Privileges=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$extRows)  @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; ExternalLocation=''; Url=''; Owner=''; Comment=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$extPerms) @{ SubscriptionName=''; WorkspaceName=''; ExternalLocation=''; PrincipalName=''; Privileges=''; Note='' }
-Ensure-AtLeastOneRow ([ref]$notes)    @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed=''; PatLooksLikeDatabricksPAT=''; GenSpnClientIdPresent=''; GenSpnClientSecretPresent=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$notes)    @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed=''; PatValid=''; Note='' }
 
-# -------- Output files (yyyyMMdd) --------
+# Output files
 $stamp = Get-Date -Format 'yyyyMMdd'
 $base  = "{0}_{1}_{2}" -f $adh_group, $adh_subscription_type, $stamp
 
