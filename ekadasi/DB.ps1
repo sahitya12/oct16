@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$TenantId,
-    [Parameter(Mandatory)][string]$ClientId,
+    [Parameter(Mandatory)][string]$ClientId,       # ADO login SPN (used for Az login)
     [Parameter(Mandatory)][string]$ClientSecret,
 
     [Parameter(Mandatory)][string]$adh_group,
@@ -27,7 +27,11 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 Ensure-Dir -Path $OutputDir | Out-Null
 
 function Normalize-Text([string]$s) { if ($null -eq $s) { '' } else { $s.Trim() } }
-function Get-EnvList([string]$subType) { if ($subType -eq 'prd') { @('prd') } else { @('dev','tst','stg') } }
+
+function Get-EnvList([string]$subType) {
+    if ($subType -eq 'prd') { return @('prd') }
+    return @('dev','tst','stg')
+}
 
 function Build-InfraKvName([string]$group, [string]$subGroup, [string]$env) {
     if ([string]::IsNullOrWhiteSpace($subGroup)) {
@@ -37,58 +41,38 @@ function Build-InfraKvName([string]$group, [string]$subGroup, [string]$env) {
 }
 
 function Get-SecretSafe([string]$VaultName, [string]$SecretName) {
-    try { (Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop).SecretValueText } catch { $null }
-}
-
-function Ensure-RbacRole([string]$ObjectId, [string]$Scope, [string]$RoleName) {
-    try {
-        $existing = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction SilentlyContinue
-        if (-not $existing) {
-            New-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope | Out-Null
-            Start-Sleep -Seconds 15
-        }
-    } catch {
-        Write-Warning "RBAC assign failed: $($_.Exception.Message)"
-    }
-}
-
-function Remove-RbacRole([string]$ObjectId, [string]$Scope, [string]$RoleName) {
-    try {
-        $assignments = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction SilentlyContinue
-        foreach ($a in @($assignments)) { Remove-AzRoleAssignment -RoleAssignmentId $a.Id -ErrorAction SilentlyContinue }
-    } catch {
-        Write-Warning "RBAC revoke failed: $($_.Exception.Message)"
-    }
+    try { (Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop).SecretValueText }
+    catch { $null }
 }
 
 function Test-DatabricksPat([string]$Token) {
     if ([string]::IsNullOrWhiteSpace($Token)) { return $false }
     $t = $Token.Trim()
-    return ($t.Length -ge 10 -and $t.StartsWith('dapi'))
+    return ($t.StartsWith('dapi') -and $t.Length -ge 20)
 }
+
+# Azure Databricks resource ID for AAD tokens
+$DatabricksResource = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
 $script:LastDbxError = ''
 
-function Invoke-DbRestPat {
+function Invoke-DbxRest {
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
         [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','PATCH','DELETE')][string]$Method,
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$PatToken,
+        [Parameter(Mandatory)][hashtable]$Headers,
         [string]$Body = $null
     )
-
     $script:LastDbxError = ''
-    $tok = $PatToken.Trim()
     $hostPart = ($WorkspaceUrl -replace '^https://','').Trim().TrimEnd('/')
     $uri = "https://$hostPart$Path"
-    $headers = @{ Authorization = "Bearer $tok" }
 
     try {
         if ($Body) {
-            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType 'application/json' -Body $Body
+            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $Headers -ContentType 'application/json' -Body $Body
         } else {
-            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers
+            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $Headers
         }
     } catch {
         $statusCode = $null
@@ -111,6 +95,29 @@ function Invoke-DbRestPat {
     }
 }
 
+function Get-AadTokenClientCreds {
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$ClientSecret,
+        [Parameter(Mandatory)][string]$Resource
+    )
+    # v1 endpoint (resource-based) works well for ADO/Windows agents
+    $uri = "https://login.microsoftonline.com/$TenantId/oauth2/token"
+    $body = @{
+        grant_type    = "client_credentials"
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        resource      = $Resource
+    }
+    try {
+        $resp = Invoke-RestMethod -Method Post -Uri $uri -Body $body -ContentType "application/x-www-form-urlencoded"
+        return $resp.access_token
+    } catch {
+        return $null
+    }
+}
+
 function Ensure-AtLeastOneRow([ref]$arr, [hashtable]$row) {
     if (-not $arr.Value -or @($arr.Value).Count -eq 0) { $arr.Value = @([pscustomobject]$row) }
 }
@@ -128,12 +135,7 @@ $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscript
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 if (-not $subs -or @($subs).Count -eq 0) { throw "No subscriptions resolved." }
 
-# resolve pipeline SP object id
-$spObjectId = $null
-try { $spObjectId = (Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop).Id } catch {}
-
 $envs = Get-EnvList $adh_subscription_type
-$rbacToRevoke = New-Object System.Collections.Generic.List[object]
 
 # Results
 $wsRows   = @()
@@ -155,9 +157,12 @@ foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
     Write-Host "`n=== Databricks scan: $($sub.Name) ($($sub.Id)) ==="
 
-    $wsResources = Get-AzResource -ResourceType "Microsoft.Databricks/workspaces" -ExpandProperties
+    $wsResources = Get-AzResource -ResourceType "Microsoft.Databricks/workspaces" -ExpandProperties -ErrorAction SilentlyContinue
     if (-not $wsResources -or @($wsResources).Count -eq 0) {
-        $notes += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed=''; PatValid=$false; Note="No workspaces found OR no permission to list." }
+        $notes += [pscustomobject]@{
+            SubscriptionName=$sub.Name; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed='';
+            AuthMode=''; AuthOk=$false; Note="No workspaces found OR no permission to list."
+        }
         continue
     }
 
@@ -172,36 +177,37 @@ foreach ($sub in $subs) {
         elseif ($ws.Properties.parameters.workspaceUrl.value) { $wsUrl = $ws.Properties.parameters.workspaceUrl.value }
 
         $wsRows += [pscustomobject]@{
-            SubscriptionName=$sub.Name; SubscriptionId=$sub.Id; ResourceGroup=$rg; WorkspaceName=$wsName; Location=$loc; WorkspaceUrl=($wsUrl ?? ''); WorkspaceResourceId=$wsId; Note=($wsUrl ? '' : 'workspaceUrl missing')
+            SubscriptionName=$sub.Name; SubscriptionId=$sub.Id; ResourceGroup=$rg; WorkspaceName=$wsName;
+            Location=$loc; WorkspaceUrl=($wsUrl ?? ''); WorkspaceResourceId=$wsId; Note=($wsUrl ? '' : 'workspaceUrl missing')
         }
 
         if (-not $wsUrl) {
-            $notes += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed=''; PatValid=$false; Note="Skipping REST: workspaceUrl missing." }
+            $notes += [pscustomobject]@{
+                SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl='';
+                InfraKVUsed=''; TokenSecretUsed=''; AuthMode=''; AuthOk=$false; Note="Skipping REST: workspaceUrl missing."
+            }
             continue
         }
 
-        # env candidates for KV lookup
-        $candidateEnvs = @()
-        foreach ($e in $envs) {
-            if ($wsName -match ("-{0}$" -f [Regex]::Escape($e)) -or $wsName -match ("_{0}$" -f [Regex]::Escape($e))) { $candidateEnvs += $e }
+        # Build KV list (no guessing from workspace name -> always try all env KVs)
+        $kvList = foreach ($env in $envs) {
+            Build-InfraKvName -group $adh_group -subGroup $adh_sub_group -env $env
         }
-        if ($candidateEnvs.Count -eq 0) { $candidateEnvs = $envs }
 
         $patToken = $null
         $kvUsed = $null
         $tokenSecretUsed = $null
 
-        foreach ($env in $candidateEnvs) {
-            $kvName = Build-InfraKvName -group $adh_group -subGroup $adh_sub_group -env $env
-            $kvRes = $null
-            try { $kvRes = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" -Name $kvName -ErrorAction Stop } catch { continue }
+        $genSpnClientId = $null
+        $genSpnClientSecret = $null
 
-            if ($GrantRbac -and $spObjectId) {
-                Ensure-RbacRole -ObjectId $spObjectId -Scope $kvRes.ResourceId -RoleName "Key Vault Secrets User"
-                if ($RevokeRbacAfter) {
-                    $rbacToRevoke.Add([pscustomobject]@{ ObjectId=$spObjectId; Scope=$kvRes.ResourceId; Role="Key Vault Secrets User" })
-                }
-            }
+        foreach ($kvName in $kvList) {
+            $kvRes = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" -Name $kvName -ErrorAction SilentlyContinue
+            if (-not $kvRes) { continue }
+
+            # Read Gen SPN creds too (for fallback)
+            if (-not $genSpnClientId)     { $genSpnClientId     = Get-SecretSafe -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientID" }
+            if (-not $genSpnClientSecret) { $genSpnClientSecret = Get-SecretSafe -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientSecret" }
 
             foreach ($sec in $tokenSecrets) {
                 $tmp = Get-SecretSafe -VaultName $kvName -SecretName $sec
@@ -212,33 +218,76 @@ foreach ($sub in $subs) {
                     break
                 }
             }
-
             if ($patToken) { break }
         }
 
-        if (-not $patToken) {
+        $headers = $null
+        $authMode = ''
+        $authOk = $false
+        $authNote = ''
+
+        if ($patToken) {
+            $headers = @{ Authorization = "Bearer $patToken" }
+            $authMode = "PAT"
+            $authOk = $true
+        }
+        else {
+            # Fallback: AAD OAuth token using Gen SPN
+            if (-not [string]::IsNullOrWhiteSpace($genSpnClientId) -and -not [string]::IsNullOrWhiteSpace($genSpnClientSecret)) {
+                $aadToken = Get-AadTokenClientCreds -TenantId $TenantId -ClientId $genSpnClientId.Trim() -ClientSecret $genSpnClientSecret.Trim() -Resource $DatabricksResource
+                if ($aadToken) {
+                    $headers = @{ Authorization = "Bearer $aadToken" }
+                    $authMode = "AAD_SP"
+                    $authOk = $true
+                    $authNote = "Used Gen SPN OAuth (no dapi PAT in KV)."
+                } else {
+                    $authMode = "AAD_SP"
+                    $authOk = $false
+                    $authNote = "Gen SPN present but OAuth token fetch FAILED."
+                }
+            } else {
+                $authMode = ""
+                $authOk = $false
+                $authNote = "No dapi PAT in KV and Gen SPN secrets missing."
+            }
+        }
+
+        if (-not $authOk) {
             $notes += [pscustomobject]@{
-                SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl=$wsUrl; InfraKVUsed=''; TokenSecretUsed='';
-                PatValid=$false; Note="No VALID Databricks PAT found in KV. Must start with 'dapi'. Checked envs: $($candidateEnvs -join ', ')"
+                SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl=$wsUrl;
+                InfraKVUsed=($kvUsed ?? ''); TokenSecretUsed=($tokenSecretUsed ?? '');
+                AuthMode=$authMode; AuthOk=$false;
+                Note=("AUTH FAILED. " + $authNote + " | Checked KVs: " + ($kvList -join ', '))
             }
             continue
         }
 
-        # UC metastore probe
-        $ms = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/metastore" -PatToken $patToken
+        # --- UC Metastore probe (tells immediately if UC is attached / accessible)
+        $ms = Invoke-DbxRest -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/metastore" -Headers $headers
         if ($ms) {
-            $ucProbe += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl=$wsUrl; Status='OK'; UcMetastoreId=$ms.metastore_id; UcMetastoreName=$ms.metastore_name; DefaultCatalog=$ms.default_catalog_name; Note='' }
+            $ucProbe += [pscustomobject]@{
+                SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl=$wsUrl;
+                Status='OK'; UcMetastoreId=$ms.metastore_id; UcMetastoreName=$ms.metastore_name;
+                DefaultCatalog=$ms.default_catalog_name; Note=''
+            }
         } else {
-            $ucProbe += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl=$wsUrl; Status='ERROR'; UcMetastoreId=''; UcMetastoreName=''; DefaultCatalog=''; Note=$script:LastDbxError }
+            $ucProbe += [pscustomobject]@{
+                SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl=$wsUrl;
+                Status='ERROR'; UcMetastoreId=''; UcMetastoreName=''; DefaultCatalog='';
+                Note=$script:LastDbxError
+            }
         }
 
-        # SQL warehouses
-        $wh = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.0/sql/warehouses" -PatToken $patToken
+        # --- SQL Warehouses + permissions
+        $wh = Invoke-DbxRest -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.0/sql/warehouses" -Headers $headers
         if ($wh -and $wh.warehouses) {
             foreach ($w in $wh.warehouses) {
-                $whRows += [pscustomobject]@{ SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName; WarehouseId=$w.id; WarehouseName=$w.name; State=$w.state; ClusterSize=$w.cluster_size; Note='' }
-                $perm = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.0/permissions/warehouses/{0}" -f $w.id) -PatToken $patToken
+                $whRows += [pscustomobject]@{
+                    SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName;
+                    WarehouseId=$w.id; WarehouseName=$w.name; State=$w.state; ClusterSize=$w.cluster_size; Note=''
+                }
 
+                $perm = Invoke-DbxRest -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.0/permissions/warehouses/{0}" -f $w.id) -Headers $headers
                 if ($perm -and $perm.access_control_list) {
                     foreach ($ace in $perm.access_control_list) {
                         $ptype='unknown'; $pname=$null
@@ -247,66 +296,97 @@ foreach ($sub in $subs) {
                         elseif ($ace.service_principal_name) { $ptype='service_principal'; $pname=$ace.service_principal_name }
 
                         foreach ($p in @($ace.all_permissions)) {
-                            $whPerms += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=$wsName; WarehouseName=$w.name; WarehouseId=$w.id; PrincipalType=$ptype; PrincipalName=$pname; PermissionLevel=$p.permission_level; Inherited=$p.inherited; Note='' }
+                            $whPerms += [pscustomobject]@{
+                                SubscriptionName=$sub.Name; WorkspaceName=$wsName; WarehouseName=$w.name; WarehouseId=$w.id;
+                                PrincipalType=$ptype; PrincipalName=$pname; PermissionLevel=$p.permission_level; Inherited=$p.inherited; Note=''
+                            }
                         }
                     }
                 } else {
-                    $whPerms += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=$wsName; WarehouseName=$w.name; WarehouseId=$w.id; PrincipalType=''; PrincipalName=''; PermissionLevel=''; Inherited=''; Note=$script:LastDbxError }
+                    $whPerms += [pscustomobject]@{
+                        SubscriptionName=$sub.Name; WorkspaceName=$wsName; WarehouseName=$w.name; WarehouseId=$w.id;
+                        PrincipalType=''; PrincipalName=''; PermissionLevel=''; Inherited=''; Note=$script:LastDbxError
+                    }
                 }
             }
         } else {
-            $whRows += [pscustomobject]@{ SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName; WarehouseId=''; WarehouseName=''; State=''; ClusterSize=''; Note=$script:LastDbxError }
+            $whRows += [pscustomobject]@{
+                SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName;
+                WarehouseId=''; WarehouseName=''; State=''; ClusterSize=''; Note=$script:LastDbxError
+            }
         }
 
-        # UC catalogs + permissions
-        $cats = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/catalogs" -PatToken $patToken
+        # --- UC Catalogs + permissions
+        $cats = Invoke-DbxRest -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/catalogs" -Headers $headers
         if ($cats -and $cats.catalogs) {
             foreach ($c in $cats.catalogs) {
-                $catRows += [pscustomobject]@{ SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName; CatalogName=$c.name; Owner=$c.owner; Comment=$c.comment; Note='' }
+                $catRows += [pscustomobject]@{
+                    SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName; CatalogName=$c.name;
+                    Owner=$c.owner; Comment=$c.comment; Note=''
+                }
 
-                $cp = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.1/unity-catalog/permissions/catalogs/{0}" -f $c.name) -PatToken $patToken
+                $cp = Invoke-DbxRest -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.1/unity-catalog/permissions/catalogs/{0}" -f $c.name) -Headers $headers
                 if ($cp -and $cp.privilege_assignments) {
                     foreach ($pa in $cp.privilege_assignments) {
-                        $catPerms += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=$wsName; CatalogName=$c.name; PrincipalName=$pa.principal; Privileges=($pa.privileges -join ','); Note='' }
+                        $catPerms += [pscustomobject]@{
+                            SubscriptionName=$sub.Name; WorkspaceName=$wsName; CatalogName=$c.name;
+                            PrincipalName=$pa.principal; Privileges=($pa.privileges -join ','); Note=''
+                        }
                     }
                 } else {
-                    $catPerms += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=$wsName; CatalogName=$c.name; PrincipalName=''; Privileges=''; Note=$script:LastDbxError }
+                    $catPerms += [pscustomobject]@{
+                        SubscriptionName=$sub.Name; WorkspaceName=$wsName; CatalogName=$c.name;
+                        PrincipalName=''; Privileges=''; Note=$script:LastDbxError
+                    }
                 }
             }
         } else {
-            $catRows += [pscustomobject]@{ SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName; CatalogName=''; Owner=''; Comment=''; Note=$script:LastDbxError }
+            $catRows += [pscustomobject]@{
+                SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName;
+                CatalogName=''; Owner=''; Comment=''; Note=$script:LastDbxError
+            }
         }
 
-        # UC external locations + permissions
-        $ext = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/external-locations" -PatToken $patToken
+        # --- UC External locations + permissions
+        $ext = Invoke-DbxRest -WorkspaceUrl $wsUrl -Method GET -Path "/api/2.1/unity-catalog/external-locations" -Headers $headers
         if ($ext -and $ext.external_locations) {
             foreach ($l in $ext.external_locations) {
-                $extRows += [pscustomobject]@{ SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName; ExternalLocation=$l.name; Url=$l.url; Owner=$l.owner; Comment=$l.comment; Note='' }
+                $extRows += [pscustomobject]@{
+                    SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName;
+                    ExternalLocation=$l.name; Url=$l.url; Owner=$l.owner; Comment=$l.comment; Note=''
+                }
 
-                $lp = Invoke-DbRestPat -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.1/unity-catalog/permissions/external-locations/{0}" -f $l.name) -PatToken $patToken
+                $lp = Invoke-DbxRest -WorkspaceUrl $wsUrl -Method GET -Path ("/api/2.1/unity-catalog/permissions/external-locations/{0}" -f $l.name) -Headers $headers
                 if ($lp -and $lp.privilege_assignments) {
                     foreach ($pa in $lp.privilege_assignments) {
-                        $extPerms += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=$wsName; ExternalLocation=$l.name; PrincipalName=$pa.principal; Privileges=($pa.privileges -join ','); Note='' }
+                        $extPerms += [pscustomobject]@{
+                            SubscriptionName=$sub.Name; WorkspaceName=$wsName; ExternalLocation=$l.name;
+                            PrincipalName=$pa.principal; Privileges=($pa.privileges -join ','); Note=''
+                        }
                     }
                 } else {
-                    $extPerms += [pscustomobject]@{ SubscriptionName=$sub.Name; WorkspaceName=$wsName; ExternalLocation=$l.name; PrincipalName=''; Privileges=''; Note=$script:LastDbxError }
+                    $extPerms += [pscustomobject]@{
+                        SubscriptionName=$sub.Name; WorkspaceName=$wsName; ExternalLocation=$l.name;
+                        PrincipalName=''; Privileges=''; Note=$script:LastDbxError
+                    }
                 }
             }
         } else {
-            $extRows += [pscustomobject]@{ SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName; ExternalLocation=''; Url=''; Owner=''; Comment=''; Note=$script:LastDbxError }
+            $extRows += [pscustomobject]@{
+                SubscriptionName=$sub.Name; ResourceGroup=$rg; WorkspaceName=$wsName;
+                ExternalLocation=''; Url=''; Owner=''; Comment=''; Note=$script:LastDbxError
+            }
         }
 
         $notes += [pscustomobject]@{
-            SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl=$wsUrl; InfraKVUsed=$kvUsed; TokenSecretUsed=$tokenSecretUsed; PatValid=$true; Note=''
+            SubscriptionName=$sub.Name; WorkspaceName=$wsName; WorkspaceUrl=$wsUrl;
+            InfraKVUsed=($kvUsed ?? ''); TokenSecretUsed=($tokenSecretUsed ?? '');
+            AuthMode=$authMode; AuthOk=$true; Note=$authNote
         }
     }
 }
 
-if ($RevokeRbacAfter -and $rbacToRevoke.Count -gt 0) {
-    foreach ($r in $rbacToRevoke) { Remove-RbacRole -ObjectId $r.ObjectId -Scope $r.Scope -RoleName $r.Role }
-}
-
-# Ensure not-empty outputs
+# Ensure not-empty outputs (so artifacts always publish)
 Ensure-AtLeastOneRow ([ref]$wsRows)   @{ SubscriptionName=''; SubscriptionId=''; ResourceGroup=''; WorkspaceName=''; Location=''; WorkspaceUrl=''; WorkspaceResourceId=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$ucProbe)  @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; Status=''; UcMetastoreId=''; UcMetastoreName=''; DefaultCatalog=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$whRows)   @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; WarehouseId=''; WarehouseName=''; State=''; ClusterSize=''; Note='' }
@@ -315,8 +395,9 @@ Ensure-AtLeastOneRow ([ref]$catRows)  @{ SubscriptionName=''; ResourceGroup=''; 
 Ensure-AtLeastOneRow ([ref]$catPerms) @{ SubscriptionName=''; WorkspaceName=''; CatalogName=''; PrincipalName=''; Privileges=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$extRows)  @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; ExternalLocation=''; Url=''; Owner=''; Comment=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$extPerms) @{ SubscriptionName=''; WorkspaceName=''; ExternalLocation=''; PrincipalName=''; Privileges=''; Note='' }
-Ensure-AtLeastOneRow ([ref]$notes)    @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed=''; PatValid=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$notes)    @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed=''; AuthMode=''; AuthOk=''; Note='' }
 
+# Export
 $stamp = Get-Date -Format 'yyyyMMdd'
 $base  = "{0}_{1}_{2}" -f $adh_group, $adh_subscription_type, $stamp
 
