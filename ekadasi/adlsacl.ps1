@@ -63,9 +63,10 @@ try {
 
     # Remove toxic env vars that sometimes get set to 0000.. in pipelines
     foreach ($k in @('AZURE_SUBSCRIPTION_ID','ARM_SUBSCRIPTION_ID','AZURE_SUBSCRIPTION','ARM_SUBSCRIPTION')) {
-        if (Test-Path "env:$k") {
-            Write-Host "DEBUG: Removing env:$k (was '$($env:$k)')"
-            Remove-Item "env:$k" -ErrorAction SilentlyContinue
+        if (Test-Path -Path "env:$k") {
+            $oldVal = (Get-Item -Path "env:$k" -ErrorAction SilentlyContinue).Value
+            Write-Host "DEBUG: Removing env:$k (was '$oldVal')"
+            Remove-Item -Path "env:$k" -ErrorAction SilentlyContinue
         }
     }
 }
@@ -97,7 +98,12 @@ try {
         throw "SPN logged in but no subscriptions visible. Check RBAC scope (Subscription/Management Group)."
     }
 
-    Write-Host "DEBUG: Current context = $((Get-AzContext).Subscription.Name) / $((Get-AzContext).Subscription.Id)"
+    $ctx = Get-AzContext -ErrorAction Stop
+    if ($ctx -and $ctx.Subscription -and $ctx.Subscription.Id) {
+        Write-Host "DEBUG: Current context = $($ctx.Subscription.Name) / $($ctx.Subscription.Id)"
+    } else {
+        Write-Host "DEBUG: Current context = <none>"
+    }
 }
 catch {
     throw "Post-login subscription visibility/context setup failed: $($_.Exception.Message)"
@@ -316,7 +322,7 @@ foreach ($sub in $subs) {
         $ctx = $sa.Context
 
         try {
-            $container = Get-AzStorageContainer -Name $cont -Context $ctx -ErrorAction Stop
+            $null = Get-AzStorageContainer -Name $cont -Context $ctx -ErrorAction Stop
         } catch {
             $out += [pscustomobject]@{
                 SubscriptionName = $sub.Name
@@ -370,40 +376,30 @@ foreach ($sub in $subs) {
             $aclString = $item.Acl
             $permType  = $r.PermissionType
 
-            # 1) Check explicit ACL entries: user:<objectId>:rwx / group:<objectId>:r-x etc.
+            # Check explicit ACL entries
             $matchEntry = $aclString | Where-Object {
                 ($_ -like "*$objectId*") -and ($_ -like "*$permType*")
             }
 
-            # 2) Also treat Owner / Group of the item as a valid match
+            # Also treat Owner / Group of the item as a valid match
             $ownerMatch = $false
             $groupMatch = $false
 
             if ($item.Owner) {
-                if ($item.Owner -like "*$objectId*" -or $item.Owner -eq $iden) {
-                    $ownerMatch = $true
-                }
+                if ($item.Owner -like "*$objectId*" -or $item.Owner -eq $iden) { $ownerMatch = $true }
             }
             if ($item.Group) {
-                if ($item.Group -like "*$objectId*" -or $item.Group -eq $iden) {
-                    $groupMatch = $true
-                }
+                if ($item.Group -like "*$objectId*" -or $item.Group -eq $iden) { $groupMatch = $true }
             }
 
             $hasMatch = $matchEntry -or $ownerMatch -or $groupMatch
 
             $status = if ($hasMatch) { 'OK' } else { 'MISSING' }
-            if ($matchEntry) {
-                $notes = 'ACL contains required permission'
-            }
-            elseif ($ownerMatch -or $groupMatch) {
-                $notes = 'Identity matches Owner/Group with required permission mask'
-            }
-            else {
-                $notes = 'Permissions missing or mismatched'
-            }
-
-        } catch {
+            if ($matchEntry) { $notes = 'ACL contains required permission' }
+            elseif ($ownerMatch -or $groupMatch) { $notes = 'Identity matches Owner/Group with required permission mask' }
+            else { $notes = 'Permissions missing or mismatched' }
+        }
+        catch {
             $status = 'ERROR'
             $notes  = "ACL read error: $($_.Exception.Message)"
         }
@@ -442,12 +438,7 @@ if (-not $out -or $out.Count -eq 0) {
 # ----------------------------------------------------------------------
 # Export CSV + HTML (include adh_sub_group when present)
 # ----------------------------------------------------------------------
-$groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) {
-    $adh_group
-}
-else {
-    "${adh_group}-${adh_sub_group}"
-}
+$groupForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) { $adh_group } else { "${adh_group}-${adh_sub_group}" }
 
 $csvOut  = New-StampedPath -BaseDir $OutputDir -Prefix ("adls_validation_{0}_{1}" -f $groupForFile, $adh_subscription_type)
 Write-CsvSafe -Rows $out -Path $csvOut
