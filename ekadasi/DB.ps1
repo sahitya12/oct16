@@ -98,6 +98,13 @@ function Get-SecretVerbose {
     }
 }
 
+function Normalize-WorkspaceUrl([string]$u) {
+    if ([string]::IsNullOrWhiteSpace($u)) { return '' }
+    $u = $u.Trim().TrimEnd('/')
+    if ($u -notmatch '^https?://') { $u = "https://$u" }
+    return $u
+}
+
 # Global last error from DBX REST (so we can write it into CSV)
 $script:LastDbxError = ''
 
@@ -112,7 +119,8 @@ function Invoke-DbRest {
 
     $script:LastDbxError = ''
 
-    $hostPart = $WorkspaceUrl -replace '^https://',''
+    $WorkspaceUrl = Normalize-WorkspaceUrl $WorkspaceUrl
+    $hostPart = $WorkspaceUrl -replace '^https?://',''
     $uri = "https://$hostPart$Path"
 
     $headers = @{ Authorization = "Bearer $BearerToken" }
@@ -137,7 +145,9 @@ function Invoke-DbRest {
         $msg = "HTTP=$statusCode; $($_.Exception.Message)"
         if ($respBody) {
             $one = ($respBody -replace '\s+',' ')
-            $msg = $msg + " | BODY=" + $one.Substring(0,[Math]::Min(400,$one.Length))
+            if ($one.Length -gt 0) {
+                $msg = $msg + " | BODY=" + $one.Substring(0,[Math]::Min(400,$one.Length))
+            }
         }
 
         $script:LastDbxError = $msg
@@ -145,14 +155,39 @@ function Invoke-DbRest {
     }
 }
 
+function LooksLikeDbxPat([string]$v) {
+    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+    return ($v.Trim() -match '^dapi')
+}
+
+function LooksLikeJwt([string]$v) {
+    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+    return ($v.Trim().StartsWith('eyJ') -and ($v -split '\.').Count -ge 3)
+}
+
+# IMPORTANT FIX:
+# - Token validation must not fail just because SCIM/current-user is forbidden.
+# - Treat 403 as "token is valid, but this API is not allowed".
 function Test-DbxAuth {
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
         [Parameter(Mandatory)][string]$BearerToken
     )
-    # /Me is lightweight and good to validate a token
-    $me = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.0/preview/scim/v2/Me" -BearerToken $BearerToken
-    if ($me) { return $true }
+
+    # Prefer current-user (common) and interpret 403 correctly.
+    $resp = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.0/current-user" -BearerToken $BearerToken
+    if ($resp) { return $true }
+
+    if ($script:LastDbxError -match 'HTTP=403') { return $true }   # authenticated, forbidden
+    if ($script:LastDbxError -match 'HTTP=401') { return $false }  # not authenticated
+
+    # Try a second endpoint (clusters list) for robustness
+    $resp2 = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.0/clusters/list" -BearerToken $BearerToken
+    if ($resp2) { return $true }
+
+    if ($script:LastDbxError -match 'HTTP=403') { return $true }
+    if ($script:LastDbxError -match 'HTTP=401') { return $false }
+
     return $false
 }
 
@@ -253,6 +288,8 @@ foreach ($sub in $subs) {
             $wsUrl = $ws.Properties.parameters.workspaceUrl.value
         }
 
+        $wsUrl = Normalize-WorkspaceUrl $wsUrl
+
         if (-not $wsUrl) {
             $wsRows += [pscustomobject]@{
                 SubscriptionName    = $sub.Name
@@ -312,23 +349,28 @@ foreach ($sub in $subs) {
                 }
             }
 
-            # ---- 1) Try KV tokens (no 'dapi' requirement; validate by calling /Me) ----
-            foreach ($secName in @("SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION","SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION")) {
+            # ---- 1) Try KV PAT tokens (dapi...) ----
+            foreach ($secName in @("SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION","SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION","SPN-TOKEN-CUSTODIAN-GEN")) {
                 $s = Get-SecretVerbose -VaultName $kvName -SecretName $secName
                 if ($s.Error) {
                     $reason.Add("KV '$kvName' secret '$secName' read failed: $($s.Error)") | Out-Null
                     continue
                 }
+
                 if (-not [string]::IsNullOrWhiteSpace($s.Value)) {
-                    if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $s.Value) {
-                        $bearer = $s.Value
-                        $authMode = "KV_TOKEN"
-                        $authOk = $true
-                        $kvUsed = $kvName
-                        $tokenSecretUsed = $secName
-                        break
+                    if (LooksLikeDbxPat $s.Value -or LooksLikeJwt $s.Value) {
+                        if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $s.Value) {
+                            $bearer = $s.Value
+                            $authMode = "KV_DATABRICKS_PAT"
+                            $authOk = $true
+                            $kvUsed = $kvName
+                            $tokenSecretUsed = $secName
+                            break
+                        } else {
+                            $reason.Add("Token from '$kvName/$secName' rejected. $script:LastDbxError") | Out-Null
+                        }
                     } else {
-                        $reason.Add("Token from '$kvName/$secName' is not valid for Databricks. $script:LastDbxError") | Out-Null
+                        $reason.Add("KV '$kvName/$secName' is not a Databricks token (not dapi/JWT).") | Out-Null
                     }
                 }
             }
@@ -346,13 +388,13 @@ foreach ($sub in $subs) {
                 if ($aadTok) {
                     if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $aadTok) {
                         $bearer = $aadTok
-                        $authMode = "AAD_SP"
+                        $authMode = "AAD_GEN_SPN"
                         $authOk = $true
                         $kvUsed = $kvName
                         $tokenSecretUsed = "ADH-Gen-SPN-ClientID/ClientSecret"
                         break
                     } else {
-                        $reason.Add("AAD token obtained from Gen SPN in '$kvName' but Databricks rejected it. $script:LastDbxError") | Out-Null
+                        $reason.Add("AAD token from Gen SPN in '$kvName' rejected. $script:LastDbxError") | Out-Null
                     }
                 } else {
                     $reason.Add("Failed to obtain AAD token using Gen SPN secrets from '$kvName'.") | Out-Null
@@ -371,7 +413,7 @@ foreach ($sub in $subs) {
                 TokenSecretUsed  = $tokenSecretUsed
                 AuthMode         = $authMode
                 AuthOk           = $false
-                Note             = ("AUTH FAILED. Checked KVs: " + ($checkedKvs -join ', ') + " | " + (($reason | Select-Object -First 8) -join " || "))
+                Note             = ("AUTH FAILED. Checked KVs: " + ($checkedKvs -join ', ') + " | " + (($reason | Select-Object -First 10) -join " || "))
             }
             continue
         }
