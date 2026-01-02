@@ -1,7 +1,11 @@
 # sanitychecks/scripts/Scan-Databricks.ps1
-# Uses ONLY the Databricks PAT (dapi...) from KV secret:
-#   SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION
-# No GEN SPN / AAD fallback.
+# FIXED: Uses per-environment Infra KV (dev/tst/stg or prd) and reads the Databricks PAT (dapi...)
+# from SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION (and optional fallback ADO token).
+#
+# IMPORTANT: PAT tokens are workspace-scoped. You must store a PAT created in ADH_MDM_dev inside
+# ADH-MDM-Infra-KV-dev, PAT created in ADH_MDM_tst inside ADH-MDM-Infra-KV-tst, etc.
+#
+# KV is RBAC-only supported (no access policies). Use -GrantRbac if pipeline SPN needs temporary KV read role.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$TenantId,
@@ -55,7 +59,8 @@ function Ensure-RbacRole {
         if (-not $existing) {
             New-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction Stop | Out-Null
             Write-Host "RBAC: Assigned '$RoleName' on $Scope" -ForegroundColor Green
-            Start-Sleep -Seconds 25
+            # RBAC propagation can be slow in enterprise tenants
+            Start-Sleep -Seconds 60
         }
     } catch {
         Write-Warning "RBAC: Failed assign '$RoleName' on $Scope : $($_.Exception.Message)"
@@ -81,30 +86,42 @@ function Remove-RbacRole {
     }
 }
 
-# Returns object: @{ Value=...; Error=... }
-function Get-SecretVerbose {
-    param(
-        [Parameter(Mandatory)][string]$VaultName,
-        [Parameter(Mandatory)][string]$SecretName
-    )
-    try {
-        $s = Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop
-        $v = $s.SecretValueText
-        if ($null -ne $v) {
-            $v = $v.Replace("`r","").Replace("`n","").Trim()
-            $v = $v.Trim('"').Trim("'").Trim()
-        }
-        return @{ Value = $v; Error = '' }
-    } catch {
-        return @{ Value = $null; Error = $_.Exception.Message }
-    }
-}
-
 function Normalize-WorkspaceUrl([string]$u) {
     if ([string]::IsNullOrWhiteSpace($u)) { return '' }
     $u = $u.Trim().TrimEnd('/')
     if ($u -notmatch '^https?://') { $u = "https://$u" }
     return $u
+}
+
+function LooksLikeDbxPat([string]$v) {
+    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+    return ($v.Trim() -match '^dapi')
+}
+
+# Returns object: @{ Value=...; Error=... }
+# RBAC propagation sometimes causes transient 403/401 from KV; retry a few times.
+function Get-SecretVerbose {
+    param(
+        [Parameter(Mandatory)][string]$VaultName,
+        [Parameter(Mandatory)][string]$SecretName,
+        [int]$Retries = 3,
+        [int]$DelaySeconds = 10
+    )
+    for ($i = 1; $i -le $Retries; $i++) {
+        try {
+            $s = Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop
+            $v = $s.SecretValueText
+            if ($null -ne $v) {
+                $v = $v.Replace("`r","").Replace("`n","").Trim()
+                $v = $v.Trim('"').Trim("'").Trim()
+            }
+            return @{ Value = $v; Error = '' }
+        } catch {
+            $err = $_.Exception.Message
+            if ($i -lt $Retries) { Start-Sleep -Seconds $DelaySeconds; continue }
+            return @{ Value = $null; Error = $err }
+        }
+    }
 }
 
 # Global last error from DBX REST (so we can write it into CSV)
@@ -124,7 +141,6 @@ function Invoke-DbRest {
     $WorkspaceUrl = Normalize-WorkspaceUrl $WorkspaceUrl
     $hostPart = $WorkspaceUrl -replace '^https?://',''
     $uri = "https://$hostPart$Path"
-
     $headers = @{ Authorization = "Bearer $BearerToken" }
 
     try {
@@ -151,18 +167,14 @@ function Invoke-DbRest {
                 $msg = $msg + " | BODY=" + $one.Substring(0,[Math]::Min(400,$one.Length))
             }
         }
-
         $script:LastDbxError = $msg
         return $null
     }
 }
 
-function LooksLikeDbxPat([string]$v) {
-    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
-    return ($v.Trim() -match '^dapi')
-}
-
-# Treat 403 as "token valid, API forbidden" (prevents false auth failures)
+# Token check:
+# - If 401 => invalid token for this workspace
+# - If 403 => token is valid but lacks permission (still "auth ok" for our purposes)
 function Test-DbxAuth {
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
@@ -190,6 +202,14 @@ function Ensure-AtLeastOneRow([ref]$arr, [hashtable]$row) {
     }
 }
 
+# Derive env from workspace name suffix (e.g., _dev or -dev). If not found, fallback to env list.
+function Derive-WorkspaceEnv([string]$workspaceName, [string[]]$envs) {
+    foreach ($e in $envs) {
+        if ($workspaceName -match ("(_|-){0}$" -f [Regex]::Escape($e))) { return $e }
+    }
+    return $null
+}
+
 # ---------------- Start ----------------
 $adh_sub_group = Normalize-Text $adh_sub_group
 
@@ -200,7 +220,8 @@ Write-Host "INFO: OutputDir             = $OutputDir"
 Write-Host "INFO: BranchName            = $BranchName"
 Write-Host "INFO: GrantRbac             = $GrantRbac"
 Write-Host "INFO: RevokeRbacAfter       = $RevokeRbacAfter"
-Write-Host "INFO: Databricks token KV secret = SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
+Write-Host "INFO: Token secret (primary)= SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
+Write-Host "INFO: Token secret (fallback)= SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION"
 
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
@@ -285,19 +306,22 @@ foreach ($sub in $subs) {
             Note                = ''
         }
 
-        # -------- determine env for KV lookup --------
-        $candidateEnvs = @()
-        foreach ($e in $envs) {
-            if ($wsName -match ("-{0}$" -f [Regex]::Escape($e)) -or $wsName -match ("_{0}$" -f [Regex]::Escape($e))) {
-                $candidateEnvs += $e
-            }
-        }
-        if ($candidateEnvs.Count -eq 0) { $candidateEnvs = $envs }
+        # -------- Determine env & corresponding KV --------
+        $envGuess = Derive-WorkspaceEnv -workspaceName $wsName -envs $envs
 
-        # -------- Get Databricks PAT from infra KV (ONLY Terraform secret) --------
+        $candidateEnvs = @()
+        if ($envGuess) {
+            $candidateEnvs = @($envGuess)   # prefer exact match
+        } else {
+            $candidateEnvs = $envs          # fallback: try all
+        }
+
+        # -------- Get token from KV (per-environment) --------
         $bearer = $null
         $authOk = $false
+        $authMode = ''
         $kvUsed = ''
+        $tokenSecretUsed = ''
         $checkedKvs = New-Object System.Collections.Generic.List[string]
         $reason = New-Object System.Collections.Generic.List[string]
 
@@ -305,7 +329,7 @@ foreach ($sub in $subs) {
             $kvName = Build-InfraKvName -group $adh_group -subGroup $adh_sub_group -env $env
             $checkedKvs.Add($kvName) | Out-Null
 
-            # Use Get-AzKeyVault (reliable)
+            # RBAC-only KV: discover via Get-AzKeyVault (reliable)
             $kv = Get-AzKeyVault -VaultName $kvName -ErrorAction SilentlyContinue
             if (-not $kv) {
                 $reason.Add("KeyVault '$kvName' not found / not accessible.") | Out-Null
@@ -321,30 +345,44 @@ foreach ($sub in $subs) {
                 }
             }
 
-            $secName = "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
-            $s = Get-SecretVerbose -VaultName $kvName -SecretName $secName
+            # Try secrets in strict order (Terraform token first; ADO token fallback)
+            foreach ($secName in @(
+                "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION",
+                "SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION"
+            )) {
+                $s = Get-SecretVerbose -VaultName $kvName -SecretName $secName
+                if ($s.Error) {
+                    $reason.Add("KV '$kvName' secret '$secName' read failed: $($s.Error)") | Out-Null
+                    continue
+                }
+                if ([string]::IsNullOrWhiteSpace($s.Value)) {
+                    $reason.Add("KV '$kvName/$secName' is empty.") | Out-Null
+                    continue
+                }
+                if (-not (LooksLikeDbxPat $s.Value)) {
+                    $reason.Add("KV '$kvName/$secName' is not a Databricks PAT (must start with 'dapi').") | Out-Null
+                    continue
+                }
 
-            if ($s.Error) {
-                $reason.Add("KV '$kvName' secret '$secName' read failed: $($s.Error)") | Out-Null
-                continue
-            }
-            if ([string]::IsNullOrWhiteSpace($s.Value)) {
-                $reason.Add("KV '$kvName/$secName' is empty.") | Out-Null
-                continue
-            }
-            if (-not (LooksLikeDbxPat $s.Value)) {
-                $reason.Add("KV '$kvName/$secName' is not a Databricks PAT (must start with 'dapi').") | Out-Null
-                continue
+                # Validate token against this workspace
+                if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $s.Value) {
+                    $bearer = $s.Value
+                    $authOk = $true
+                    $authMode = "KV_DATABRICKS_PAT"
+                    $kvUsed = $kvName
+                    $tokenSecretUsed = $secName
+                    break
+                } else {
+                    # If 401, most likely PAT created in different workspace
+                    if ($script:LastDbxError -match 'HTTP=401') {
+                        $reason.Add("Token from '$kvName/$secName' got HTTP=401 on $wsUrl (most likely PAT belongs to a different workspace).") | Out-Null
+                    } else {
+                        $reason.Add("Token from '$kvName/$secName' failed on $wsUrl. $script:LastDbxError") | Out-Null
+                    }
+                }
             }
 
-            if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $s.Value) {
-                $bearer = $s.Value
-                $authOk = $true
-                $kvUsed = $kvName
-                break
-            } else {
-                $reason.Add("Token from '$kvName/$secName' rejected. $script:LastDbxError") | Out-Null
-            }
+            if ($authOk) { break }
         }
 
         if (-not $authOk) {
@@ -353,10 +391,12 @@ foreach ($sub in $subs) {
                 WorkspaceName    = $wsName
                 WorkspaceUrl     = $wsUrl
                 InfraKVUsed      = $kvUsed
-                TokenSecretUsed  = "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
-                AuthMode         = "KV_DATABRICKS_PAT_ONLY"
+                TokenSecretUsed  = $tokenSecretUsed
+                AuthMode         = $authMode
                 AuthOk           = $false
-                Note             = ("AUTH FAILED. Checked KVs: " + ($checkedKvs -join ', ') + " | " + (($reason | Select-Object -First 12) -join " || "))
+                Note             = ("AUTH FAILED. EnvGuess=" + ($envGuess ?? '') +
+                                    " | CheckedKVs=" + ($checkedKvs -join ', ') +
+                                    " | " + (($reason | Select-Object -First 12) -join " || "))
             }
             continue
         }
@@ -366,8 +406,8 @@ foreach ($sub in $subs) {
             WorkspaceName    = $wsName
             WorkspaceUrl     = $wsUrl
             InfraKVUsed      = $kvUsed
-            TokenSecretUsed  = "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
-            AuthMode         = "KV_DATABRICKS_PAT_ONLY"
+            TokenSecretUsed  = $tokenSecretUsed
+            AuthMode         = $authMode
             AuthOk           = $true
             Note             = "Auth OK"
         }
