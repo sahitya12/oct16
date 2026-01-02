@@ -1,11 +1,7 @@
 # sanitychecks/scripts/Scan-Databricks.ps1
-# FIXED: Uses per-environment Infra KV (dev/tst/stg or prd) and reads the Databricks PAT (dapi...)
-# from SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION (and optional fallback ADO token).
-#
-# IMPORTANT: PAT tokens are workspace-scoped. You must store a PAT created in ADH_MDM_dev inside
-# ADH-MDM-Infra-KV-dev, PAT created in ADH_MDM_tst inside ADH-MDM-Infra-KV-tst, etc.
-#
-# KV is RBAC-only supported (no access policies). Use -GrantRbac if pipeline SPN needs temporary KV read role.
+# AAD (client_credentials) -> Create Databricks PAT per workspace -> Scan UC/SQL permissions
+# No Key Vault dependency. Works if the SPN used for Azure login is added to each workspace.
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$TenantId,
@@ -21,11 +17,14 @@ param(
     [Parameter(Mandatory)][string]$OutputDir,
     [string]$BranchName = '',
 
-    [switch]$GrantRbac,
-    [switch]$RevokeRbacAfter
+    # Create a short-lived PAT per workspace (default 1 day)
+    [int]$PatLifetimeSeconds = 86400,
+
+    # Revoke the generated PAT after scan (recommended)
+    [switch]$RevokeGeneratedPat
 )
 
-Import-Module Az.Accounts, Az.Resources, Az.KeyVault -ErrorAction Stop
+Import-Module Az.Accounts, Az.Resources -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
 Ensure-Dir -Path $OutputDir | Out-Null
@@ -41,87 +40,11 @@ function Get-EnvList([string]$subType) {
     return @('dev','tst','stg')
 }
 
-function Build-InfraKvName([string]$group, [string]$subGroup, [string]$env) {
-    if ([string]::IsNullOrWhiteSpace($subGroup)) {
-        return ("ADH-{0}-Infra-KV-{1}" -f $group.ToUpper(), $env)
-    }
-    return ("ADH-{0}-{1}-Infra-KV-{2}" -f $group.ToUpper(), $subGroup.ToUpper(), $env)
-}
-
-function Ensure-RbacRole {
-    param(
-        [Parameter(Mandatory)][string]$ObjectId,
-        [Parameter(Mandatory)][string]$Scope,
-        [Parameter(Mandatory)][string]$RoleName
-    )
-    try {
-        $existing = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction SilentlyContinue
-        if (-not $existing) {
-            New-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction Stop | Out-Null
-            Write-Host "RBAC: Assigned '$RoleName' on $Scope" -ForegroundColor Green
-            # RBAC propagation can be slow in enterprise tenants
-            Start-Sleep -Seconds 60
-        }
-    } catch {
-        Write-Warning "RBAC: Failed assign '$RoleName' on $Scope : $($_.Exception.Message)"
-    }
-}
-
-function Remove-RbacRole {
-    param(
-        [Parameter(Mandatory)][string]$ObjectId,
-        [Parameter(Mandatory)][string]$Scope,
-        [Parameter(Mandatory)][string]$RoleName
-    )
-    try {
-        $assignments = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleName -Scope $Scope -ErrorAction SilentlyContinue
-        foreach ($a in @($assignments)) {
-            Remove-AzRoleAssignment -RoleAssignmentId $a.Id -ErrorAction SilentlyContinue
-        }
-        if ($assignments) {
-            Write-Host "RBAC: Revoked '$RoleName' on $Scope" -ForegroundColor DarkYellow
-        }
-    } catch {
-        Write-Warning "RBAC: Failed revoke '$RoleName' on $Scope : $($_.Exception.Message)"
-    }
-}
-
 function Normalize-WorkspaceUrl([string]$u) {
     if ([string]::IsNullOrWhiteSpace($u)) { return '' }
     $u = $u.Trim().TrimEnd('/')
     if ($u -notmatch '^https?://') { $u = "https://$u" }
     return $u
-}
-
-function LooksLikeDbxPat([string]$v) {
-    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
-    return ($v.Trim() -match '^dapi')
-}
-
-# Returns object: @{ Value=...; Error=... }
-# RBAC propagation sometimes causes transient 403/401 from KV; retry a few times.
-function Get-SecretVerbose {
-    param(
-        [Parameter(Mandatory)][string]$VaultName,
-        [Parameter(Mandatory)][string]$SecretName,
-        [int]$Retries = 3,
-        [int]$DelaySeconds = 10
-    )
-    for ($i = 1; $i -le $Retries; $i++) {
-        try {
-            $s = Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop
-            $v = $s.SecretValueText
-            if ($null -ne $v) {
-                $v = $v.Replace("`r","").Replace("`n","").Trim()
-                $v = $v.Trim('"').Trim("'").Trim()
-            }
-            return @{ Value = $v; Error = '' }
-        } catch {
-            $err = $_.Exception.Message
-            if ($i -lt $Retries) { Start-Sleep -Seconds $DelaySeconds; continue }
-            return @{ Value = $null; Error = $err }
-        }
-    }
 }
 
 # Global last error from DBX REST (so we can write it into CSV)
@@ -133,7 +56,8 @@ function Invoke-DbRest {
         [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','PATCH','DELETE')][string]$Method,
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$BearerToken,
-        [string]$Body = $null
+        [string]$Body = $null,
+        [string]$ContentType = $null
     )
 
     $script:LastDbxError = ''
@@ -145,7 +69,8 @@ function Invoke-DbRest {
 
     try {
         if ($Body) {
-            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType 'application/json' -Body $Body -ErrorAction Stop
+            if (-not $ContentType) { $ContentType = 'application/json' }
+            return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType $ContentType -Body $Body -ErrorAction Stop
         } else {
             return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ErrorAction Stop
         }
@@ -172,42 +97,121 @@ function Invoke-DbRest {
     }
 }
 
-# Token check:
-# - If 401 => invalid token for this workspace
-# - If 403 => token is valid but lacks permission (still "auth ok" for our purposes)
+# Get Entra token for Azure Databricks resource (client_credentials)
+function Get-AadDatabricksToken {
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$SpnClientId,
+        [Parameter(Mandatory)][string]$SpnClientSecret
+    )
+    try {
+        # Azure Databricks resource App ID
+        $scope = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"
+
+        $body = @{
+            client_id     = $SpnClientId
+            client_secret = $SpnClientSecret
+            grant_type    = "client_credentials"
+            scope         = $scope
+        }
+
+        $tok = Invoke-RestMethod -Method POST `
+            -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+            -ContentType "application/x-www-form-urlencoded" -Body $body -ErrorAction Stop
+
+        return $tok.access_token
+    } catch {
+        return $null
+    }
+}
+
+# Validate whether token is accepted by the workspace (403 means token valid but lacks permission for that endpoint)
 function Test-DbxAuth {
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
         [Parameter(Mandatory)][string]$BearerToken
     )
 
-    $resp = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.0/current-user" -BearerToken $BearerToken
-    if ($resp) { return $true }
-
+    $me = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.0/current-user" -BearerToken $BearerToken
+    if ($me) { return $true }
     if ($script:LastDbxError -match 'HTTP=403') { return $true }
     if ($script:LastDbxError -match 'HTTP=401') { return $false }
 
-    $resp2 = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.0/clusters/list" -BearerToken $BearerToken
-    if ($resp2) { return $true }
-
+    # fallback probe
+    $c = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.0/clusters/list" -BearerToken $BearerToken
+    if ($c) { return $true }
     if ($script:LastDbxError -match 'HTTP=403') { return $true }
     if ($script:LastDbxError -match 'HTTP=401') { return $false }
 
     return $false
 }
 
+# Create a PAT using AAD token (Databricks allows this if SPN exists in workspace)
+function New-DatabricksPat {
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceUrl,
+        [Parameter(Mandatory)][string]$AadBearerToken,
+        [int]$LifetimeSeconds = 86400,
+        [string]$Comment = "sanitychecks-auto"
+    )
+
+    $bodyObj = @{
+        lifetime_seconds = $LifetimeSeconds
+        comment          = $Comment
+    }
+    $json = ($bodyObj | ConvertTo-Json -Depth 5)
+
+    $resp = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method POST -Path "/api/2.0/token/create" `
+        -BearerToken $AadBearerToken -Body $json -ContentType "application/json"
+
+    if (-not $resp -or [string]::IsNullOrWhiteSpace($resp.token_value)) {
+        return $null
+    }
+    return $resp.token_value
+}
+
+# Optionally revoke created PAT
+function Revoke-DatabricksPat {
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceUrl,
+        [Parameter(Mandatory)][string]$AadBearerToken,
+        [Parameter(Mandatory)][string]$TokenId
+    )
+    $json = (@{ token_id = $TokenId } | ConvertTo-Json -Depth 5)
+    $null = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method POST -Path "/api/2.0/token/delete" `
+        -BearerToken $AadBearerToken -Body $json -ContentType "application/json"
+}
+
+# Create token AND remember token_id for revoke
+function New-DatabricksPatWithId {
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceUrl,
+        [Parameter(Mandatory)][string]$AadBearerToken,
+        [int]$LifetimeSeconds = 86400,
+        [string]$Comment = "sanitychecks-auto"
+    )
+
+    $bodyObj = @{
+        lifetime_seconds = $LifetimeSeconds
+        comment          = $Comment
+    }
+    $json = ($bodyObj | ConvertTo-Json -Depth 5)
+
+    $resp = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method POST -Path "/api/2.0/token/create" `
+        -BearerToken $AadBearerToken -Body $json -ContentType "application/json"
+
+    if (-not $resp) { return $null }
+    if ([string]::IsNullOrWhiteSpace($resp.token_value)) { return $null }
+    # response includes token_value and (usually) token_info with token_id
+    $tokenId = $null
+    try { $tokenId = $resp.token_info.token_id } catch {}
+    return @{ Pat = $resp.token_value; TokenId = $tokenId }
+}
+
 function Ensure-AtLeastOneRow([ref]$arr, [hashtable]$row) {
     if (-not $arr.Value -or @($arr.Value).Count -eq 0) {
         $arr.Value = @([pscustomobject]$row)
     }
-}
-
-# Derive env from workspace name suffix (e.g., _dev or -dev). If not found, fallback to env list.
-function Derive-WorkspaceEnv([string]$workspaceName, [string[]]$envs) {
-    foreach ($e in $envs) {
-        if ($workspaceName -match ("(_|-){0}$" -f [Regex]::Escape($e))) { return $e }
-    }
-    return $null
 }
 
 # ---------------- Start ----------------
@@ -218,10 +222,8 @@ Write-Host "INFO: adh_sub_group         = '$adh_sub_group'"
 Write-Host "INFO: adh_subscription_type = $adh_subscription_type"
 Write-Host "INFO: OutputDir             = $OutputDir"
 Write-Host "INFO: BranchName            = $BranchName"
-Write-Host "INFO: GrantRbac             = $GrantRbac"
-Write-Host "INFO: RevokeRbacAfter       = $RevokeRbacAfter"
-Write-Host "INFO: Token secret (primary)= SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
-Write-Host "INFO: Token secret (fallback)= SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION"
+Write-Host "INFO: PatLifetimeSeconds    = $PatLifetimeSeconds"
+Write-Host "INFO: RevokeGeneratedPat    = $RevokeGeneratedPat"
 
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
@@ -232,15 +234,6 @@ if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 if (-not $subs -or @($subs).Count -eq 0) { throw "No subscriptions resolved." }
 
 Write-Host "INFO: Subscriptions = $(($subs | Select-Object -ExpandProperty Name) -join ', ')"
-
-# SP object id (for RBAC assignments)
-$spObjectId = $null
-try {
-    $sp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
-    $spObjectId = $sp.Id
-} catch {
-    Write-Warning "Unable to resolve SP object id from ClientId. RBAC grant may fail."
-}
 
 $envs = Get-EnvList $adh_subscription_type
 
@@ -254,8 +247,6 @@ $catPerms = @()
 $extRows  = @()
 $extPerms = @()
 $notes    = @()
-
-$rbacToRevoke = New-Object System.Collections.Generic.List[object]
 
 foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
@@ -306,110 +297,57 @@ foreach ($sub in $subs) {
             Note                = ''
         }
 
-        # -------- Determine env & corresponding KV --------
-        $envGuess = Derive-WorkspaceEnv -workspaceName $wsName -envs $envs
-
-        $candidateEnvs = @()
-        if ($envGuess) {
-            $candidateEnvs = @($envGuess)   # prefer exact match
-        } else {
-            $candidateEnvs = $envs          # fallback: try all
-        }
-
-        # -------- Get token from KV (per-environment) --------
-        $bearer = $null
-        $authOk = $false
-        $authMode = ''
-        $kvUsed = ''
-        $tokenSecretUsed = ''
-        $checkedKvs = New-Object System.Collections.Generic.List[string]
-        $reason = New-Object System.Collections.Generic.List[string]
-
-        foreach ($env in $candidateEnvs) {
-            $kvName = Build-InfraKvName -group $adh_group -subGroup $adh_sub_group -env $env
-            $checkedKvs.Add($kvName) | Out-Null
-
-            # RBAC-only KV: discover via Get-AzKeyVault (reliable)
-            $kv = Get-AzKeyVault -VaultName $kvName -ErrorAction SilentlyContinue
-            if (-not $kv) {
-                $reason.Add("KeyVault '$kvName' not found / not accessible.") | Out-Null
-                continue
-            }
-
-            $kvScope = $kv.ResourceId
-
-            if ($GrantRbac -and $spObjectId) {
-                Ensure-RbacRole -ObjectId $spObjectId -Scope $kvScope -RoleName "Key Vault Secrets User"
-                if ($RevokeRbacAfter) {
-                    $rbacToRevoke.Add([pscustomobject]@{ ObjectId=$spObjectId; Scope=$kvScope; Role="Key Vault Secrets User" })
-                }
-            }
-
-            # Try secrets in strict order (Terraform token first; ADO token fallback)
-            foreach ($secName in @(
-                "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION",
-                "SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION"
-            )) {
-                $s = Get-SecretVerbose -VaultName $kvName -SecretName $secName
-                if ($s.Error) {
-                    $reason.Add("KV '$kvName' secret '$secName' read failed: $($s.Error)") | Out-Null
-                    continue
-                }
-                if ([string]::IsNullOrWhiteSpace($s.Value)) {
-                    $reason.Add("KV '$kvName/$secName' is empty.") | Out-Null
-                    continue
-                }
-                if (-not (LooksLikeDbxPat $s.Value)) {
-                    $reason.Add("KV '$kvName/$secName' is not a Databricks PAT (must start with 'dapi').") | Out-Null
-                    continue
-                }
-
-                # Validate token against this workspace
-                if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $s.Value) {
-                    $bearer = $s.Value
-                    $authOk = $true
-                    $authMode = "KV_DATABRICKS_PAT"
-                    $kvUsed = $kvName
-                    $tokenSecretUsed = $secName
-                    break
-                } else {
-                    # If 401, most likely PAT created in different workspace
-                    if ($script:LastDbxError -match 'HTTP=401') {
-                        $reason.Add("Token from '$kvName/$secName' got HTTP=401 on $wsUrl (most likely PAT belongs to a different workspace).") | Out-Null
-                    } else {
-                        $reason.Add("Token from '$kvName/$secName' failed on $wsUrl. $script:LastDbxError") | Out-Null
-                    }
-                }
-            }
-
-            if ($authOk) { break }
-        }
-
-        if (-not $authOk) {
+        # -------- Auth bootstrap using AAD --------
+        $aadTok = Get-AadDatabricksToken -TenantId $TenantId -SpnClientId $ClientId -SpnClientSecret $ClientSecret
+        if (-not $aadTok) {
             $notes += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 WorkspaceName    = $wsName
                 WorkspaceUrl     = $wsUrl
-                InfraKVUsed      = $kvUsed
-                TokenSecretUsed  = $tokenSecretUsed
-                AuthMode         = $authMode
+                AuthMode         = "AAD_CLIENT_CREDENTIALS"
                 AuthOk           = $false
-                Note             = ("AUTH FAILED. EnvGuess=" + ($envGuess ?? '') +
-                                    " | CheckedKVs=" + ($checkedKvs -join ', ') +
-                                    " | " + (($reason | Select-Object -First 12) -join " || "))
+                Note             = "AUTH FAILED: could not obtain AAD token for Databricks resource."
             }
             continue
         }
+
+        # Validate AAD token is accepted by this workspace (SPN must exist in that workspace)
+        if (-not (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $aadTok)) {
+            $notes += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                WorkspaceName    = $wsName
+                WorkspaceUrl     = $wsUrl
+                AuthMode         = "AAD_CLIENT_CREDENTIALS"
+                AuthOk           = $false
+                Note             = "AUTH FAILED: workspace rejected AAD token. Ensure SPN is added in this workspace (Identity & access > Service principals) and has access. $script:LastDbxError"
+            }
+            continue
+        }
+
+        # -------- Create PAT per workspace (short-lived) --------
+        $patObj = New-DatabricksPatWithId -WorkspaceUrl $wsUrl -AadBearerToken $aadTok -LifetimeSeconds $PatLifetimeSeconds -Comment ("sanitychecks-{0}-{1}" -f $adh_group, $adh_subscription_type)
+        if (-not $patObj -or [string]::IsNullOrWhiteSpace($patObj.Pat)) {
+            $notes += [pscustomobject]@{
+                SubscriptionName = $sub.Name
+                WorkspaceName    = $wsName
+                WorkspaceUrl     = $wsUrl
+                AuthMode         = "AAD_TO_PAT"
+                AuthOk           = $false
+                Note             = "AUTH FAILED: could not create PAT using AAD token. SPN needs permission to create tokens. $script:LastDbxError"
+            }
+            continue
+        }
+
+        $bearer = $patObj.Pat
+        $tokenIdForRevoke = $patObj.TokenId
 
         $notes += [pscustomobject]@{
             SubscriptionName = $sub.Name
             WorkspaceName    = $wsName
             WorkspaceUrl     = $wsUrl
-            InfraKVUsed      = $kvUsed
-            TokenSecretUsed  = $tokenSecretUsed
-            AuthMode         = $authMode
+            AuthMode         = "AAD_TO_PAT"
             AuthOk           = $true
-            Note             = "Auth OK"
+            Note             = ("Auth OK. PAT created. TokenId=" + ($tokenIdForRevoke ?? ''))
         }
 
         # -------- UC probe: metastore attachment --------
@@ -602,14 +540,12 @@ foreach ($sub in $subs) {
                 Note             = ("No external locations OR UC API blocked. " + $script:LastDbxError)
             }
         }
-    }
-}
 
-# -------- Revoke RBAC if requested --------
-if ($RevokeRbacAfter -and $rbacToRevoke.Count -gt 0) {
-    Write-Host "`nRevoking temporary RBAC..." -ForegroundColor Yellow
-    foreach ($r in $rbacToRevoke) {
-        Remove-RbacRole -ObjectId $r.ObjectId -Scope $r.Scope -RoleName $r.Role
+        # -------- Revoke PAT if requested --------
+        if ($RevokeGeneratedPat -and $tokenIdForRevoke) {
+            Write-Host "INFO: Revoking generated PAT for $wsName (token_id=$tokenIdForRevoke)" -ForegroundColor DarkYellow
+            Revoke-DatabricksPat -WorkspaceUrl $wsUrl -AadBearerToken $aadTok -TokenId $tokenIdForRevoke
+        }
     }
 }
 
@@ -622,7 +558,7 @@ Ensure-AtLeastOneRow ([ref]$catRows)  @{ SubscriptionName=''; ResourceGroup=''; 
 Ensure-AtLeastOneRow ([ref]$catPerms) @{ SubscriptionName=''; WorkspaceName=''; CatalogName=''; PrincipalName=''; Privileges=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$extRows)  @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; ExternalLocation=''; Url=''; Owner=''; Comment=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$extPerms) @{ SubscriptionName=''; WorkspaceName=''; ExternalLocation=''; PrincipalName=''; Privileges=''; Note='' }
-Ensure-AtLeastOneRow ([ref]$notes)    @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed=''; AuthMode=''; AuthOk=''; Note='' }
+Ensure-AtLeastOneRow ([ref]$notes)    @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; AuthMode=''; AuthOk=''; Note='' }
 
 # -------- Output files (DB_<group>_<subtype>_<YYYYMMDD>_*.csv) --------
 $stamp = Get-Date -Format 'yyyyMMdd'
