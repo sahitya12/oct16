@@ -67,7 +67,7 @@ function Remove-RbacRole {
     }
 }
 
-# Returns object: @{ Value=...; Error=... }
+# Returns @{ Value=...; Error=... }
 function Get-SecretVerbose {
     param([string]$VaultName,[string]$SecretName)
     try {
@@ -83,7 +83,7 @@ function Get-SecretVerbose {
     }
 }
 
-# Global last error from DBX REST (so we can write it into CSV)
+# Last DBX REST error
 $script:LastDbxError = ''
 
 function Invoke-DbRest {
@@ -140,7 +140,6 @@ function Test-DbxAuth {
 function Get-AadDatabricksToken {
     param([string]$TenantId,[string]$SpnClientId,[string]$SpnClientSecret)
     try {
-        # Databricks resource scope for AAD token
         $scope = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"
         $body = @{
             client_id     = $SpnClientId
@@ -167,7 +166,7 @@ function Ensure-AtLeastOneRow([ref]$arr, [hashtable]$row) {
     }
 }
 
-# ---- FIX: UC permissions via Grants endpoint ----
+# FIX: UC permissions via correct endpoint + robust type fallbacks
 function Get-UcPermissions {
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
@@ -176,27 +175,25 @@ function Get-UcPermissions {
         [Parameter(Mandatory)][string]$FullName
     )
 
-    # Try a few variants because some workspaces are picky about names
+    $encoded = UrlEnc $FullName
+
     $typeCandidates = @(
         $SecurableType,
-        ($SecurableType.ToLower()),
-        ($SecurableType.ToUpper())
+        $SecurableType.ToLower(),
+        $SecurableType.ToUpper()
     ) | Select-Object -Unique
 
-    # Also try common plural->singular fallbacks if caller passed plural
-    if ($SecurableType -match 'catalogs') { $typeCandidates += 'catalog' }
-    if ($SecurableType -match 'external-locations') { $typeCandidates += 'external-location' }
-    if ($SecurableType -match '^catalog$') { $typeCandidates += 'catalogs' }
-    if ($SecurableType -match '^external-location$') { $typeCandidates += 'external-locations' }
+    # plural/singular fallbacks
+    if ($SecurableType -eq 'catalog') { $typeCandidates += 'catalogs' }
+    if ($SecurableType -eq 'catalogs') { $typeCandidates += 'catalog' }
+    if ($SecurableType -eq 'external-location') { $typeCandidates += 'external-locations' }
+    if ($SecurableType -eq 'external-locations') { $typeCandidates += 'external-location' }
 
     $typeCandidates = $typeCandidates | Select-Object -Unique
-
-    $encoded = UrlEnc $FullName
 
     foreach ($t in $typeCandidates) {
         $resp = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.1/unity-catalog/permissions/$t/$encoded" -BearerToken $BearerToken
         if ($resp) { return $resp }
-        # if it's a 404/400, keep trying next variant
     }
     return $null
 }
@@ -208,9 +205,6 @@ Write-Host "INFO: adh_group             = $adh_group"
 Write-Host "INFO: adh_sub_group         = '$adh_sub_group'"
 Write-Host "INFO: adh_subscription_type = $adh_subscription_type"
 Write-Host "INFO: OutputDir             = $OutputDir"
-Write-Host "INFO: BranchName            = $BranchName"
-Write-Host "INFO: GrantRbac             = $GrantRbac"
-Write-Host "INFO: RevokeRbacAfter       = $RevokeRbacAfter"
 
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
@@ -220,9 +214,7 @@ $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscript
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 if (-not $subs -or @($subs).Count -eq 0) { throw "No subscriptions resolved." }
 
-Write-Host "INFO: Subscriptions = $(($subs | Select-Object -ExpandProperty Name) -join ', ')"
-
-# SP object id (for RBAC assignments)
+# SP object id (for RBAC assignments to KV)
 $spObjectId = $null
 try {
     $sp = Get-AzADServicePrincipal -ApplicationId $ClientId -ErrorAction Stop
@@ -262,26 +254,9 @@ foreach ($sub in $subs) {
         $wsId   = $ws.ResourceId
 
         $wsUrl = $null
-        if ($ws.Properties.workspaceUrl) {
-            $wsUrl = $ws.Properties.workspaceUrl
-        } elseif ($ws.Properties.parameters.workspaceUrl.value) {
-            $wsUrl = $ws.Properties.parameters.workspaceUrl.value
-        }
+        if ($ws.Properties.workspaceUrl) { $wsUrl = $ws.Properties.workspaceUrl }
+        elseif ($ws.Properties.parameters.workspaceUrl.value) { $wsUrl = $ws.Properties.parameters.workspaceUrl.value }
         if ($wsUrl -and $wsUrl -notmatch '^https?://') { $wsUrl = "https://$wsUrl" }
-
-        if (-not $wsUrl) {
-            $wsRows += [pscustomobject]@{
-                SubscriptionName    = $sub.Name
-                SubscriptionId      = $sub.Id
-                ResourceGroup       = $rg
-                WorkspaceName       = $wsName
-                Location            = $loc
-                WorkspaceUrl        = ''
-                WorkspaceResourceId = $wsId
-                Note                = 'workspaceUrl missing'
-            }
-            continue
-        }
 
         $wsRows += [pscustomobject]@{
             SubscriptionName    = $sub.Name
@@ -289,12 +264,14 @@ foreach ($sub in $subs) {
             ResourceGroup       = $rg
             WorkspaceName       = $wsName
             Location            = $loc
-            WorkspaceUrl        = $wsUrl
+            WorkspaceUrl        = ($wsUrl ?? '')
             WorkspaceResourceId = $wsId
-            Note                = ''
+            Note                = (if ($wsUrl) { '' } else { 'workspaceUrl missing' })
         }
 
-        # -------- determine env for KV lookup --------
+        if (-not $wsUrl) { continue }
+
+        # determine env guess from workspace name
         $envGuess = $null
         foreach ($e in $envs) {
             if ($wsName -match ("[-_]{0}$" -f [Regex]::Escape($e))) { $envGuess = $e; break }
@@ -302,7 +279,7 @@ foreach ($sub in $subs) {
         $candidateEnvs = @()
         if ($envGuess) { $candidateEnvs = @($envGuess) } else { $candidateEnvs = $envs }
 
-        # -------- Auth: prefer Gen SPN AAD token (works cross-workspace if SPN exists in workspace) --------
+        # ---- AUTH (PAT FIRST, then Gen SPN) ----
         $bearer = $null
         $authMode = ''
         $authOk = $false
@@ -327,7 +304,26 @@ foreach ($sub in $subs) {
                 }
             }
 
-            # ---- 1) AAD token using Gen SPN ----
+            # 1) PAT tokens from KV (dapi...)
+            foreach ($secName in @("SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION","SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION")) {
+                $s = Get-SecretVerbose -VaultName $kvName -SecretName $secName
+                if ($s.Error) { $reason.Add("KV '$kvName' secret '$secName' read failed: $($s.Error)") | Out-Null; continue }
+                if (-not [string]::IsNullOrWhiteSpace($s.Value)) {
+                    if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $s.Value) {
+                        $bearer = $s.Value
+                        $authMode = "KV_PAT"
+                        $authOk = $true
+                        $kvUsed = $kvName
+                        $tokenSecretUsed = $secName
+                        break
+                    } else {
+                        $reason.Add("PAT '$kvName/$secName' rejected. $script:LastDbxError") | Out-Null
+                    }
+                }
+            }
+            if ($authOk) { break }
+
+            # 2) Gen SPN AAD token fallback
             $cid = Get-SecretVerbose -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientID"
             $cse = Get-SecretVerbose -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientSecret"
 
@@ -344,36 +340,16 @@ foreach ($sub in $subs) {
                     $tokenSecretUsed = "ADH-Gen-SPN-ClientID/ADH-Gen-SPN-ClientSecret"
                     break
                 } else {
-                    $reason.Add("AAD Gen SPN token rejected by Databricks. $script:LastDbxError") | Out-Null
+                    $reason.Add("Gen SPN AAD token rejected. $script:LastDbxError") | Out-Null
                 }
             } else {
                 $reason.Add("Gen SPN secrets missing/empty in '$kvName'.") | Out-Null
             }
-
-            # ---- 2) Fallback: KV PAT tokens (dapi...) ----
-            foreach ($secName in @("SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION","SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION")) {
-                $s = Get-SecretVerbose -VaultName $kvName -SecretName $secName
-                if ($s.Error) {
-                    $reason.Add("KV '$kvName' secret '$secName' read failed: $($s.Error)") | Out-Null
-                    continue
-                }
-                if (-not [string]::IsNullOrWhiteSpace($s.Value)) {
-                    if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $s.Value) {
-                        $bearer = $s.Value
-                        $authMode = "KV_PAT"
-                        $authOk = $true
-                        $kvUsed = $kvName
-                        $tokenSecretUsed = $secName
-                        break
-                    } else {
-                        $reason.Add("PAT from '$kvName/$secName' not valid for this workspace. $script:LastDbxError") | Out-Null
-                    }
-                }
-            }
-            if ($authOk) { break }
         }
 
         if (-not $authOk) {
+            $eg = ''
+            if ($envGuess) { $eg = $envGuess }
             $notes += [pscustomobject]@{
                 SubscriptionName = $sub.Name
                 WorkspaceName    = $wsName
@@ -382,7 +358,7 @@ foreach ($sub in $subs) {
                 TokenSecretUsed  = $tokenSecretUsed
                 AuthMode         = $authMode
                 AuthOk           = $false
-                Note             = ("AUTH FAILED. EnvGuess={0} | CheckedKVs={1} | {2}" -f ($envGuess ?? ''), ($checkedKvs -join ', '), (($reason | Select-Object -First 8) -join " || "))
+                Note             = ("AUTH FAILED. EnvGuess={0} | CheckedKVs={1} | {2}" -f $eg, ($checkedKvs -join ', '), (($reason | Select-Object -First 8) -join " || "))
             }
             continue
         }
@@ -469,7 +445,6 @@ foreach ($sub in $subs) {
             foreach ($c in $cats.catalogs) {
                 $catName = $c.name
 
-                # Skip internal/system-ish catalogs
                 if ($catName -in @('system','samples','__databricks_internal')) {
                     $catRows += [pscustomobject]@{
                         SubscriptionName = $sub.Name
@@ -506,27 +481,15 @@ foreach ($sub in $subs) {
                         }
                     }
                 } else {
-                    $err = $script:LastDbxError
-                    if (-not $err) { $err = "Unknown error calling Grants API." }
                     $catPerms += [pscustomobject]@{
                         SubscriptionName = $sub.Name
                         WorkspaceName    = $wsName
                         CatalogName      = $catName
                         PrincipalName    = ''
                         Privileges       = ''
-                        Note             = ("CANNOT_VIEW_GRANTS. " + $err)
+                        Note             = ("CANNOT_VIEW_GRANTS. " + $script:LastDbxError)
                     }
                 }
-            }
-        } else {
-            $catRows += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rg
-                WorkspaceName    = $wsName
-                CatalogName      = ''
-                Owner            = ''
-                Comment          = ''
-                Note             = ("No catalogs OR UC API blocked. " + $script:LastDbxError)
             }
         }
 
@@ -536,7 +499,6 @@ foreach ($sub in $subs) {
             foreach ($l in $ext.external_locations) {
                 $locName = $l.name
 
-                # Skip managed storage location (often behaves differently)
                 if ($locName -eq '__databricks_managed_storage_location') {
                     $extRows += [pscustomobject]@{
                         SubscriptionName = $sub.Name
@@ -546,7 +508,7 @@ foreach ($sub in $subs) {
                         Url              = $l.url
                         Owner            = $l.owner
                         Comment          = $l.comment
-                        Note             = 'SKIPPED: databricks managed storage location'
+                        Note             = 'SKIPPED: managed storage location'
                     }
                     continue
                 }
@@ -575,34 +537,21 @@ foreach ($sub in $subs) {
                         }
                     }
                 } else {
-                    $err = $script:LastDbxError
-                    if (-not $err) { $err = "Unknown error calling Grants API." }
                     $extPerms += [pscustomobject]@{
                         SubscriptionName = $sub.Name
                         WorkspaceName    = $wsName
                         ExternalLocation = $locName
                         PrincipalName    = ''
                         Privileges       = ''
-                        Note             = ("CANNOT_VIEW_GRANTS. " + $err)
+                        Note             = ("CANNOT_VIEW_GRANTS. " + $script:LastDbxError)
                     }
                 }
-            }
-        } else {
-            $extRows += [pscustomobject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $rg
-                WorkspaceName    = $wsName
-                ExternalLocation = ''
-                Url              = ''
-                Owner            = ''
-                Comment          = ''
-                Note             = ("No external locations OR UC API blocked. " + $script:LastDbxError)
             }
         }
     }
 }
 
-# -------- Revoke RBAC if requested --------
+# Revoke RBAC
 if ($RevokeRbacAfter -and $rbacToRevoke.Count -gt 0) {
     Write-Host "`nRevoking temporary RBAC..." -ForegroundColor Yellow
     foreach ($r in $rbacToRevoke) {
@@ -610,7 +559,7 @@ if ($RevokeRbacAfter -and $rbacToRevoke.Count -gt 0) {
     }
 }
 
-# -------- Ensure not-empty outputs --------
+# Ensure not-empty outputs
 Ensure-AtLeastOneRow ([ref]$wsRows)   @{ SubscriptionName=''; SubscriptionId=''; ResourceGroup=''; WorkspaceName=''; Location=''; WorkspaceUrl=''; WorkspaceResourceId=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$whRows)   @{ SubscriptionName=''; ResourceGroup=''; WorkspaceName=''; WarehouseId=''; WarehouseName=''; State=''; ClusterSize=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$whPerms)  @{ SubscriptionName=''; WorkspaceName=''; WarehouseName=''; WarehouseId=''; PrincipalType=''; PrincipalName=''; PermissionLevel=''; Inherited=''; Note='' }
@@ -620,7 +569,7 @@ Ensure-AtLeastOneRow ([ref]$extRows)  @{ SubscriptionName=''; ResourceGroup=''; 
 Ensure-AtLeastOneRow ([ref]$extPerms) @{ SubscriptionName=''; WorkspaceName=''; ExternalLocation=''; PrincipalName=''; Privileges=''; Note='' }
 Ensure-AtLeastOneRow ([ref]$notes)    @{ SubscriptionName=''; WorkspaceName=''; WorkspaceUrl=''; InfraKVUsed=''; TokenSecretUsed=''; AuthMode=''; AuthOk=''; Note='' }
 
-# -------- Output files (DB_<group>_<subtype>_<YYYYMMDD>_*.csv) --------
+# Output files
 $stamp = Get-Date -Format 'yyyyMMdd'
 $base  = "DB_{0}_{1}_{2}" -f $adh_group, $adh_subscription_type, $stamp
 
