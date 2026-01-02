@@ -1,4 +1,7 @@
 # sanitychecks/scripts/Scan-Databricks.ps1
+# Uses ONLY the Databricks PAT (dapi...) from KV secret:
+#   SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION
+# No GEN SPN / AAD fallback.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$TenantId,
@@ -88,7 +91,6 @@ function Get-SecretVerbose {
         $s = Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop
         $v = $s.SecretValueText
         if ($null -ne $v) {
-            # sanitize (remove quotes/newlines/spaces that often come from KV imports)
             $v = $v.Replace("`r","").Replace("`n","").Trim()
             $v = $v.Trim('"').Trim("'").Trim()
         }
@@ -160,28 +162,19 @@ function LooksLikeDbxPat([string]$v) {
     return ($v.Trim() -match '^dapi')
 }
 
-function LooksLikeJwt([string]$v) {
-    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
-    return ($v.Trim().StartsWith('eyJ') -and ($v -split '\.').Count -ge 3)
-}
-
-# IMPORTANT FIX:
-# - Token validation must not fail just because SCIM/current-user is forbidden.
-# - Treat 403 as "token is valid, but this API is not allowed".
+# Treat 403 as "token valid, API forbidden" (prevents false auth failures)
 function Test-DbxAuth {
     param(
         [Parameter(Mandatory)][string]$WorkspaceUrl,
         [Parameter(Mandatory)][string]$BearerToken
     )
 
-    # Prefer current-user (common) and interpret 403 correctly.
     $resp = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.0/current-user" -BearerToken $BearerToken
     if ($resp) { return $true }
 
-    if ($script:LastDbxError -match 'HTTP=403') { return $true }   # authenticated, forbidden
-    if ($script:LastDbxError -match 'HTTP=401') { return $false }  # not authenticated
+    if ($script:LastDbxError -match 'HTTP=403') { return $true }
+    if ($script:LastDbxError -match 'HTTP=401') { return $false }
 
-    # Try a second endpoint (clusters list) for robustness
     $resp2 = Invoke-DbRest -WorkspaceUrl $WorkspaceUrl -Method GET -Path "/api/2.0/clusters/list" -BearerToken $BearerToken
     if ($resp2) { return $true }
 
@@ -189,29 +182,6 @@ function Test-DbxAuth {
     if ($script:LastDbxError -match 'HTTP=401') { return $false }
 
     return $false
-}
-
-function Get-AadDatabricksToken {
-    param(
-        [Parameter(Mandatory)][string]$TenantId,
-        [Parameter(Mandatory)][string]$SpnClientId,
-        [Parameter(Mandatory)][string]$SpnClientSecret
-    )
-    try {
-        # Azure Databricks resource App ID (standard)
-        $scope = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"
-        $body = @{
-            client_id     = $SpnClientId
-            client_secret = $SpnClientSecret
-            grant_type    = "client_credentials"
-            scope         = $scope
-        }
-        $tok = Invoke-RestMethod -Method POST -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-            -ContentType "application/x-www-form-urlencoded" -Body $body -ErrorAction Stop
-        return $tok.access_token
-    } catch {
-        return $null
-    }
 }
 
 function Ensure-AtLeastOneRow([ref]$arr, [hashtable]$row) {
@@ -230,6 +200,7 @@ Write-Host "INFO: OutputDir             = $OutputDir"
 Write-Host "INFO: BranchName            = $BranchName"
 Write-Host "INFO: GrantRbac             = $GrantRbac"
 Write-Host "INFO: RevokeRbacAfter       = $RevokeRbacAfter"
+Write-Host "INFO: Databricks token KV secret = SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
 
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
@@ -287,7 +258,6 @@ foreach ($sub in $subs) {
         } elseif ($ws.Properties.parameters.workspaceUrl.value) {
             $wsUrl = $ws.Properties.parameters.workspaceUrl.value
         }
-
         $wsUrl = Normalize-WorkspaceUrl $wsUrl
 
         if (-not $wsUrl) {
@@ -324,12 +294,10 @@ foreach ($sub in $subs) {
         }
         if ($candidateEnvs.Count -eq 0) { $candidateEnvs = $envs }
 
-        # -------- Try to get an auth token --------
+        # -------- Get Databricks PAT from infra KV (ONLY Terraform secret) --------
         $bearer = $null
-        $authMode = ''
         $authOk = $false
         $kvUsed = ''
-        $tokenSecretUsed = ''
         $checkedKvs = New-Object System.Collections.Generic.List[string]
         $reason = New-Object System.Collections.Generic.List[string]
 
@@ -337,10 +305,14 @@ foreach ($sub in $subs) {
             $kvName = Build-InfraKvName -group $adh_group -subGroup $adh_sub_group -env $env
             $checkedKvs.Add($kvName) | Out-Null
 
-            $kvRes = Get-AzResource -ResourceType "Microsoft.KeyVault/vaults" -Name $kvName -ErrorAction SilentlyContinue
-            if (-not $kvRes) { continue }
+            # Use Get-AzKeyVault (reliable)
+            $kv = Get-AzKeyVault -VaultName $kvName -ErrorAction SilentlyContinue
+            if (-not $kv) {
+                $reason.Add("KeyVault '$kvName' not found / not accessible.") | Out-Null
+                continue
+            }
 
-            $kvScope = $kvRes.ResourceId
+            $kvScope = $kv.ResourceId
 
             if ($GrantRbac -and $spObjectId) {
                 Ensure-RbacRole -ObjectId $spObjectId -Scope $kvScope -RoleName "Key Vault Secrets User"
@@ -349,58 +321,29 @@ foreach ($sub in $subs) {
                 }
             }
 
-            # ---- 1) Try KV PAT tokens (dapi...) ----
-            foreach ($secName in @("SPN-TOKEN-ADH-PLATFORM-ADO-CONFIGURATION","SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION","SPN-TOKEN-CUSTODIAN-GEN")) {
-                $s = Get-SecretVerbose -VaultName $kvName -SecretName $secName
-                if ($s.Error) {
-                    $reason.Add("KV '$kvName' secret '$secName' read failed: $($s.Error)") | Out-Null
-                    continue
-                }
+            $secName = "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
+            $s = Get-SecretVerbose -VaultName $kvName -SecretName $secName
 
-                if (-not [string]::IsNullOrWhiteSpace($s.Value)) {
-                    if (LooksLikeDbxPat $s.Value -or LooksLikeJwt $s.Value) {
-                        if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $s.Value) {
-                            $bearer = $s.Value
-                            $authMode = "KV_DATABRICKS_PAT"
-                            $authOk = $true
-                            $kvUsed = $kvName
-                            $tokenSecretUsed = $secName
-                            break
-                        } else {
-                            $reason.Add("Token from '$kvName/$secName' rejected. $script:LastDbxError") | Out-Null
-                        }
-                    } else {
-                        $reason.Add("KV '$kvName/$secName' is not a Databricks token (not dapi/JWT).") | Out-Null
-                    }
-                }
+            if ($s.Error) {
+                $reason.Add("KV '$kvName' secret '$secName' read failed: $($s.Error)") | Out-Null
+                continue
             }
-            if ($authOk) { break }
+            if ([string]::IsNullOrWhiteSpace($s.Value)) {
+                $reason.Add("KV '$kvName/$secName' is empty.") | Out-Null
+                continue
+            }
+            if (-not (LooksLikeDbxPat $s.Value)) {
+                $reason.Add("KV '$kvName/$secName' is not a Databricks PAT (must start with 'dapi').") | Out-Null
+                continue
+            }
 
-            # ---- 2) Fallback: AAD token using Gen SPN ----
-            $cid = Get-SecretVerbose -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientID"
-            $cse = Get-SecretVerbose -VaultName $kvName -SecretName "ADH-Gen-SPN-ClientSecret"
-
-            if ($cid.Error) { $reason.Add("KV '$kvName' secret 'ADH-Gen-SPN-ClientID' read failed: $($cid.Error)") | Out-Null }
-            if ($cse.Error) { $reason.Add("KV '$kvName' secret 'ADH-Gen-SPN-ClientSecret' read failed: $($cse.Error)") | Out-Null }
-
-            if (-not [string]::IsNullOrWhiteSpace($cid.Value) -and -not [string]::IsNullOrWhiteSpace($cse.Value)) {
-                $aadTok = Get-AadDatabricksToken -TenantId $TenantId -SpnClientId $cid.Value -SpnClientSecret $cse.Value
-                if ($aadTok) {
-                    if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $aadTok) {
-                        $bearer = $aadTok
-                        $authMode = "AAD_GEN_SPN"
-                        $authOk = $true
-                        $kvUsed = $kvName
-                        $tokenSecretUsed = "ADH-Gen-SPN-ClientID/ClientSecret"
-                        break
-                    } else {
-                        $reason.Add("AAD token from Gen SPN in '$kvName' rejected. $script:LastDbxError") | Out-Null
-                    }
-                } else {
-                    $reason.Add("Failed to obtain AAD token using Gen SPN secrets from '$kvName'.") | Out-Null
-                }
+            if (Test-DbxAuth -WorkspaceUrl $wsUrl -BearerToken $s.Value) {
+                $bearer = $s.Value
+                $authOk = $true
+                $kvUsed = $kvName
+                break
             } else {
-                $reason.Add("Gen SPN secrets missing/empty in '$kvName'.") | Out-Null
+                $reason.Add("Token from '$kvName/$secName' rejected. $script:LastDbxError") | Out-Null
             }
         }
 
@@ -410,10 +353,10 @@ foreach ($sub in $subs) {
                 WorkspaceName    = $wsName
                 WorkspaceUrl     = $wsUrl
                 InfraKVUsed      = $kvUsed
-                TokenSecretUsed  = $tokenSecretUsed
-                AuthMode         = $authMode
+                TokenSecretUsed  = "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
+                AuthMode         = "KV_DATABRICKS_PAT_ONLY"
                 AuthOk           = $false
-                Note             = ("AUTH FAILED. Checked KVs: " + ($checkedKvs -join ', ') + " | " + (($reason | Select-Object -First 10) -join " || "))
+                Note             = ("AUTH FAILED. Checked KVs: " + ($checkedKvs -join ', ') + " | " + (($reason | Select-Object -First 12) -join " || "))
             }
             continue
         }
@@ -423,8 +366,8 @@ foreach ($sub in $subs) {
             WorkspaceName    = $wsName
             WorkspaceUrl     = $wsUrl
             InfraKVUsed      = $kvUsed
-            TokenSecretUsed  = $tokenSecretUsed
-            AuthMode         = $authMode
+            TokenSecretUsed  = "SPN-TOKEN-ADH-PLATFORM-TERRAFORM-CONFIGURATION"
+            AuthMode         = "KV_DATABRICKS_PAT_ONLY"
             AuthOk           = $true
             Note             = "Auth OK"
         }
