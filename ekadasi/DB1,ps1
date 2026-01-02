@@ -611,7 +611,7 @@ foreach ($sub in $subs) {
                         CatalogName      = $catName
                         PrincipalName    = ''
                         Privileges       = ''
-                        Note             = "$cls: cannot view grants for this catalog. $script:LastDbxError"
+                        Note             = "${cls}: cannot view grants for this catalog. $script:LastDbxError"
                     }
                 }
             }
@@ -666,7 +666,7 @@ foreach ($sub in $subs) {
                         ExternalLocation = $l.name
                         PrincipalName    = ''
                         Privileges       = ''
-                        Note             = "$cls: cannot view grants for this external location. $script:LastDbxError"
+                        Note             = "${cls}: cannot view grants for this external location. $script:LastDbxError"
                     }
                 }
             }
