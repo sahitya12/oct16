@@ -1,13 +1,12 @@
 # sanitychecks/scripts/Scan-ADLS-Acls.ps1
-# FINAL working code for your ADO agent (NO Get-AzDataLakeGen2ItemAclObject)
-# - Uses ONLY: Get-AzDataLakeGen2Item -GetAccessControl (works on older Az.Storage)
-# - Computes ActualPermission from Access+Default (mask-limited), across root + parents + target
-# - Reports MissingPermission and Status (OK / PARTIAL / MISSING / ERROR)
-# - Reports MissingSources without treating missing ACL as OK
-# - Adds visibility columns: AccessAclRaw, DefaultAclRaw, AccessEntryForId, DefaultEntryForId
+# FINAL working code (compatible with very old Az.Storage on ADO agents)
+# - Uses ONLY: Get-AzDataLakeGen2Item -IncludeAcl  (no -GetAccessControl, no Get-AzDataLakeGen2ItemAclObject)
+# - Scans Access + Default + Mask (mask-limited) across root + parents + target path
+# - If input has rwx and actual is r-x => Status PARTIAL and MissingPermission = -w-
+# - If Access ACL missing OR Default ACL missing => NOT ERROR (treated as empty, as you asked)
 # - Output filename:
 #     adls_acl_<adh_group>_YYYYMMDD.csv
-#     adls_acl_<adh_group>_<adh_sub_group>_YYYYMMDD.csv   (if adh_sub_group passed)
+#     adls_acl_<adh_group>_<adh_sub_group>_YYYYMMDD.csv (if adh_sub_group passed)
 
 [CmdletBinding()]
 param(
@@ -241,7 +240,7 @@ function Ensure-ContainerExistsCached([string]$SubscriptionId,[string]$ResourceG
     $script:ContainerCache[$key] = $true
 }
 
-# ------------------------- ACL fetch (WORKS on your agent) --------------------------
+# ------------------------- ACL fetch (MOST compatible) --------------------------
 function Get-AclStringsForPathCached {
     param(
         [Parameter(Mandatory=$true)][string]$SubscriptionId,
@@ -264,14 +263,16 @@ function Get-AclStringsForPathCached {
 
     Write-Host "DEBUG ACL FETCH: fs=$FileSystem path='$p'"
 
-    # This cmdlet exists on older Az.Storage versions
-    $ac = Get-AzDataLakeGen2Item @params -GetAccessControl
+    # ✅ Works on older Az.Storage: returns item + AccessControl object
+    $item = Get-AzDataLakeGen2Item @params -IncludeAcl
 
     $access  = $null
     $default = $null
 
-    if ($ac -and ($ac.PSObject.Properties.Name -contains 'Acl'))        { $access  = $ac.Acl }
-    if ($ac -and ($ac.PSObject.Properties.Name -contains 'DefaultAcl')) { $default = $ac.DefaultAcl }
+    if ($item -and $item.AccessControl) {
+        $access  = $item.AccessControl.Acl
+        $default = $item.AccessControl.DefaultAcl
+    }
 
     $res = @{ AccessAcl=$access; DefaultAcl=$default }
     $script:AclCache[$cacheKey] = $res
@@ -286,8 +287,6 @@ if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
 if (-not $subs -or $subs.Count -eq 0) { throw "No subscriptions resolved for $adh_group / $adh_subscription_type" }
 
 $out = @()
-$total = $rows.Count
-$rowIndex = 0
 
 foreach ($sub in $subs) {
     Set-ScContext -Subscription $sub
@@ -296,8 +295,6 @@ foreach ($sub in $subs) {
     Write-Host "=== Subscription: $($sub.Name) ($subId) ===" -ForegroundColor Cyan
 
     foreach ($r in $rows) {
-        $rowIndex++
-
         $missingSrc = New-Object System.Collections.Generic.List[string]
 
         # Replace placeholders
@@ -327,6 +324,7 @@ foreach ($sub in $subs) {
         $accessPath = ("$($r.AccessPath)" -replace '<Custodian>', $BaseCustodian)
         $accessPath = ($accessPath -replace '<Cust>', $BaseCustLower).Trim()
 
+        # /catalog -> /adh_<group>[_<subgroup>]
         if ($accessPath -like '/catalog*') {
             $suffix = $accessPath.Substring('/catalog'.Length)
             $g = $adh_group.ToLower()
@@ -340,29 +338,6 @@ foreach ($sub in $subs) {
         $normalizedPath = $accessPath
         if ($normalizedPath -eq '/') { $normalizedPath = '' }
         $folderForReport = if ([string]::IsNullOrWhiteSpace($normalizedPath)) { '/' } else { $normalizedPath }
-
-        # Basic validation
-        if ([string]::IsNullOrWhiteSpace($rgName) -or [string]::IsNullOrWhiteSpace($saName) -or [string]::IsNullOrWhiteSpace($fsName)) {
-            $out += [pscustomobject]@{
-                SubscriptionName   = $sub.Name
-                ResourceGroup      = $rgName
-                Storage            = $saName
-                Container          = $fsName
-                Folder             = $folderForReport
-                Identity           = $iden
-                RequiredPermission = $r.PermissionType
-                ActualPermission   = ''
-                MissingPermission  = ''
-                Status             = 'ERROR'
-                MissingSources     = 'INPUT'
-                AccessAclRaw       = ''
-                DefaultAclRaw      = ''
-                AccessEntryForId   = ''
-                DefaultEntryForId  = ''
-                Notes              = 'RG/Storage/Container empty after placeholder replacement.'
-            }
-            continue
-        }
 
         # Resolve identity objectId
         $objectId = Resolve-IdentityObjectId -IdentityName $iden -IdentityType $type
@@ -443,6 +418,7 @@ foreach ($sub in $subs) {
                 $accessAclStr  = Normalize-AclToString $aclObj.AccessAcl
                 $defaultAclStr = Normalize-AclToString $aclObj.DefaultAcl
 
+                # Per your requirement: missing Access/Default is treated as EMPTY (NOT ERROR)
                 $parsedAccess  = Parse-AclString -AclString $accessAclStr  -Kind 'access'
                 $parsedDefault = Parse-AclString -AclString $defaultAclStr -Kind 'default'
 
@@ -454,7 +430,7 @@ foreach ($sub in $subs) {
                 $accessBits  = Get-EffectiveBitsFromParsedAcl -ParsedAcl $parsedAccess  -ObjectId $objectId
                 $defaultBits = Get-EffectiveBitsFromParsedAcl -ParsedAcl $parsedDefault -ObjectId $objectId
 
-                # Your semantics: Access + Default (masked) then OR
+                # Access + Default => OR
                 $combined = OrBits $accessBits $defaultBits
                 $actualBitsOverall = OrBits $actualBitsOverall $combined
 
