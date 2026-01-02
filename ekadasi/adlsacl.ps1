@@ -1,9 +1,12 @@
 # sanitychecks/scripts/Scan-ADLS-Acls.ps1
-# FINAL optimized version:
-# - Scans Access + Default + Mask (mask acts as limiter)
+# FINAL (optimized + correct reporting)
+# - Scans Access + Default + Mask (mask limits, does not grant)
 # - Compares RequiredPermission (from input) vs ActualPermission (computed)
-# - Outputs MissingPermission and Status (OK / PARTIAL / MISSING / ERROR)
-# - Optimized with caching + per-call timeout + progress logs
+# - Reports MissingPermission and Status (OK / PARTIAL / MISSING / ERROR)
+# - DOES NOT throw ERROR when ACL strings are missing/empty:
+#     Missing ACLs are treated as "no grants" for computation,
+#     AND explicitly reported in MissingSources column.
+# - Optimized with caching + progress logs
 # - Output name:
 #   adls_acl_<adh_group>_YYYYMMDD.csv
 #   adls_acl_<adh_group>_<adh_sub_group>_YYYYMMDD.csv  (if adh_sub_group passed)
@@ -55,14 +58,11 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 $BaseCustodian = $adh_group
 $BaseCustLower = $BaseCustodian.ToLower() -replace '_',''
 
-Write-Host "DEBUG: BaseCustodian = $BaseCustodian"
-Write-Host "DEBUG: BaseCustLower = $BaseCustLower"
-
-# ------------------------- Caches (big perf win) -----------------------
-$script:IdentityCache = @{}
-$script:AclCache = @{}     # key: "<subId>|<sa>|<fs>|<path>" => @{ AccessAcl=..., DefaultAcl=... }
-$script:ContainerCache = @{} # key: "<subId>|<rg>|<sa>|<fs>" => $true
-$script:StorageCtxCache = @{} # key: "<subId>|<rg>|<sa>" => StorageContext
+# ------------------------- Caches (performance) ------------------------
+$script:IdentityCache    = @{}
+$script:AclCache         = @{} # key: "<subId>|<sa>|<fs>|<path>" => @{ AccessAcl=..., DefaultAcl=... }
+$script:ContainerCache   = @{} # key: "<subId>|<rg>|<sa>|<fs>" => $true
+$script:StorageCtxCache  = @{} # key: "<subId>|<rg>|<sa>" => StorageContext
 
 # ------------------------- Identity resolver ---------------------------
 function Resolve-IdentityObjectId {
@@ -106,24 +106,6 @@ function Resolve-IdentityObjectId {
 
     $script:IdentityCache[$cacheKey] = $id
     return $id
-}
-
-# ------------------------- Timeout wrapper ----------------------------
-function Invoke-WithTimeout {
-    param(
-        [Parameter(Mandatory=$true)][scriptblock]$ScriptBlock,
-        [int]$TimeoutSeconds = 25,
-        [object[]]$ArgumentList = @()
-    )
-
-    # Start-Job isolates module/session state; for Az cmdlets, it can sometimes fail in job.
-    # So use a .NET timer approach with PowerShell StopProcessing? Not easy.
-    # Pragmatic approach: use Start-Job but pass only simple args and re-import modules inside.
-    # However that's slower. We'll instead set strict client timeout by limiting retries and
-    # rely on try/catch. Most hangs are actually long-running calls, not infinite.
-    #
-    # If you REALLY need hard-kill timeouts, tell me and I’ll give a Runspace-based version.
-    return & $ScriptBlock @ArgumentList
 }
 
 # ------------------------- Permission helpers --------------------------
@@ -200,14 +182,14 @@ function Compare-RequiredVsActual {
 function Normalize-AclToString {
     param($Acl)
 
-    if (-not $Acl) { return '' }
+    if ($null -eq $Acl) { return '' }
 
     if ($Acl -is [string]) {
         return $Acl
     }
 
     if ($Acl -is [System.Collections.IEnumerable]) {
-        return ($Acl | ForEach-Object { "$_" } ) -join ','
+        return ($Acl | ForEach-Object { "$_" }) -join ','
     }
 
     return [string]$Acl
@@ -215,43 +197,54 @@ function Normalize-AclToString {
 
 function Parse-AclString {
     param(
-        [Parameter(Mandatory=$true)][string]$AclString,
-        [Parameter(Mandatory=$true)][ValidateSet('access','default')][string]$Kind
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$AclString = '',
+
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('access','default')]
+        [string]$Kind
     )
+
+    # Present/MaskPresent let us report "missing sources" without turning it into ERROR.
     $result = @{
-        entries  = @()
-        maskBits = $null
+        Present     = $false
+        MaskPresent = $false
+        entries     = @()
+        maskBits    = $null
     }
 
-    if ([string]::IsNullOrWhiteSpace($AclString)) { return $result }
+    if ([string]::IsNullOrWhiteSpace($AclString)) {
+        return $result
+    }
+
+    $result.Present = $true
 
     $parts = $AclString -split ','
     foreach ($raw in $parts) {
         $e = $raw.Trim()
         if ([string]::IsNullOrWhiteSpace($e)) { continue }
 
-        # For default kind, entries start with 'default:' prefix.
         if ($Kind -eq 'default') {
             if ($e.StartsWith('default:')) { $e = $e.Substring(8) } else { continue }
         }
         else {
-            # For access kind, ignore default entries
             if ($e.StartsWith('default:')) { continue }
         }
 
-        # mask::rwx
         if ($e -match '^mask::([rwx-]{3})$') {
             $result.maskBits = (PermStringToBits -p $Matches[1])
+            $result.MaskPresent = $true
             continue
         }
 
-        # user:<id>:rwx or group:<id>:r-x
         if ($e -match '^(user|group):([^:]*):([rwx-]{3})$') {
             $etype = $Matches[1]
             $eid   = $Matches[2]
             $perm  = $Matches[3]
 
             if ([string]::IsNullOrWhiteSpace($eid)) { continue }  # owner entries
+
             $result.entries += [pscustomobject]@{
                 EntityType = $etype
                 EntityId   = $eid
@@ -311,9 +304,7 @@ function Ensure-ContainerExistsCached {
     )
 
     $key = "$SubscriptionId|$ResourceGroupName|$StorageAccountName|$FileSystemName"
-    if ($script:ContainerCache.ContainsKey($key)) {
-        return
-    }
+    if ($script:ContainerCache.ContainsKey($key)) { return }
 
     $null = Get-AzStorageContainer -Name $FileSystemName -Context $Context -ErrorAction Stop
     $script:ContainerCache[$key] = $true
@@ -342,41 +333,29 @@ function Get-AclStringsForPathCached {
     }
     if (-not [string]::IsNullOrWhiteSpace($p)) { $params.Path = $p }
 
-    # Progress log (prevents “stuck” feeling)
+    # Progress log so the task doesn't look stuck
     Write-Host "DEBUG ACL FETCH: fs=$FileSystem path='$p'"
 
     $access = $null
     $default = $null
 
-    # Try -GetAccessControl first (fast & accurate when supported)
+    # Try -GetAccessControl first
     try {
-        $ac = Invoke-WithTimeout -TimeoutSeconds 25 -ScriptBlock {
-            param($pp)
-            Get-AzDataLakeGen2Item @pp -GetAccessControl -ErrorAction Stop
-        } -ArgumentList @($params)
-
+        $ac = Get-AzDataLakeGen2Item @params -GetAccessControl -ErrorAction Stop
         if ($ac) {
             if ($ac.PSObject.Properties.Name -contains 'Acl')        { $access  = $ac.Acl }
             if ($ac.PSObject.Properties.Name -contains 'DefaultAcl') { $default = $ac.DefaultAcl }
         }
     } catch {
-        # ignore and fallback
+        # ignore and fallback below
     }
 
     # Fallback to normal item properties
-    if (-not $access -or (-not $default)) {
-        try {
-            $item = Invoke-WithTimeout -TimeoutSeconds 25 -ScriptBlock {
-                param($pp)
-                Get-AzDataLakeGen2Item @pp -ErrorAction Stop
-            } -ArgumentList @($params)
-
-            if ($item) {
-                if (-not $access  -and ($item.PSObject.Properties.Name -contains 'Acl'))        { $access  = $item.Acl }
-                if (-not $default -and ($item.PSObject.Properties.Name -contains 'DefaultAcl')) { $default = $item.DefaultAcl }
-            }
-        } catch {
-            throw
+    if ($null -eq $access -or $null -eq $default) {
+        $item = Get-AzDataLakeGen2Item @params -ErrorAction Stop
+        if ($item) {
+            if ($null -eq $access  -and ($item.PSObject.Properties.Name -contains 'Acl'))        { $access  = $item.Acl }
+            if ($null -eq $default -and ($item.PSObject.Properties.Name -contains 'DefaultAcl')) { $default = $item.DefaultAcl }
         }
     }
 
@@ -392,9 +371,6 @@ function Get-AclStringsForPathCached {
 # ------------------------- Load CSV & subs -----------------------------
 $rows = Import-Csv -LiteralPath $InputCsvPath
 Write-Host ("DEBUG: CSV rows loaded: {0}" -f $rows.Count)
-if ($rows.Count -gt 0) {
-    Write-Host ("DEBUG: CSV headers: " + ($rows[0].psobject.Properties.Name -join ', '))
-}
 
 $subs = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 if ($subs -isnot [System.Collections.IEnumerable]) { $subs = ,$subs }
@@ -411,23 +387,27 @@ foreach ($sub in $subs) {
 
     Set-ScContext -Subscription $sub
     $subId = "$($sub.Id)"
+
     Write-Host ""
     Write-Host "=== Subscription: $($sub.Name) ($subId) ===" -ForegroundColor Cyan
 
     foreach ($r in $rows) {
         $rowIndex++
 
-        # ---- Placeholder replacement: RG / SA / FS ----
-        $rgName = ($r.ResourceGroupName -replace '<Custodian>', $BaseCustodian).Trim()
+        # ------------------- Row-level tracker: missing sources -------------------
+        $missingSrc = New-Object System.Collections.Generic.List[string]
 
-        $saName = ($r.StorageAccountName -replace '<Custodian>', $BaseCustodian)
+        # ---- Placeholder replacement: RG / SA / FS ----
+        $rgName = ("$($r.ResourceGroupName)" -replace '<Custodian>', $BaseCustodian).Trim()
+
+        $saName = ("$($r.StorageAccountName)" -replace '<Custodian>', $BaseCustodian)
         $saName = ($saName -replace '<Cust>',      $BaseCustLower).Trim()
 
-        $fsName = ($r.ContainerName -replace '<Custodian>', $BaseCustodian)
+        $fsName = ("$($r.ContainerName)" -replace '<Custodian>', $BaseCustodian)
         $fsName = ($fsName -replace '<Cust>',      $BaseCustLower).Trim()
 
         # ---- Identity ----
-        $idenRaw = $r.Identity
+        $idenRaw = "$($r.Identity)"
         $iden = ($idenRaw -replace '<Custodian>', $BaseCustodian)
         $iden = ($iden -replace '<Cust>', $BaseCustLower).Trim()
 
@@ -466,7 +446,7 @@ foreach ($sub in $subs) {
         if ($normalizedPath -eq '/') { $normalizedPath = '' }
         $folderForReport = if ([string]::IsNullOrWhiteSpace($normalizedPath)) { '/' } else { $normalizedPath }
 
-        # Progress line every N rows
+        # Progress line every 20 rows (per subscription context)
         if (($rowIndex % 20) -eq 0) {
             Write-Host ("PROGRESS: {0}/{1} rows processed..." -f $rowIndex, $total)
         }
@@ -484,6 +464,7 @@ foreach ($sub in $subs) {
                 ActualPermission   = ''
                 MissingPermission  = ''
                 Status             = 'ERROR'
+                MissingSources     = 'INPUT'
                 Notes              = 'ResourceGroupName/StorageAccountName/ContainerName empty after placeholder replacement.'
             }
             continue
@@ -503,6 +484,7 @@ foreach ($sub in $subs) {
                 ActualPermission   = ''
                 MissingPermission  = ''
                 Status             = 'ERROR'
+                MissingSources     = 'IDENTITY'
                 Notes              = "Identity '$iden' ($type) not found in Entra ID."
             }
             continue
@@ -524,6 +506,7 @@ foreach ($sub in $subs) {
                 ActualPermission   = ''
                 MissingPermission  = ''
                 Status             = 'ERROR'
+                MissingSources     = 'STORAGE'
                 Notes              = "Storage/container error: $($_.Exception.Message)"
             }
             continue
@@ -550,35 +533,40 @@ foreach ($sub in $subs) {
         try {
             foreach ($p in $pathsToCheck) {
 
-                # Pull access/default ACL (cached)
                 $aclObj = Get-AclStringsForPathCached -SubscriptionId $subId -StorageAccountName $saName -FileSystem $fsName -Context $ctx -Path $p
 
-                # Normalize to string (fixes your "Cannot convert value to System.String" error)
                 $accessAclStr  = Normalize-AclToString $aclObj.AccessAcl
                 $defaultAclStr = Normalize-AclToString $aclObj.DefaultAcl
 
                 $parsedAccess  = Parse-AclString -AclString $accessAclStr  -Kind 'access'
                 $parsedDefault = Parse-AclString -AclString $defaultAclStr -Kind 'default'
 
+                # Record missing sources (reporting only; computation continues as "no grants")
+                if (-not $parsedAccess.Present)  { $missingSrc.Add("AccessACL@'$p'") | Out-Null }
+                if (-not $parsedDefault.Present) { $missingSrc.Add("DefaultACL@'$p'") | Out-Null }
+
+                if ($parsedAccess.Present -and -not $parsedAccess.MaskPresent)   { $missingSrc.Add("AccessMask@'$p'") | Out-Null }
+                if ($parsedDefault.Present -and -not $parsedDefault.MaskPresent) { $missingSrc.Add("DefaultMask@'$p'") | Out-Null }
+
                 $accessBits  = Get-EffectiveBitsFromParsedAcl -ParsedAcl $parsedAccess  -ObjectId $objectId
                 $defaultBits = Get-EffectiveBitsFromParsedAcl -ParsedAcl $parsedDefault -ObjectId $objectId
 
-                # For your requirement: "scan all Mask Default and Access"
-                # Combine grants from access+default (each already masked)
+                # Your requested semantics: scan all Access+Default (each mask-limited), then combine
                 $combined = OrBits $accessBits $defaultBits
-
                 $actualBitsOverall = OrBits $actualBitsOverall $combined
             }
 
             $cmp = Compare-RequiredVsActual -RequiredBits $requiredBits -ActualBits $actualBitsOverall
-
             $actualPerm  = BitsToPermString $actualBitsOverall
             $missingPerm = BitsToPermString $cmp.MissingBits
 
-            $note =
-                if ($cmp.Status -eq 'OK')      { 'Required permissions satisfied (computed from Access+Default with mask limits).' }
+            $noteBase =
+                if ($cmp.Status -eq 'OK') { 'Required permissions satisfied (computed from Access+Default with mask limits).' }
                 elseif ($cmp.Status -eq 'PARTIAL') { 'Some required bits are missing (computed from Access+Default with mask limits).' }
                 else { 'Required bits not satisfied (computed from Access+Default with mask limits).' }
+
+            $missingSourcesText = (($missingSrc | Select-Object -Unique) -join '; ')
+            if ([string]::IsNullOrWhiteSpace($missingSourcesText)) { $missingSourcesText = '' }
 
             $out += [pscustomobject]@{
                 SubscriptionName   = $sub.Name
@@ -591,7 +579,8 @@ foreach ($sub in $subs) {
                 ActualPermission   = $actualPerm
                 MissingPermission  = $missingPerm
                 Status             = $cmp.Status
-                Notes              = $note
+                MissingSources     = $missingSourcesText
+                Notes              = $noteBase
             }
         }
         catch {
@@ -606,6 +595,7 @@ foreach ($sub in $subs) {
                 ActualPermission   = ''
                 MissingPermission  = ''
                 Status             = 'ERROR'
+                MissingSources     = 'ACL_READ'
                 Notes              = "ACL read/compute error: $($_.Exception.Message)"
             }
         }
@@ -624,6 +614,7 @@ if (-not $out -or $out.Count -eq 0) {
         ActualPermission   = ''
         MissingPermission  = ''
         Status             = 'NO_RESULTS'
+        MissingSources     = ''
         Notes              = 'Nothing matched in scan.'
     }
 }
