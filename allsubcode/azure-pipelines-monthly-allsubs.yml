@@ -1,27 +1,39 @@
 trigger: none
 pr: none
 
+# ===========================================
+# SCHEDULES (UTC)
+# - Keep both blocks and comment/uncomment.
+# ===========================================
 schedules:
-- cron: "30 2 1 * *"
-  displayName: Monthly sanity checks (ALL custodians)
-  branches:
-    include:
-    - main
-  always: true
+  # ---- Monthly: 1st of every month @ 02:30 UTC (~08:00 IST) ----
+  - cron: "30 2 1 * *"
+    displayName: Monthly sanity checks (ALL custodians)
+    branches:
+      include:
+        - main
+    always: true
+
+  # ---- Every 2 hours: runs at 00:00, 02:00, 04:00... UTC ----
+  - cron: "0 */2 * * *"
+    displayName: Sanity checks (ALL custodians) - every 2 hours
+    branches:
+      include:
+        - main
+    always: true
 
 variables:
 - group: Terraform_ADO_Creds
 
 pool:
   name: Self-Hosted-Pool
-  # IMPORTANT: Do NOT set Agent.Name demand here.
-  # Use a generic agent that can read all subscriptions.
+  # IMPORTANT: no Agent.Name demand (any agent in this pool can run)
 
 steps:
 - checkout: self
 
 - task: PowerShell@2
-  displayName: Run monthly sanity checks across all custodians
+  displayName: Run sanity checks across all custodians
   inputs:
     pwsh: true
     targetType: inline
@@ -39,6 +51,8 @@ steps:
         -RgPermsNonPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\rg_permissions_nonprd.csv" `
         -RgPermsPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\rg_permissions_prd.csv" `
         -AdlsInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\adls_paths_master.csv" `
+        -KvSecretsInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\kv_secrets_master.csv" `
+        -KvPermInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\kv_permissions_master.csv" `
         -OutputRootDir $out `
         -RunRgPermissions $true `
         -RunRgTags $true `
@@ -52,7 +66,7 @@ steps:
         -BranchName "$(Build.SourceBranchName)"
 
 - task: PublishPipelineArtifact@1
-  displayName: Publish monthly outputs
+  displayName: Publish outputs
   inputs:
     targetPath: "$(Build.SourcesDirectory)\out"
-    artifact: "monthly_sanitychecks_allsubs"
+    artifact: "sanitychecks_allsubs"
