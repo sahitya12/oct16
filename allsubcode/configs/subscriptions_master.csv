@@ -1,5 +1,5 @@
-adh_group,adh_sub_group,adh_subscription_type,subscription_id
-KTK,,nonprd,
-KTK,,prd,
-MDM,,nonprd,
-MDM,,prd,
+adh_group,adh_sub_group,adh_subscription_type
+KTK,,nonprd
+KTK,,prd
+MDM,,nonprd
+MDM,,prd
