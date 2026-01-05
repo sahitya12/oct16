@@ -1,14 +1,15 @@
 # sanitychecks/scripts/Scan-ADLS-Acls.ps1
-# FINAL SCRIPT (v4): Scope-aware MissingSources + correct PARTIAL/MISSING + root "/" fix
-# ✅ Reads ACLs using Azure CLI (az storage fs access show)
-# ✅ ROOT path fix: always queries --path "/"
+# FINAL SCRIPT (v5):
+# ✅ Fix Excel #NAME? by prefixing permission strings with a single quote (ExcelSafe)
+# ✅ MissingSources now reports BOTH:
+#    - ACL missing (AccessACLMissing / DefaultACLMissing)
+#    - Identity entry missing even when ACL exists (AccessEntryMissing / DefaultEntryMissing)
+# ✅ MissingSources is SCOPE-AWARE (Access/Default/Both) so it won't show Default* when Scope=Access
+# ✅ ROOT "/" fix: always query --path "/"
 # ✅ Status logic:
-#    - OK: no missing required bits
-#    - MISSING: none of the required bits are satisfied
-#    - PARTIAL: some required bits satisfied, some missing
-# ✅ MissingSources is now SCOPE-AWARE (Access / Default / Both) to avoid confusion
-# ✅ Missing Access/Default ACL is treated as empty (NOT ERROR), but reported only if in-scope and Status != OK
-# ✅ Adds SatisfiedBy + ResolvedObjectId + ValidationScope for clarity
+#    - OK: all required bits satisfied
+#    - MISSING: none of the required bits satisfied
+#    - PARTIAL: some satisfied, some missing
 # ✅ Output filename:
 #    adls_acl_<adh_group>_YYYYMMDD.csv
 #    adls_acl_<adh_group>_<adh_sub_group>_YYYYMMDD.csv
@@ -18,9 +19,11 @@ param(
     [Parameter(Mandatory=$true)][string]$TenantId,
     [Parameter(Mandatory=$true)][string]$ClientId,
     [Parameter(Mandatory=$true)][string]$ClientSecret,
+
     [Parameter(Mandatory=$true)][string]$adh_group,
     [string]$adh_sub_group = '',
     [ValidateSet('nonprd','prd')][string]$adh_subscription_type = 'nonprd',
+
     [Parameter(Mandatory=$true)][string]$InputCsvPath,
     [Parameter(Mandatory=$true)][string]$OutputDir,
     [string]$BranchName = ''
@@ -29,6 +32,7 @@ param(
 Import-Module Az.Accounts, Az.Resources -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
+# -------------------- IO --------------------
 Ensure-Dir -Path $OutputDir | Out-Null
 if (-not (Test-Path -LiteralPath $InputCsvPath)) { throw "Input CSV not found: $InputCsvPath" }
 
@@ -44,22 +48,32 @@ Write-Host "DEBUG: InputCsvPath  = $InputCsvPath"
 Write-Host "DEBUG: OutputDir     = $OutputDir"
 Write-Host "DEBUG: BranchName    = $BranchName"
 
-# --- Connect Az (subscription resolution helpers) ---
+# -------------------- Connect Az (your Common.psm1 helpers) --------------------
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
 }
 
-# --- Ensure Azure CLI is present + login with SPN ---
+# -------------------- Ensure Azure CLI + login --------------------
 try { $null = az version | Out-String } catch { throw "Azure CLI 'az' not found on agent." }
 
 & az login --service-principal -u $ClientId -p $ClientSecret --tenant $TenantId 1>$null 2>$null
 if ($LASTEXITCODE -ne 0) { throw "az login failed for the provided SPN." }
 
+# -------------------- Globals / caches --------------------
 $BaseCustodian = $adh_group
 $BaseCustLower = $BaseCustodian.ToLower() -replace '_',''
 
 $script:IdentityCache = @{}
 $script:AclCache      = @{}
+
+# -------------------- Excel-safe helper (fix #NAME?) --------------------
+function ExcelSafe([string]$s) {
+    if ($null -eq $s) { return '' }
+    $s = "$s"
+    # Excel treats strings like --- or --x as formulas -> #NAME?
+    if ($s -match '^[rwx-]{3}$') { return "'" + $s }
+    return $s
+}
 
 # -------------------- Identity resolver --------------------
 function Resolve-IdentityObjectId {
@@ -156,6 +170,7 @@ function Parse-AclString {
         maskBits    = $null
     }
 
+    # Treat missing as empty (NOT ERROR)
     if ([string]::IsNullOrWhiteSpace($AclString)) { return $result }
     $result.Present = $true
 
@@ -252,9 +267,11 @@ function Get-AclStringsForPathCached {
     }
 
     $argsBase = @("storage","fs","access","show","--account-name",$StorageAccountName,"--file-system",$FileSystem,"--auth-mode","login","-o","tsv")
+
+    # ROOT path fix: always query --path "/"
     $argsPath = if ([string]::IsNullOrWhiteSpace($p)) { @("--path","/") } else { @("--path",$p) }
 
-    $accessAcl = ''
+    $accessAcl  = ''
     $defaultAcl = ''
 
     try {
@@ -313,7 +330,7 @@ foreach ($sub in $subs) {
             elseif ($typeRaw.Trim().ToUpper() -eq 'SPN') { 'SPN' }
             else { 'Group' }
 
-        # env filter
+        # env filter (keep your convention; adjust if needed)
         if ($adh_subscription_type -eq 'prd') { if ($saName -match 'adlsnonprd$') { continue } }
         else { if ($saName -match 'adlsprd$') { continue } }
 
@@ -331,7 +348,7 @@ foreach ($sub in $subs) {
             }
         }
 
-        $normalizedPath = $accessPath
+        $normalizedPath  = $accessPath
         if ($normalizedPath -eq '/') { $normalizedPath = '' }
         $folderForReport = if ([string]::IsNullOrWhiteSpace($normalizedPath)) { '/' } else { $normalizedPath }
 
@@ -346,9 +363,9 @@ foreach ($sub in $subs) {
                 Identity           = $iden
                 ResolvedObjectId   = ''
                 ValidationScope    = $scope
-                RequiredPermission = $r.PermissionType
-                ActualPermission   = ''
-                MissingPermission  = ''
+                RequiredPermission = ExcelSafe $r.PermissionType
+                ActualPermission   = ExcelSafe ''
+                MissingPermission  = ExcelSafe ''
                 Status             = 'ERROR'
                 SatisfiedBy        = 'NONE'
                 MissingSources     = 'IDENTITY'
@@ -361,11 +378,11 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # Build chain: root + parents + target
+        # Build chain: root + parents + target (for execute-on-parents semantics)
         $segments = @()
         if (-not [string]::IsNullOrWhiteSpace($normalizedPath)) { $segments = $normalizedPath.Trim('/') -split '/' }
 
-        $pathsToCheck = @('')  # root marker
+        $pathsToCheck = @('')  # root marker (will query "/")
         if ($segments.Count -gt 0) {
             $current = ''
             foreach ($seg in $segments) {
@@ -380,13 +397,13 @@ foreach ($sub in $subs) {
         $anyAccessContribution  = $false
         $anyDefaultContribution = $false
 
-        $targetAccessAclStr = ''
+        $targetAccessAclStr  = ''
         $targetDefaultAclStr = ''
-        $targetAccessEntry = ''
-        $targetDefaultEntry = ''
+        $targetAccessEntry   = ''
+        $targetDefaultEntry  = ''
 
         $lastPath = $pathsToCheck[-1]
-        $lastAccessPresent = $false
+        $lastAccessPresent  = $false
         $lastDefaultPresent = $false
 
         try {
@@ -400,7 +417,7 @@ foreach ($sub in $subs) {
                 $parsedAccess  = Parse-AclString -AclString $accessAclStr  -Kind 'access'
                 $parsedDefault = Parse-AclString -AclString $defaultAclStr -Kind 'default'
 
-                # ✅ Scope-aware evaluation: ignore the out-of-scope ACL when computing actual bits
+                # Scope-aware evaluation
                 $accessBits  = @{ r=$false; w=$false; x=$false }
                 $defaultBits = @{ r=$false; w=$false; x=$false }
 
@@ -420,8 +437,10 @@ foreach ($sub in $subs) {
                 if ($p -eq $pathsToCheck[-1]) {
                     $targetAccessAclStr  = $accessAclStr
                     $targetDefaultAclStr = $defaultAclStr
+
                     $targetAccessEntry   = Find-IdentityEntryText -AclString $accessAclStr  -ObjectId $objectId -Kind 'access'
                     $targetDefaultEntry  = Find-IdentityEntryText -AclString $defaultAclStr -ObjectId $objectId -Kind 'default'
+
                     $lastPath = $p
                     $lastAccessPresent  = $parsedAccess.Present
                     $lastDefaultPresent = $parsedDefault.Present
@@ -439,29 +458,42 @@ foreach ($sub in $subs) {
                 elseif (($cmp.Status -eq 'OK' -or $cmp.Status -eq 'PARTIAL') -and $anyDefaultContribution) { 'DEFAULT' }
                 else { 'NONE' }
 
-            # ✅ MissingSources ONLY when not OK, and ONLY for ACLs that are IN-SCOPE
+            # ✅ Enhanced MissingSources:
+            # - If ACL missing entirely => *ACLMissing
+            # - Else if ACL exists but identity entry missing at target => *EntryMissing
+            # Only for in-scope ACLs, only when Status != OK
             $missingSourcesText = ''
             if ($cmp.Status -ne 'OK') {
                 $ms = New-Object System.Collections.Generic.List[string]
+
+                $accessEntryExists  = -not [string]::IsNullOrWhiteSpace($targetAccessEntry)
+                $defaultEntryExists = -not [string]::IsNullOrWhiteSpace($targetDefaultEntry)
+
                 switch ($scope) {
                     'access' {
-                        if (-not $lastAccessPresent) { $ms.Add("AccessACL@'$lastPath'") | Out-Null }
+                        if (-not $lastAccessPresent) { $ms.Add("AccessACLMissing@'$lastPath'") | Out-Null }
+                        elseif (-not $accessEntryExists) { $ms.Add("AccessEntryMissing@'$lastPath'") | Out-Null }
                     }
                     'default' {
-                        if (-not $lastDefaultPresent) { $ms.Add("DefaultACL@'$lastPath'") | Out-Null }
+                        if (-not $lastDefaultPresent) { $ms.Add("DefaultACLMissing@'$lastPath'") | Out-Null }
+                        elseif (-not $defaultEntryExists) { $ms.Add("DefaultEntryMissing@'$lastPath'") | Out-Null }
                     }
                     default { # both
-                        if (-not $lastAccessPresent)  { $ms.Add("AccessACL@'$lastPath'")  | Out-Null }
-                        if (-not $lastDefaultPresent) { $ms.Add("DefaultACL@'$lastPath'") | Out-Null }
+                        if (-not $lastAccessPresent) { $ms.Add("AccessACLMissing@'$lastPath'") | Out-Null }
+                        elseif (-not $accessEntryExists) { $ms.Add("AccessEntryMissing@'$lastPath'") | Out-Null }
+
+                        if (-not $lastDefaultPresent) { $ms.Add("DefaultACLMissing@'$lastPath'") | Out-Null }
+                        elseif (-not $defaultEntryExists) { $ms.Add("DefaultEntryMissing@'$lastPath'") | Out-Null }
                     }
                 }
+
                 $missingSourcesText = ($ms | Select-Object -Unique) -join '; '
             }
 
             $note =
-                if ($cmp.Status -eq 'OK') { 'Required permissions satisfied (scope-aware, with mask limits).' }
-                elseif ($cmp.Status -eq 'PARTIAL') { 'Some required bits are satisfied, but not all (scope-aware, with mask limits).' }
-                else { 'No required bits are satisfied (scope-aware, with mask limits).' }
+                if ($cmp.Status -eq 'OK') { 'Required permissions satisfied (scope-aware, mask applied).' }
+                elseif ($cmp.Status -eq 'PARTIAL') { 'Some required bits satisfied; some missing (scope-aware, mask applied).' }
+                else { 'No required bits satisfied (scope-aware, mask applied).' }
 
             $out += [pscustomobject]@{
                 SubscriptionName   = $sub.Name
@@ -472,12 +504,15 @@ foreach ($sub in $subs) {
                 Identity           = $iden
                 ResolvedObjectId   = $objectId
                 ValidationScope    = $scope
-                RequiredPermission = $r.PermissionType
-                ActualPermission   = $actualPerm
-                MissingPermission  = $missingPerm
+
+                RequiredPermission = ExcelSafe $r.PermissionType
+                ActualPermission   = ExcelSafe $actualPerm
+                MissingPermission  = ExcelSafe $missingPerm
+
                 Status             = $cmp.Status
                 SatisfiedBy        = $satisfiedBy
                 MissingSources     = $missingSourcesText
+
                 AccessAclRaw       = $targetAccessAclStr
                 DefaultAclRaw      = $targetDefaultAclStr
                 AccessEntryForId   = $targetAccessEntry
@@ -495,12 +530,15 @@ foreach ($sub in $subs) {
                 Identity           = $iden
                 ResolvedObjectId   = $objectId
                 ValidationScope    = $scope
-                RequiredPermission = $r.PermissionType
-                ActualPermission   = ''
-                MissingPermission  = ''
+
+                RequiredPermission = ExcelSafe $r.PermissionType
+                ActualPermission   = ExcelSafe ''
+                MissingPermission  = ExcelSafe ''
+
                 Status             = 'ERROR'
                 SatisfiedBy        = 'NONE'
                 MissingSources     = 'ACL_READ'
+
                 AccessAclRaw       = $targetAccessAclStr
                 DefaultAclRaw      = $targetDefaultAclStr
                 AccessEntryForId   = $targetAccessEntry
@@ -521,9 +559,9 @@ if (-not $out -or $out.Count -eq 0) {
         Identity           = ''
         ResolvedObjectId   = ''
         ValidationScope    = ''
-        RequiredPermission = ''
-        ActualPermission   = ''
-        MissingPermission  = ''
+        RequiredPermission = ExcelSafe ''
+        ActualPermission   = ExcelSafe ''
+        MissingPermission  = ExcelSafe ''
         Status             = 'NO_RESULTS'
         SatisfiedBy        = 'NONE'
         MissingSources     = ''
