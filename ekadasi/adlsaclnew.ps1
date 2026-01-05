@@ -1,15 +1,18 @@
 # sanitychecks/scripts/Scan-ADLS-Acls.ps1
-# FINAL SCRIPT (v5):
-# ✅ Fix Excel #NAME? by prefixing permission strings with a single quote (ExcelSafe)
-# ✅ MissingSources now reports BOTH:
-#    - ACL missing (AccessACLMissing / DefaultACLMissing)
-#    - Identity entry missing even when ACL exists (AccessEntryMissing / DefaultEntryMissing)
-# ✅ MissingSources is SCOPE-AWARE (Access/Default/Both) so it won't show Default* when Scope=Access
-# ✅ ROOT "/" fix: always query --path "/"
+# FINAL SCRIPT (v6)
+# ✅ Fix Excel #NAME? (permissions like r--/---/--x) via ExcelSafe everywhere
+# ✅ MissingSources is STRICTLY scope-aware:
+#    - scope=access  -> only AccessACLMissing / AccessEntryMissing
+#    - scope=default -> only DefaultACLMissing / DefaultEntryMissing
+#    - scope=both    -> can include both
+# ✅ MissingSources shows when:
+#    - ACL string missing (treated as empty, not ERROR)
+#    - Identity entry missing even when ACL exists (EntryMissing)
+# ✅ Root "/" always queried with --path "/"
 # ✅ Status logic:
-#    - OK: all required bits satisfied
-#    - MISSING: none of the required bits satisfied
-#    - PARTIAL: some satisfied, some missing
+#    - OK      : all required bits present
+#    - MISSING : none of required bits present
+#    - PARTIAL : some present, some missing
 # ✅ Output filename:
 #    adls_acl_<adh_group>_YYYYMMDD.csv
 #    adls_acl_<adh_group>_<adh_sub_group>_YYYYMMDD.csv
@@ -48,7 +51,7 @@ Write-Host "DEBUG: InputCsvPath  = $InputCsvPath"
 Write-Host "DEBUG: OutputDir     = $OutputDir"
 Write-Host "DEBUG: BranchName    = $BranchName"
 
-# -------------------- Connect Az (your Common.psm1 helpers) --------------------
+# -------------------- Connect Az (your Common.psm1 helper) --------------------
 if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret)) {
     throw "Azure connection failed."
 }
@@ -132,10 +135,7 @@ function RequiredBitsFromPermissionType([string]$permType) {
     @{ r=($permType -like '*r*'); w=($permType -like '*w*'); x=($permType -like '*x*') }
 }
 
-# ✅ Correct PARTIAL logic:
-# OK: none missing
-# MISSING: none of required bits satisfied
-# PARTIAL: some satisfied, some missing
+# OK: none missing | MISSING: none satisfied | PARTIAL: some satisfied, some missing
 function Compare-RequiredVsActual($req,$act) {
     $missing = @{
         r = ($req.r -and -not $act.r)
@@ -307,7 +307,7 @@ foreach ($sub in $subs) {
 
     foreach ($r in $rows) {
 
-        # ✅ Read scope from input row:
+        # Scope from input row:
         # expected values: Access | Default | Both (empty => Both)
         $scope = "$($r.Scope)".Trim().ToLower()
         if ([string]::IsNullOrWhiteSpace($scope)) { $scope = 'both' }
@@ -330,10 +330,6 @@ foreach ($sub in $subs) {
             elseif ($typeRaw.Trim().ToUpper() -eq 'SPN') { 'SPN' }
             else { 'Group' }
 
-        # env filter (keep your convention; adjust if needed)
-        if ($adh_subscription_type -eq 'prd') { if ($saName -match 'adlsnonprd$') { continue } }
-        else { if ($saName -match 'adlsprd$') { continue } }
-
         $accessPath = ("$($r.AccessPath)" -replace '<Custodian>', $BaseCustodian)
         $accessPath = ($accessPath -replace '<Cust>', $BaseCustLower).Trim()
 
@@ -349,7 +345,7 @@ foreach ($sub in $subs) {
         }
 
         $normalizedPath  = $accessPath
-        if ($normalizedPath -eq '/') { $normalizedPath = '' }
+        if ($normalizedPath -eq '/') { $normalizedPath = '' } # root marker
         $folderForReport = if ([string]::IsNullOrWhiteSpace($normalizedPath)) { '/' } else { $normalizedPath }
 
         $objectId = Resolve-IdentityObjectId -IdentityName $iden -IdentityType $type
@@ -363,9 +359,11 @@ foreach ($sub in $subs) {
                 Identity           = $iden
                 ResolvedObjectId   = ''
                 ValidationScope    = $scope
-                RequiredPermission = ExcelSafe $r.PermissionType
+
+                RequiredPermission = ExcelSafe "$($r.PermissionType)"
                 ActualPermission   = ExcelSafe ''
                 MissingPermission  = ExcelSafe ''
+
                 Status             = 'ERROR'
                 SatisfiedBy        = 'NONE'
                 MissingSources     = 'IDENTITY'
@@ -378,11 +376,11 @@ foreach ($sub in $subs) {
             continue
         }
 
-        # Build chain: root + parents + target (for execute-on-parents semantics)
+        # Build chain: root + parents + target
         $segments = @()
         if (-not [string]::IsNullOrWhiteSpace($normalizedPath)) { $segments = $normalizedPath.Trim('/') -split '/' }
 
-        $pathsToCheck = @('')  # root marker (will query "/")
+        $pathsToCheck = @('')  # root marker (queries "/")
         if ($segments.Count -gt 0) {
             $current = ''
             foreach ($seg in $segments) {
@@ -434,10 +432,12 @@ foreach ($sub in $subs) {
                 $combined = OrBits $accessBits $defaultBits
                 $actualBitsOverall = OrBits $actualBitsOverall $combined
 
+                # target path capture
                 if ($p -eq $pathsToCheck[-1]) {
                     $targetAccessAclStr  = $accessAclStr
                     $targetDefaultAclStr = $defaultAclStr
 
+                    # entries found at target path (used for EntryMissing)
                     $targetAccessEntry   = Find-IdentityEntryText -AclString $accessAclStr  -ObjectId $objectId -Kind 'access'
                     $targetDefaultEntry  = Find-IdentityEntryText -AclString $defaultAclStr -ObjectId $objectId -Kind 'default'
 
@@ -449,19 +449,18 @@ foreach ($sub in $subs) {
 
             $cmp = Compare-RequiredVsActual -req $requiredBits -act $actualBitsOverall
 
-            $actualPerm  = BitsToPermString $actualBitsOverall
-            $missingPerm = BitsToPermString $cmp.MissingBits
+            # ✅ ExcelSafe applied at creation time (fix #NAME?)
+            $actualPerm  = ExcelSafe (BitsToPermString $actualBitsOverall)
+            $missingPerm = ExcelSafe (BitsToPermString $cmp.MissingBits)
+            $reqPerm     = ExcelSafe "$($r.PermissionType)"
 
             $satisfiedBy =
-                if (($cmp.Status -eq 'OK' -or $cmp.Status -eq 'PARTIAL') -and $anyAccessContribution -and $anyDefaultContribution) { 'BOTH' }
-                elseif (($cmp.Status -eq 'OK' -or $cmp.Status -eq 'PARTIAL') -and $anyAccessContribution) { 'ACCESS' }
-                elseif (($cmp.Status -eq 'OK' -or $cmp.Status -eq 'PARTIAL') -and $anyDefaultContribution) { 'DEFAULT' }
+                if (($cmp.Status -in @('OK','PARTIAL')) -and $anyAccessContribution -and $anyDefaultContribution) { 'BOTH' }
+                elseif (($cmp.Status -in @('OK','PARTIAL')) -and $anyAccessContribution) { 'ACCESS' }
+                elseif (($cmp.Status -in @('OK','PARTIAL')) -and $anyDefaultContribution) { 'DEFAULT' }
                 else { 'NONE' }
 
-            # ✅ Enhanced MissingSources:
-            # - If ACL missing entirely => *ACLMissing
-            # - Else if ACL exists but identity entry missing at target => *EntryMissing
-            # Only for in-scope ACLs, only when Status != OK
+            # ✅ STRICT scope-aware MissingSources (no Default* when scope=access)
             $missingSourcesText = ''
             if ($cmp.Status -ne 'OK') {
                 $ms = New-Object System.Collections.Generic.List[string]
@@ -469,22 +468,20 @@ foreach ($sub in $subs) {
                 $accessEntryExists  = -not [string]::IsNullOrWhiteSpace($targetAccessEntry)
                 $defaultEntryExists = -not [string]::IsNullOrWhiteSpace($targetDefaultEntry)
 
-                switch ($scope) {
-                    'access' {
-                        if (-not $lastAccessPresent) { $ms.Add("AccessACLMissing@'$lastPath'") | Out-Null }
-                        elseif (-not $accessEntryExists) { $ms.Add("AccessEntryMissing@'$lastPath'") | Out-Null }
-                    }
-                    'default' {
-                        if (-not $lastDefaultPresent) { $ms.Add("DefaultACLMissing@'$lastPath'") | Out-Null }
-                        elseif (-not $defaultEntryExists) { $ms.Add("DefaultEntryMissing@'$lastPath'") | Out-Null }
-                    }
-                    default { # both
-                        if (-not $lastAccessPresent) { $ms.Add("AccessACLMissing@'$lastPath'") | Out-Null }
-                        elseif (-not $accessEntryExists) { $ms.Add("AccessEntryMissing@'$lastPath'") | Out-Null }
+                if ($scope -eq 'access') {
+                    if (-not $lastAccessPresent) { $ms.Add("AccessACLMissing@'$lastPath'") | Out-Null }
+                    elseif (-not $accessEntryExists) { $ms.Add("AccessEntryMissing@'$lastPath'") | Out-Null }
+                }
+                elseif ($scope -eq 'default') {
+                    if (-not $lastDefaultPresent) { $ms.Add("DefaultACLMissing@'$lastPath'") | Out-Null }
+                    elseif (-not $defaultEntryExists) { $ms.Add("DefaultEntryMissing@'$lastPath'") | Out-Null }
+                }
+                else { # both
+                    if (-not $lastAccessPresent) { $ms.Add("AccessACLMissing@'$lastPath'") | Out-Null }
+                    elseif (-not $accessEntryExists) { $ms.Add("AccessEntryMissing@'$lastPath'") | Out-Null }
 
-                        if (-not $lastDefaultPresent) { $ms.Add("DefaultACLMissing@'$lastPath'") | Out-Null }
-                        elseif (-not $defaultEntryExists) { $ms.Add("DefaultEntryMissing@'$lastPath'") | Out-Null }
-                    }
+                    if (-not $lastDefaultPresent) { $ms.Add("DefaultACLMissing@'$lastPath'") | Out-Null }
+                    elseif (-not $defaultEntryExists) { $ms.Add("DefaultEntryMissing@'$lastPath'") | Out-Null }
                 }
 
                 $missingSourcesText = ($ms | Select-Object -Unique) -join '; '
@@ -492,8 +489,8 @@ foreach ($sub in $subs) {
 
             $note =
                 if ($cmp.Status -eq 'OK') { 'Required permissions satisfied (scope-aware, mask applied).' }
-                elseif ($cmp.Status -eq 'PARTIAL') { 'Some required bits satisfied; some missing (scope-aware, mask applied).' }
-                else { 'No required bits satisfied (scope-aware, mask applied).' }
+                elseif ($cmp.Status -eq 'PARTIAL') { 'Some required bits are satisfied, but not all (scope-aware, mask applied).' }
+                else { 'No required bits are satisfied (scope-aware, mask applied).' }
 
             $out += [pscustomobject]@{
                 SubscriptionName   = $sub.Name
@@ -505,18 +502,20 @@ foreach ($sub in $subs) {
                 ResolvedObjectId   = $objectId
                 ValidationScope    = $scope
 
-                RequiredPermission = ExcelSafe $r.PermissionType
-                ActualPermission   = ExcelSafe $actualPerm
-                MissingPermission  = ExcelSafe $missingPerm
+                RequiredPermission = $reqPerm
+                ActualPermission   = $actualPerm
+                MissingPermission  = $missingPerm
 
                 Status             = $cmp.Status
                 SatisfiedBy        = $satisfiedBy
                 MissingSources     = $missingSourcesText
 
+                # Raw ACLs for troubleshooting
                 AccessAclRaw       = $targetAccessAclStr
                 DefaultAclRaw      = $targetDefaultAclStr
                 AccessEntryForId   = $targetAccessEntry
                 DefaultEntryForId  = $targetDefaultEntry
+
                 Notes              = $note
             }
         }
@@ -531,7 +530,7 @@ foreach ($sub in $subs) {
                 ResolvedObjectId   = $objectId
                 ValidationScope    = $scope
 
-                RequiredPermission = ExcelSafe $r.PermissionType
+                RequiredPermission = ExcelSafe "$($r.PermissionType)"
                 ActualPermission   = ExcelSafe ''
                 MissingPermission  = ExcelSafe ''
 
