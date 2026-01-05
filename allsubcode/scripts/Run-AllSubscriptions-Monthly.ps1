@@ -138,4 +138,89 @@ foreach ($r in $rows) {
     '-TenantId', $TenantId,
     '-ClientId', $ClientId,
     '-ClientSecret', $ClientSecret,
-    '-adh_g_
+    '-adh_group', $adh_group,
+    '-adh_sub_group', $adh_sub_group,
+    '-adh_subscription_type', $env,
+    '-OutputDir', $subOut,
+    '-BranchName', $BranchName
+  )
+
+  # Some scripts do not accept adh_sub_group (ADF)
+  $baseArgsNoSub = @(
+    '-TenantId', $TenantId,
+    '-ClientId', $ClientId,
+    '-ClientSecret', $ClientSecret,
+    '-adh_group', $adh_group,
+    '-adh_subscription_type', $env,
+    '-OutputDir', $subOut,
+    '-BranchName', $BranchName
+  )
+
+  if ($RunRgPermissions) {
+    $args = @(
+      '-TenantId', $TenantId, '-ClientId', $ClientId, '-ClientSecret', $ClientSecret,
+      '-adh_group', $adh_group, '-adh_sub_group', $adh_sub_group, '-adh_subscription_type', $env,
+      '-ProdCsvPath', $RgPermsPrdCsvPath,
+      '-NonProdCsvPath', $RgPermsNonPrdCsvPath,
+      '-OutputDir', $subOut,
+      '-BranchName', $BranchName
+    )
+    $code = Invoke-ChildScript -Title "RG Permissions ($custToken/$env)" -ScriptPath $scanRgPerms -Args $args
+    if ($code -ne 0) { $failures += "RG Permissions $custToken/$env" }
+  }
+
+  if ($RunRgTags) {
+    $code = Invoke-ChildScript -Title "RG Tags ($custToken/$env)" -ScriptPath $scanRgTags -Args $baseArgsWithSub
+    if ($code -ne 0) { $failures += "RG Tags $custToken/$env" }
+  }
+
+  if ($RunKvSecrets) {
+    $args = $baseArgsWithSub + @('-InputCsvPath', $KvSecretsInputCsvPath)
+    $code = Invoke-ChildScript -Title "KV Secrets ($custToken/$env)" -ScriptPath $scanKvSecrets -Args $args
+    if ($code -ne 0) { $failures += "KV Secrets $custToken/$env" }
+  }
+
+  if ($RunKvPermissions) {
+    $args = $baseArgsWithSub + @('-KvPermCsvPath', $KvPermInputCsvPath)
+    $code = Invoke-ChildScript -Title "KV Permissions ($custToken/$env)" -ScriptPath $scanKvPerms -Args $args
+    if ($code -ne 0) { $failures += "KV Permissions $custToken/$env" }
+  }
+
+  if ($RunKvFirewall) {
+    $code = Invoke-ChildScript -Title "KV Networks ($custToken/$env)" -ScriptPath $scanKvFw -Args $baseArgsWithSub
+    if ($code -ne 0) { $failures += "KV Networks $custToken/$env" }
+  }
+
+  if ($RunVnet) {
+    $code = Invoke-ChildScript -Title "VNet ($custToken/$env)" -ScriptPath $scanVnet -Args $baseArgsWithSub
+    if ($code -ne 0) { $failures += "VNet $custToken/$env" }
+  }
+
+  if ($RunAdls) {
+    $args = $baseArgsWithSub + @('-InputCsvPath', $adlsCsv)
+    $code = Invoke-ChildScript -Title "ADLS ACL ($custToken/$env)" -ScriptPath $scanAdls -Args $args
+    if ($code -ne 0) { $failures += "ADLS ACL $custToken/$env" }
+  }
+
+  if ($RunAdf) {
+    $code = Invoke-ChildScript -Title "Data Factory ($custToken/$env)" -ScriptPath $scanAdf -Args $baseArgsNoSub
+    if ($code -ne 0) { $failures += "Data Factory $custToken/$env" }
+  }
+
+  if ($RunDatabricks) {
+    $code = Invoke-ChildScript -Title "Databricks ($custToken/$env)" -ScriptPath $scanDbx -Args $baseArgsWithSub
+    if ($code -ne 0) { $failures += "Databricks $custToken/$env" }
+  }
+}
+
+Write-Host ""
+Write-Host "ALL-SUBS run completed. Output: $runDir" -ForegroundColor Green
+
+if ($failures.Count -gt 0) {
+  Write-Host ""
+  Write-Host "Some checks failed:" -ForegroundColor Yellow
+  $failures | Sort-Object | ForEach-Object { Write-Host " - $_" -ForegroundColor Yellow }
+  exit 1
+}
+
+exit 0
