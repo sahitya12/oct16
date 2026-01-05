@@ -1,14 +1,13 @@
 # sanitychecks/scripts/Scan-ADLS-Acls.ps1
-# FINAL SCRIPT (v3): correct PARTIAL logic + clear MissingSources
 # ✅ Reads ACLs using Azure CLI (az storage fs access show)
-# ✅ ROOT path fix: uses --path "/"
-# ✅ Missing Access/Default ACL => treated as empty (NOT ERROR)
+# ✅ ROOT path fix: always queries --path "/"
 # ✅ Status logic:
 #    - OK: no missing required bits
 #    - MISSING: none of the required bits are satisfied
 #    - PARTIAL: some required bits satisfied, some missing
-# ✅ MissingSources: only populated when Status != OK, and only for the TARGET path
-# ✅ Adds SatisfiedBy + ResolvedObjectId for easy troubleshooting
+# ✅ MissingSources is now SCOPE-AWARE (Access / Default / Both) to avoid confusion
+# ✅ Missing Access/Default ACL is treated as empty (NOT ERROR), but reported only if in-scope and Status != OK
+# ✅ Adds SatisfiedBy + ResolvedObjectId + ValidationScope for clarity
 # ✅ Output filename:
 #    adls_acl_<adh_group>_YYYYMMDD.csv
 #    adls_acl_<adh_group>_<adh_sub_group>_YYYYMMDD.csv
@@ -129,11 +128,9 @@ function Compare-RequiredVsActual($req,$act) {
         x = ($req.x -and -not $act.x)
     }
 
-    # satisfied bits among required
     $satR = ($req.r -and $act.r)
     $satW = ($req.w -and $act.w)
     $satX = ($req.x -and $act.x)
-
     $anySatisfied = ($satR -or $satW -or $satX)
 
     $status =
@@ -166,7 +163,7 @@ function Parse-AclString {
         $e = $raw.Trim()
         if ([string]::IsNullOrWhiteSpace($e)) { continue }
 
-        # CLI default entries look like: default:user:<id>:r-x and default:mask::r-x
+        # CLI default entries: default:user:<id>:r-x and default:mask::r-x
         if ($Kind -eq 'default') {
             if ($e.StartsWith('default:')) { $e = $e.Substring(8) } else { continue }
         } else {
@@ -254,8 +251,6 @@ function Get-AclStringsForPathCached {
     }
 
     $argsBase = @("storage","fs","access","show","--account-name",$StorageAccountName,"--file-system",$FileSystem,"--auth-mode","login","-o","tsv")
-
-    # Root fix: always pass a path, root must be "/"
     $argsPath = if ([string]::IsNullOrWhiteSpace($p)) { @("--path","/") } else { @("--path",$p) }
 
     $accessAcl = ''
@@ -293,6 +288,13 @@ foreach ($sub in $subs) {
     Write-Host "=== Subscription: $($sub.Name) ($subId) ===" -ForegroundColor Cyan
 
     foreach ($r in $rows) {
+
+        # ✅ Read scope from input row:
+        # expected values: Access | Default | Both (empty => Both)
+        $scope = "$($r.Scope)".Trim().ToLower()
+        if ([string]::IsNullOrWhiteSpace($scope)) { $scope = 'both' }
+        if ($scope -notin @('access','default','both')) { $scope = 'both' }
+
         $rgName = ("$($r.ResourceGroupName)" -replace '<Custodian>', $BaseCustodian).Trim()
 
         $saName = ("$($r.StorageAccountName)" -replace '<Custodian>', $BaseCustodian)
@@ -342,6 +344,7 @@ foreach ($sub in $subs) {
                 Folder             = $folderForReport
                 Identity           = $iden
                 ResolvedObjectId   = ''
+                ValidationScope    = $scope
                 RequiredPermission = $r.PermissionType
                 ActualPermission   = ''
                 MissingPermission  = ''
@@ -396,8 +399,16 @@ foreach ($sub in $subs) {
                 $parsedAccess  = Parse-AclString -AclString $accessAclStr  -Kind 'access'
                 $parsedDefault = Parse-AclString -AclString $defaultAclStr -Kind 'default'
 
-                $accessBits  = Get-EffectiveBitsFromParsedAcl -ParsedAcl $parsedAccess  -ObjectId $objectId
-                $defaultBits = Get-EffectiveBitsFromParsedAcl -ParsedAcl $parsedDefault -ObjectId $objectId
+                # ✅ Scope-aware evaluation: ignore the out-of-scope ACL when computing actual bits
+                $accessBits  = @{ r=$false; w=$false; x=$false }
+                $defaultBits = @{ r=$false; w=$false; x=$false }
+
+                if ($scope -eq 'access' -or $scope -eq 'both') {
+                    $accessBits = Get-EffectiveBitsFromParsedAcl -ParsedAcl $parsedAccess -ObjectId $objectId
+                }
+                if ($scope -eq 'default' -or $scope -eq 'both') {
+                    $defaultBits = Get-EffectiveBitsFromParsedAcl -ParsedAcl $parsedDefault -ObjectId $objectId
+                }
 
                 if ($accessBits.r -or $accessBits.w -or $accessBits.x) { $anyAccessContribution = $true }
                 if ($defaultBits.r -or $defaultBits.w -or $defaultBits.x) { $anyDefaultContribution = $true }
@@ -422,25 +433,34 @@ foreach ($sub in $subs) {
             $missingPerm = BitsToPermString $cmp.MissingBits
 
             $satisfiedBy =
-                if ($cmp.Status -eq 'OK' -and $anyAccessContribution -and $anyDefaultContribution) { 'BOTH' }
-                elseif (($cmp.Status -eq 'OK' -or $cmp.Status -eq 'PARTIAL') -and $anyAccessContribution -and $anyDefaultContribution) { 'BOTH' }
+                if (($cmp.Status -eq 'OK' -or $cmp.Status -eq 'PARTIAL') -and $anyAccessContribution -and $anyDefaultContribution) { 'BOTH' }
                 elseif (($cmp.Status -eq 'OK' -or $cmp.Status -eq 'PARTIAL') -and $anyAccessContribution) { 'ACCESS' }
                 elseif (($cmp.Status -eq 'OK' -or $cmp.Status -eq 'PARTIAL') -and $anyDefaultContribution) { 'DEFAULT' }
                 else { 'NONE' }
 
-            # MissingSources only when not OK, and only for TARGET path
+            # ✅ MissingSources ONLY when not OK, and ONLY for ACLs that are IN-SCOPE
             $missingSourcesText = ''
             if ($cmp.Status -ne 'OK') {
                 $ms = New-Object System.Collections.Generic.List[string]
-                if (-not $lastAccessPresent)  { $ms.Add("AccessACL@'$lastPath'")  | Out-Null }
-                if (-not $lastDefaultPresent) { $ms.Add("DefaultACL@'$lastPath'") | Out-Null }
+                switch ($scope) {
+                    'access' {
+                        if (-not $lastAccessPresent) { $ms.Add("AccessACL@'$lastPath'") | Out-Null }
+                    }
+                    'default' {
+                        if (-not $lastDefaultPresent) { $ms.Add("DefaultACL@'$lastPath'") | Out-Null }
+                    }
+                    default { # both
+                        if (-not $lastAccessPresent)  { $ms.Add("AccessACL@'$lastPath'")  | Out-Null }
+                        if (-not $lastDefaultPresent) { $ms.Add("DefaultACL@'$lastPath'") | Out-Null }
+                    }
+                }
                 $missingSourcesText = ($ms | Select-Object -Unique) -join '; '
             }
 
             $note =
-                if ($cmp.Status -eq 'OK') { 'Required permissions satisfied (computed from Access+Default with mask limits).' }
-                elseif ($cmp.Status -eq 'PARTIAL') { 'Some required bits are satisfied, but not all (computed from Access+Default with mask limits).' }
-                else { 'No required bits are satisfied (computed from Access+Default with mask limits).' }
+                if ($cmp.Status -eq 'OK') { 'Required permissions satisfied (scope-aware, with mask limits).' }
+                elseif ($cmp.Status -eq 'PARTIAL') { 'Some required bits are satisfied, but not all (scope-aware, with mask limits).' }
+                else { 'No required bits are satisfied (scope-aware, with mask limits).' }
 
             $out += [pscustomobject]@{
                 SubscriptionName   = $sub.Name
@@ -450,6 +470,7 @@ foreach ($sub in $subs) {
                 Folder             = $folderForReport
                 Identity           = $iden
                 ResolvedObjectId   = $objectId
+                ValidationScope    = $scope
                 RequiredPermission = $r.PermissionType
                 ActualPermission   = $actualPerm
                 MissingPermission  = $missingPerm
@@ -472,6 +493,7 @@ foreach ($sub in $subs) {
                 Folder             = $folderForReport
                 Identity           = $iden
                 ResolvedObjectId   = $objectId
+                ValidationScope    = $scope
                 RequiredPermission = $r.PermissionType
                 ActualPermission   = ''
                 MissingPermission  = ''
@@ -497,6 +519,7 @@ if (-not $out -or $out.Count -eq 0) {
         Folder             = ''
         Identity           = ''
         ResolvedObjectId   = ''
+        ValidationScope    = ''
         RequiredPermission = ''
         ActualPermission   = ''
         MissingPermission  = ''
