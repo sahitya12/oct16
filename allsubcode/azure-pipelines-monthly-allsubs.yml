@@ -1,0 +1,58 @@
+trigger: none
+pr: none
+
+schedules:
+- cron: "30 2 1 * *"
+  displayName: Monthly sanity checks (ALL custodians)
+  branches:
+    include:
+    - main
+  always: true
+
+variables:
+- group: Terraform_ADO_Creds
+
+pool:
+  name: Self-Hosted-Pool
+  # IMPORTANT: Do NOT set Agent.Name demand here.
+  # Use a generic agent that can read all subscriptions.
+
+steps:
+- checkout: self
+
+- task: PowerShell@2
+  displayName: Run monthly sanity checks across all custodians
+  inputs:
+    pwsh: true
+    targetType: inline
+    script: |
+      $ErrorActionPreference = "Stop"
+
+      $out = "$(Build.SourcesDirectory)\out"
+      New-Item -ItemType Directory -Path $out -Force | Out-Null
+
+      pwsh -NoProfile -File "$(Build.SourcesDirectory)\sanitychecks\scripts\Run-AllSubscriptions-Monthly.ps1" `
+        -TenantId "$(ADO_TenantId)" `
+        -ClientId "$(ADO_SPN_ClientID)" `
+        -ClientSecret "$(ADO_SPN_ClientSecret)" `
+        -SubscriptionsCsvPath "$(Build.SourcesDirectory)\configs\subscriptions_master.csv" `
+        -RgPermsNonPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\rg_permissions_nonprd.csv" `
+        -RgPermsPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\rg_permissions_prd.csv" `
+        -AdlsInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\adls_paths_master.csv" `
+        -OutputRootDir $out `
+        -RunRgPermissions $true `
+        -RunRgTags $true `
+        -RunKvSecrets $true `
+        -RunKvPermissions $true `
+        -RunKvFirewall $true `
+        -RunVnet $true `
+        -RunAdls $true `
+        -RunAdf $true `
+        -RunDatabricks $true `
+        -BranchName "$(Build.SourceBranchName)"
+
+- task: PublishPipelineArtifact@1
+  displayName: Publish monthly outputs
+  inputs:
+    targetPath: "$(Build.SourcesDirectory)\out"
+    artifact: "monthly_sanitychecks_allsubs"
