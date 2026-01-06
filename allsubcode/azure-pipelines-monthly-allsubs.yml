@@ -2,13 +2,13 @@ trigger: none
 pr: none
 
 schedules:
-  # ---- Monthly: 1st of every month @ 02:30 UTC ----
-  - cron: "30 2 1 * *"
-    displayName: Monthly sanity checks (ALL custodians)
-    branches:
-      include:
-        - main
-    always: true
+  # # ---- Monthly: 1st of every month @ 02:30 UTC ----
+  # - cron: "30 2 1 * *"
+  #   displayName: Monthly sanity checks (ALL custodians)
+  #   branches:
+  #     include:
+  #       - main
+  #   always: true
 
   # ---- Every 2 hours (UTC) ----
   - cron: "0 */2 * * *"
@@ -44,11 +44,14 @@ steps:
       Write-Host "Login ClientId : $($env:BACKEND_CLIENT_ID)"
       Write-Host "ClientSecret  : present (hidden)"
 
-      # Unique per run
+      # Unique per run so 2-hour schedule doesn't overwrite
       $outRoot = "$(Build.SourcesDirectory)/sanitychecks/out/$(Build.BuildId)"
       New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
 
-      pwsh -NoProfile -File "$(Build.SourcesDirectory)/sanitychecks/scripts/Run-AllSubscriptions-Monthly.ps1" `
+      $orchestrator = "$(Build.SourcesDirectory)/sanitychecks/scripts/Run-AllSubscriptions-Monthly.ps1"
+
+      # ✅ Call the orchestrator directly (NO pwsh -File), so bool params stay bool
+      & $orchestrator `
         -TenantId $env:TENANT_ID `
         -ClientId $env:BACKEND_CLIENT_ID `
         -ClientSecret $env:BACKEND_CLIENT_SECRET `
@@ -60,16 +63,18 @@ steps:
         -KvSecretsInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/kvsecretsscan.csv" `
         -KvPermInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/kvpermissions.csv" `
         -OutputRootDir $outRoot `
-        -RunRgPermissions true `
-        -RunRgTags true `
-        -RunKvSecrets true `
-        -RunKvPermissions true `
-        -RunKvFirewall true `
-        -RunVnet true `
-        -RunAdls true `
-        -RunAdf true `
-        -RunDatabricks true `
+        -RunRgPermissions:$true `
+        -RunRgTags:$true `
+        -RunKvSecrets:$true `
+        -RunKvPermissions:$true `
+        -RunKvFirewall:$true `
+        -RunVnet:$true `
+        -RunAdls:$true `
+        -RunAdf:$true `
+        -RunDatabricks:$true `
         -BranchName "$(Build.SourceBranchName)"
+
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   env:
     TENANT_ID: $(tenant_id)
     BACKEND_CLIENT_ID: $(backend_client_id)
