@@ -2,7 +2,6 @@ trigger: none
 pr: none
 
 schedules:
-  # # Monthly: 1st of every month @ 02:30 UTC
   # - cron: "30 2 1 * *"
   #   displayName: Monthly sanity checks (ALL custodians)
   #   branches:
@@ -10,7 +9,6 @@ schedules:
   #       - main
   #   always: true
 
-  # Every 2 hours (UTC)
   - cron: "0 */2 * * *"
     displayName: Sanity checks (ALL custodians) - every 2 hours
     branches:
@@ -19,7 +17,6 @@ schedules:
     always: true
 
 variables:
-  # Your login variable group (as per screenshot)
   - group: modernization_tfstate_backend_details
 
 pool:
@@ -36,12 +33,10 @@ steps:
     script: |
       $ErrorActionPreference = "Stop"
 
-      # Ensure variable group values exist
       if (-not "$(tenant_id)") { throw "Missing variable: tenant_id" }
       if (-not "$(backend_client_id)") { throw "Missing variable: backend_client_id" }
       if (-not "$(backend_client_secret)") { throw "Missing variable: backend_client_secret" }
 
-      # Unique per run (so 2-hour schedule doesn't overwrite)
       $outRoot = "$(Build.SourcesDirectory)\sanitychecks\out\$(Build.BuildId)"
       New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
 
@@ -62,5 +57,6 @@ steps:
 - task: PublishPipelineArtifact@1
   displayName: Publish outputs
   inputs:
-    targetPath: "$(Build.SourcesDirectory)\sanitychecks\out\$(Build.BuildId)"
-    artifact: "sanitychecks_allsubs_$(Build.BuildId)"
+    # ✅ use forward slashes (or single quotes) to avoid YAML escaping problems
+    targetPath: '$(Build.SourcesDirectory)/sanitychecks/out/$(Build.BuildId)'
+    artifact: 'sanitychecks_allsubs_$(Build.BuildId)'
