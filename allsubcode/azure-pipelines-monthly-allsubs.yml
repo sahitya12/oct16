@@ -18,8 +18,9 @@ schedules:
         - main
     always: true
 
+# ✅ Use the variable group you showed in screenshot
 variables:
-- group: Terraform_ADO_Creds
+- group: modernization_tfstate_backend_details
 
 pool:
   name: Self-Hosted-Pool
@@ -35,14 +36,23 @@ steps:
     script: |
       $ErrorActionPreference = "Stop"
 
+      # ---- Validate variable group values are available (fail fast) ----
+      if ([string]::IsNullOrWhiteSpace($env:TENANT_ID))             { throw "Missing variable: tenant_id (from modernization_tfstate_backend_details)" }
+      if ([string]::IsNullOrWhiteSpace($env:BACKEND_CLIENT_ID))     { throw "Missing variable: backend_client_id (from modernization_tfstate_backend_details)" }
+      if ([string]::IsNullOrWhiteSpace($env:BACKEND_CLIENT_SECRET)) { throw "Missing variable: backend_client_secret (from modernization_tfstate_backend_details)" }
+
+      Write-Host "Login TenantId : $($env:TENANT_ID)"
+      Write-Host "Login ClientId : $($env:BACKEND_CLIENT_ID)"
+      Write-Host "ClientSecret  : present (hidden)"
+
       # Unique per run so 2-hour schedule doesn't overwrite
       $outRoot = "$(Build.SourcesDirectory)/sanitychecks/out/$(Build.BuildId)"
       New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
 
       pwsh -NoProfile -File "$(Build.SourcesDirectory)/sanitychecks/scripts/Run-AllSubscriptions-Monthly.ps1" `
-        -TenantId "$(ADO_TenantId)" `
-        -ClientId "$(ADO_SPN_ClientID)" `
-        -ClientSecret "$(ADO_SPN_ClientSecret)" `
+        -TenantId $env:TENANT_ID `
+        -ClientId $env:BACKEND_CLIENT_ID `
+        -ClientSecret $env:BACKEND_CLIENT_SECRET `
         -SubscriptionsCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/subscriptions_master.csv" `
         -RgPermsNonPrdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprd_permissions.csv" `
         -RgPermsPrdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv" `
@@ -61,6 +71,11 @@ steps:
         -RunAdf $true `
         -RunDatabricks $true `
         -BranchName "$(Build.SourceBranchName)"
+  env:
+    # ✅ exact variable names from the variable group
+    TENANT_ID: $(tenant_id)
+    BACKEND_CLIENT_ID: $(backend_client_id)
+    BACKEND_CLIENT_SECRET: $(backend_client_secret)
 
 - task: PublishPipelineArtifact@1
   displayName: Publish outputs
