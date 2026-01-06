@@ -2,7 +2,6 @@ trigger: none
 pr: none
 
 schedules:
-  # # ---- Monthly: 1st of every month @ 02:30 UTC ----
   # - cron: "30 2 1 * *"
   #   displayName: Monthly sanity checks (ALL custodians)
   #   branches:
@@ -10,7 +9,6 @@ schedules:
   #       - main
   #   always: true
 
-  # ---- Every 2 hours (UTC) ----
   - cron: "0 */2 * * *"
     displayName: Sanity checks (ALL custodians) - every 2 hours
     branches:
@@ -19,7 +17,6 @@ schedules:
     always: true
 
 variables:
-  # Using your variable group for login (as per screenshots)
   - group: modernization_tfstate_backend_details
 
 pool:
@@ -46,23 +43,23 @@ steps:
       Write-Host "ClientSecret  : present (hidden)"
 
       # Unique per run so 2-hour schedule doesn't overwrite
-      $outRoot = "$(Build.SourcesDirectory)\sanitychecks\out\$(Build.BuildId)"
+      $outRoot = "$(Build.SourcesDirectory)/sanitychecks/out/$(Build.BuildId)"
       New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
 
-      $scriptPath = "$(Build.SourcesDirectory)\sanitychecks\scripts\Run-AllSubscriptions-Monthly.ps1"
+      $scriptPath = "$(Build.SourcesDirectory)/sanitychecks/scripts/Run-AllSubscriptions-Monthly.ps1"
       if (-not (Test-Path -LiteralPath $scriptPath)) { throw "Missing orchestrator: $scriptPath" }
 
       pwsh -NoProfile -File $scriptPath `
         -TenantId $env:TENANT_ID `
         -ClientId $env:BACKEND_CLIENT_ID `
         -ClientSecret $env:BACKEND_CLIENT_SECRET `
-        -SubscriptionsCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\subscriptions_master.csv" `
-        -RgPermsNonPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\nonprod_permissions.csv" `
-        -RgPermsPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\prod_permissions.csv" `
-        -AdlsNonPrdInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\adls_nonprd_permissions.csv" `
-        -AdlsPrdInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\adls_prd_permissions.csv" `
-        -KvSecretsInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\kvsecretsscan.csv" `
-        -KvPermInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\kvpermissions.csv" `
+        -SubscriptionsCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/subscriptions_master.csv" `
+        -RgPermsNonPrdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv" `
+        -RgPermsPrdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv" `
+        -AdlsNonPrdInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_nonprd_permissions.csv" `
+        -AdlsPrdInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_prd_permissions.csv" `
+        -KvSecretsInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/kvsecretsscan.csv" `
+        -KvPermInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/kvpermissions.csv" `
         -OutputRootDir $outRoot `
         -RunRgPermissions true `
         -RunRgTags true `
@@ -74,7 +71,6 @@ steps:
         -RunAdf true `
         -RunDatabricks true `
         -BranchName "$(Build.SourceBranchName)"
-
   env:
     TENANT_ID: $(tenant_id)
     BACKEND_CLIENT_ID: $(backend_client_id)
@@ -83,5 +79,5 @@ steps:
 - task: PublishPipelineArtifact@1
   displayName: Publish outputs
   inputs:
-    targetPath: "$(Build.SourcesDirectory)\sanitychecks\out\$(Build.BuildId)"
-    artifact: "sanitychecks_allsubs_$(Build.BuildId)"
+    targetPath: $(Build.SourcesDirectory)/sanitychecks/out/$(Build.BuildId)
+    artifact: sanitychecks_allsubs_$(Build.BuildId)
