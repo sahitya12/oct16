@@ -18,7 +18,6 @@ schedules:
         - main
     always: true
 
-# ✅ Use the variable group you showed in screenshot
 variables:
 - group: modernization_tfstate_backend_details
 
@@ -36,16 +35,16 @@ steps:
     script: |
       $ErrorActionPreference = "Stop"
 
-      # ---- Validate variable group values are available (fail fast) ----
-      if ([string]::IsNullOrWhiteSpace($env:TENANT_ID))             { throw "Missing variable: tenant_id (from modernization_tfstate_backend_details)" }
-      if ([string]::IsNullOrWhiteSpace($env:BACKEND_CLIENT_ID))     { throw "Missing variable: backend_client_id (from modernization_tfstate_backend_details)" }
-      if ([string]::IsNullOrWhiteSpace($env:BACKEND_CLIENT_SECRET)) { throw "Missing variable: backend_client_secret (from modernization_tfstate_backend_details)" }
+      # ---- Validate variable group values ----
+      if (-not $env:TENANT_ID)             { throw "Missing variable: tenant_id" }
+      if (-not $env:BACKEND_CLIENT_ID)     { throw "Missing variable: backend_client_id" }
+      if (-not $env:BACKEND_CLIENT_SECRET) { throw "Missing variable: backend_client_secret" }
 
       Write-Host "Login TenantId : $($env:TENANT_ID)"
       Write-Host "Login ClientId : $($env:BACKEND_CLIENT_ID)"
       Write-Host "ClientSecret  : present (hidden)"
 
-      # Unique per run so 2-hour schedule doesn't overwrite
+      # Unique per run
       $outRoot = "$(Build.SourcesDirectory)/sanitychecks/out/$(Build.BuildId)"
       New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
 
@@ -61,18 +60,17 @@ steps:
         -KvSecretsInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/kvsecretsscan.csv" `
         -KvPermInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/kvpermissions.csv" `
         -OutputRootDir $outRoot `
-        -RunRgPermissions $true `
-        -RunRgTags $true `
-        -RunKvSecrets $true `
-        -RunKvPermissions $true `
-        -RunKvFirewall $true `
-        -RunVnet $true `
-        -RunAdls $true `
-        -RunAdf $true `
-        -RunDatabricks $true `
+        -RunRgPermissions true `
+        -RunRgTags true `
+        -RunKvSecrets true `
+        -RunKvPermissions true `
+        -RunKvFirewall true `
+        -RunVnet true `
+        -RunAdls true `
+        -RunAdf true `
+        -RunDatabricks true `
         -BranchName "$(Build.SourceBranchName)"
   env:
-    # ✅ exact variable names from the variable group
     TENANT_ID: $(tenant_id)
     BACKEND_CLIENT_ID: $(backend_client_id)
     BACKEND_CLIENT_SECRET: $(backend_client_secret)
