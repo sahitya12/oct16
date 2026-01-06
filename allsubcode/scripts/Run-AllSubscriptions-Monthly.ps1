@@ -6,11 +6,11 @@ param(
 
   [Parameter(Mandatory)][string]$SubscriptionsCsvPath,
 
-  # RG permissions inputs (same for all)
+  # RG permissions inputs
   [Parameter(Mandatory)][string]$RgPermsNonPrdCsvPath,
   [Parameter(Mandatory)][string]$RgPermsPrdCsvPath,
 
-  # ADLS inputs (env-specific)
+  # ADLS inputs
   [Parameter(Mandatory)][string]$AdlsNonPrdInputCsvPath,
   [Parameter(Mandatory)][string]$AdlsPrdInputCsvPath,
 
@@ -20,25 +20,45 @@ param(
 
   [Parameter(Mandatory)][string]$OutputRootDir,
 
-  # toggles
-  [bool]$RunRgPermissions = $true,
-  [bool]$RunRgTags        = $true,
-  [bool]$RunKvSecrets     = $true,
-  [bool]$RunKvPermissions = $true,
-  [bool]$RunKvFirewall    = $true,
-  [bool]$RunVnet          = $true,
-  [bool]$RunAdls          = $true,
-  [bool]$RunAdf           = $true,
-  [bool]$RunDatabricks    = $true,
+  # -----------------------------
+  # TOGGLES (MUST NOT BE [bool])
+  # -----------------------------
+  [object]$RunRgPermissions = $true,
+  [object]$RunRgTags        = $true,
+  [object]$RunKvSecrets     = $true,
+  [object]$RunKvPermissions = $true,
+  [object]$RunKvFirewall    = $true,
+  [object]$RunVnet          = $true,
+  [object]$RunAdls          = $true,
+  [object]$RunAdf           = $true,
+  [object]$RunDatabricks    = $true,
 
   [string]$BranchName = ''
 )
 
 $ErrorActionPreference = 'Stop'
 
+# ------------------- Helpers -------------------
 function Ensure-Dir([string]$p) {
-  if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
+  if (-not (Test-Path -LiteralPath $p)) {
+    New-Item -ItemType Directory -Path $p -Force | Out-Null
+  }
   (Get-Item -LiteralPath $p).FullName
+}
+
+function Convert-ToBool([object]$v, [bool]$default = $false) {
+  if ($null -eq $v) { return $default }
+  if ($v -is [bool]) { return $v }
+
+  $s = "$v".Trim()
+
+  if ($s -match '^(?i:true|1|yes|y|on)$')  { return $true }
+  if ($s -match '^(?i:false|0|no|n|off)$') { return $false }
+
+  # Azure DevOps sometimes passes "System.String"
+  if ($s -eq 'System.String') { return $default }
+
+  return $default
 }
 
 function Invoke-ChildScript {
@@ -51,6 +71,7 @@ function Invoke-ChildScript {
   Write-Host ""
   Write-Host "==================== $Title ====================" -ForegroundColor Cyan
   Write-Host "Script: $ScriptPath"
+
   try {
     & pwsh -NoProfile -File $ScriptPath @Args
     $code = $LASTEXITCODE
@@ -67,8 +88,30 @@ function Invoke-ChildScript {
   }
 }
 
-# ------------------- Repo-relative paths -------------------
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path  # sanitychecks/
+# ------------------- Normalize toggles -------------------
+$RunRgPermissions = Convert-ToBool $RunRgPermissions $true
+$RunRgTags        = Convert-ToBool $RunRgTags $true
+$RunKvSecrets     = Convert-ToBool $RunKvSecrets $true
+$RunKvPermissions = Convert-ToBool $RunKvPermissions $true
+$RunKvFirewall    = Convert-ToBool $RunKvFirewall $true
+$RunVnet          = Convert-ToBool $RunVnet $true
+$RunAdls          = Convert-ToBool $RunAdls $true
+$RunAdf           = Convert-ToBool $RunAdf $true
+$RunDatabricks    = Convert-ToBool $RunDatabricks $true
+
+Write-Host "Toggle summary:"
+Write-Host "  RunRgPermissions = $RunRgPermissions"
+Write-Host "  RunRgTags        = $RunRgTags"
+Write-Host "  RunKvSecrets     = $RunKvSecrets"
+Write-Host "  RunKvPermissions = $RunKvPermissions"
+Write-Host "  RunKvFirewall    = $RunKvFirewall"
+Write-Host "  RunVnet          = $RunVnet"
+Write-Host "  RunAdls          = $RunAdls"
+Write-Host "  RunAdf           = $RunAdf"
+Write-Host "  RunDatabricks    = $RunDatabricks"
+
+# ------------------- Paths -------------------
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $scanRoot = Join-Path $repoRoot 'scripts'
 
 $scanRgPerms   = Join-Path $scanRoot 'Scan-RG-Permissions-ByCustodian.ps1'
@@ -81,59 +124,44 @@ $scanAdf       = Join-Path $scanRoot 'Scan-DataFactory.ps1'
 $scanDbx       = Join-Path $scanRoot 'Scan-Databricks.ps1'
 $scanVnet      = Join-Path $scanRoot 'Scan-VNet-Monthly.ps1'
 
-# ------------------- Validate required files -------------------
-foreach ($p in @(
-  $SubscriptionsCsvPath,
-  $RgPermsNonPrdCsvPath, $RgPermsPrdCsvPath,
-  $AdlsNonPrdInputCsvPath, $AdlsPrdInputCsvPath,
-  $KvSecretsInputCsvPath, $KvPermInputCsvPath,
-  $scanRgPerms, $scanRgTags, $scanKvSecrets, $scanKvPerms, $scanKvFw,
-  $scanAdls, $scanAdf, $scanDbx, $scanVnet
-)) {
-  if (-not (Test-Path -LiteralPath $p)) { throw "Required file not found: $p" }
-}
-
-# ------------------- Output root per run -------------------
+# ------------------- Output root -------------------
 $outRoot = Ensure-Dir $OutputRootDir
 $runStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$runDir = Ensure-Dir (Join-Path $outRoot ("allsubs_{0}" -f $runStamp))
+$runDir = Ensure-Dir (Join-Path $outRoot "allsubs_$runStamp")
 
-Write-Host "ALL-SUBS run starting..."
-Write-Host "RunDir: $runDir"
+Write-Host "ALL-SUBSCRIPTIONS SANITY CHECK STARTED"
+Write-Host "Output directory: $runDir"
 Write-Host "Branch: $BranchName"
 
-# ------------------- Read subscriptions master -------------------
+# ------------------- Read subscriptions -------------------
 $rows = Import-Csv -LiteralPath $SubscriptionsCsvPath
-if (-not $rows -or $rows.Count -eq 0) { throw "No rows found in: $SubscriptionsCsvPath" }
+if (-not $rows -or $rows.Count -eq 0) {
+  throw "No rows found in $SubscriptionsCsvPath"
+}
 
 $failures = @()
 
 foreach ($r in $rows) {
-  $adh_group = ("$($r.adh_group)").Trim()
-  $adh_sub_group = ("$($r.adh_sub_group)").Trim()
-  $env = ("$($r.adh_subscription_type)").Trim().ToLower()
 
-  if ([string]::IsNullOrWhiteSpace($adh_group) -or [string]::IsNullOrWhiteSpace($env)) {
-    Write-Host "Skipping row (missing adh_group or adh_subscription_type): $($r | ConvertTo-Json -Compress)" -ForegroundColor Yellow
-    continue
-  }
-  if ($env -notin @('nonprd','prd')) {
-    Write-Host "Skipping row (invalid env '$env'): $($r | ConvertTo-Json -Compress)" -ForegroundColor Yellow
+  $adh_group     = "$($r.adh_group)".Trim()
+  $adh_sub_group = "$($r.adh_sub_group)".Trim()
+  $env           = "$($r.adh_subscription_type)".Trim().ToLower()
+
+  if (-not $adh_group -or $env -notin @('nonprd','prd')) {
+    Write-Host "Skipping invalid row: $($r | ConvertTo-Json -Compress)" -ForegroundColor Yellow
     continue
   }
 
-  $custToken = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) { $adh_group } else { "${adh_group}_${adh_sub_group}" }
-  $subOut = Ensure-Dir (Join-Path $runDir ("{0}_{1}" -f $custToken, $env))
+  $custToken = if ($adh_sub_group) { "${adh_group}_${adh_sub_group}" } else { $adh_group }
+  $subOut = Ensure-Dir (Join-Path $runDir "${custToken}_$env")
 
   Write-Host ""
   Write-Host "############################################################" -ForegroundColor Magenta
   Write-Host "# Custodian: $custToken | Env: $env" -ForegroundColor Magenta
   Write-Host "############################################################" -ForegroundColor Magenta
 
-  # ADLS input selection based on env
   $adlsCsv = if ($env -eq 'prd') { $AdlsPrdInputCsvPath } else { $AdlsNonPrdInputCsvPath }
 
-  # Common args for scripts that accept adh_sub_group
   $baseArgsWithSub = @(
     '-TenantId', $TenantId,
     '-ClientId', $ClientId,
@@ -145,7 +173,6 @@ foreach ($r in $rows) {
     '-BranchName', $BranchName
   )
 
-  # Some scripts do not accept adh_sub_group (ADF)
   $baseArgsNoSub = @(
     '-TenantId', $TenantId,
     '-ClientId', $ClientId,
@@ -157,68 +184,59 @@ foreach ($r in $rows) {
   )
 
   if ($RunRgPermissions) {
-    $args = @(
-      '-TenantId', $TenantId, '-ClientId', $ClientId, '-ClientSecret', $ClientSecret,
-      '-adh_group', $adh_group, '-adh_sub_group', $adh_sub_group, '-adh_subscription_type', $env,
+    Invoke-ChildScript "RG Permissions ($custToken/$env)" $scanRgPerms @(
+      '-TenantId', $TenantId,
+      '-ClientId', $ClientId,
+      '-ClientSecret', $ClientSecret,
+      '-adh_group', $adh_group,
+      '-adh_sub_group', $adh_sub_group,
+      '-adh_subscription_type', $env,
       '-ProdCsvPath', $RgPermsPrdCsvPath,
       '-NonProdCsvPath', $RgPermsNonPrdCsvPath,
       '-OutputDir', $subOut,
       '-BranchName', $BranchName
-    )
-    $code = Invoke-ChildScript -Title "RG Permissions ($custToken/$env)" -ScriptPath $scanRgPerms -Args $args
-    if ($code -ne 0) { $failures += "RG Permissions $custToken/$env" }
+    ) | ForEach-Object { if ($_ -ne 0) { $failures += "RG Permissions $custToken/$env" } }
   }
 
   if ($RunRgTags) {
-    $code = Invoke-ChildScript -Title "RG Tags ($custToken/$env)" -ScriptPath $scanRgTags -Args $baseArgsWithSub
-    if ($code -ne 0) { $failures += "RG Tags $custToken/$env" }
+    Invoke-ChildScript "RG Tags ($custToken/$env)" $scanRgTags $baseArgsWithSub
   }
 
   if ($RunKvSecrets) {
-    $args = $baseArgsWithSub + @('-InputCsvPath', $KvSecretsInputCsvPath)
-    $code = Invoke-ChildScript -Title "KV Secrets ($custToken/$env)" -ScriptPath $scanKvSecrets -Args $args
-    if ($code -ne 0) { $failures += "KV Secrets $custToken/$env" }
+    Invoke-ChildScript "KV Secrets ($custToken/$env)" $scanKvSecrets ($baseArgsWithSub + @('-InputCsvPath', $KvSecretsInputCsvPath))
   }
 
   if ($RunKvPermissions) {
-    $args = $baseArgsWithSub + @('-KvPermCsvPath', $KvPermInputCsvPath)
-    $code = Invoke-ChildScript -Title "KV Permissions ($custToken/$env)" -ScriptPath $scanKvPerms -Args $args
-    if ($code -ne 0) { $failures += "KV Permissions $custToken/$env" }
+    Invoke-ChildScript "KV Permissions ($custToken/$env)" $scanKvPerms ($baseArgsWithSub + @('-KvPermCsvPath', $KvPermInputCsvPath))
   }
 
   if ($RunKvFirewall) {
-    $code = Invoke-ChildScript -Title "KV Networks ($custToken/$env)" -ScriptPath $scanKvFw -Args $baseArgsWithSub
-    if ($code -ne 0) { $failures += "KV Networks $custToken/$env" }
+    Invoke-ChildScript "KV Networks ($custToken/$env)" $scanKvFw $baseArgsWithSub
   }
 
-  if ($RunVnet) {
-    $code = Invoke-ChildScript -Title "VNet ($custToken/$env)" -ScriptPath $scanVnet -Args $baseArgsWithSub
-    if ($code -ne 0) { $failures += "VNet $custToken/$env" }
+  if ($RunVnet -and (Test-Path $scanVnet)) {
+    Invoke-ChildScript "VNet ($custToken/$env)" $scanVnet $baseArgsWithSub
   }
 
   if ($RunAdls) {
-    $args = $baseArgsWithSub + @('-InputCsvPath', $adlsCsv)
-    $code = Invoke-ChildScript -Title "ADLS ACL ($custToken/$env)" -ScriptPath $scanAdls -Args $args
-    if ($code -ne 0) { $failures += "ADLS ACL $custToken/$env" }
+    Invoke-ChildScript "ADLS ACL ($custToken/$env)" $scanAdls ($baseArgsWithSub + @('-InputCsvPath', $adlsCsv))
   }
 
   if ($RunAdf) {
-    $code = Invoke-ChildScript -Title "Data Factory ($custToken/$env)" -ScriptPath $scanAdf -Args $baseArgsNoSub
-    if ($code -ne 0) { $failures += "Data Factory $custToken/$env" }
+    Invoke-ChildScript "Data Factory ($custToken/$env)" $scanAdf $baseArgsNoSub
   }
 
   if ($RunDatabricks) {
-    $code = Invoke-ChildScript -Title "Databricks ($custToken/$env)" -ScriptPath $scanDbx -Args $baseArgsWithSub
-    if ($code -ne 0) { $failures += "Databricks $custToken/$env" }
+    Invoke-ChildScript "Databricks ($custToken/$env)" $scanDbx $baseArgsWithSub
   }
 }
 
 Write-Host ""
-Write-Host "ALL-SUBS run completed. Output: $runDir" -ForegroundColor Green
+Write-Host "ALL-SUBSCRIPTIONS SANITY CHECK COMPLETED" -ForegroundColor Green
+Write-Host "Output: $runDir"
 
 if ($failures.Count -gt 0) {
-  Write-Host ""
-  Write-Host "Some checks failed:" -ForegroundColor Yellow
+  Write-Host "Failures detected:" -ForegroundColor Yellow
   $failures | Sort-Object | ForEach-Object { Write-Host " - $_" -ForegroundColor Yellow }
   exit 1
 }
