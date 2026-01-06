@@ -26,8 +26,10 @@ jobs:
     clean: true
 
   # -------------------------------------------------------
-  # ✅ HARD RESET: prevents random default subscription = 0000...
-  # Safe on self-hosted Windows agents running as service (systemprofile)
+  # ✅ HARD RESET (SAFE): isolate + clear Az + Azure CLI contexts
+  # - Does NOT fail if "az logout" says "no active accounts"
+  # - Forces per-job Azure CLI profile dir to avoid cross-run contamination
+  # - Clears Az contexts autosave in both scopes
   # -------------------------------------------------------
   - task: PowerShell@2
     displayName: "HARD RESET: Az + CLI contexts (pre-scan)"
@@ -39,19 +41,39 @@ jobs:
         Write-Host "=== HARD RESET (pre-scan) ==="
         Write-Host "Agent: $env:AGENT_NAME"
         Write-Host "USERPROFILE: $env:USERPROFILE"
-        Write-Host "LOCALAPPDATA: $env:LOCALAPPDATA"
-        Write-Host "AZURE_CONFIG_DIR: $env:AZURE_CONFIG_DIR"
+        Write-Host "Agent.TempDirectory: $env:AGENT_TEMPDIRECTORY"
 
-        # ----------------------------
-        # Azure CLI logout (best effort)
-        # ----------------------------
-        try { az logout | Out-Null } catch { Write-Host "az logout skipped" }
+        # 1) Isolate Azure CLI profile per job (prevents random cached contexts)
+        $jobAzureDir = Join-Path $env:AGENT_TEMPDIRECTORY "azure_config"
+        New-Item -ItemType Directory -Path $jobAzureDir -Force | Out-Null
+        $env:AZURE_CONFIG_DIR = $jobAzureDir
+        Write-Host "AZURE_CONFIG_DIR set to: $env:AZURE_CONFIG_DIR"
 
+        # 2) Azure CLI logout (best effort) - DO NOT FAIL job if it returns nonzero
+        if (Get-Command az -ErrorAction SilentlyContinue) {
+          az logout | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "az logout returned exit code $LASTEXITCODE (ignored)."
+            $global:LASTEXITCODE = 0
+          } else {
+            Write-Host "az logout OK."
+          }
+
+          # Clear cli account cache best-effort
+          az account clear | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "az account clear returned exit code $LASTEXITCODE (ignored)."
+            $global:LASTEXITCODE = 0
+          } else {
+            Write-Host "az account clear OK."
+          }
+        } else {
+          Write-Host "Azure CLI not found on agent - skipping az logout."
+        }
+
+        # 3) Az PowerShell context reset
         Import-Module Az.Accounts -ErrorAction Stop
 
-        # ----------------------------
-        # Az PowerShell context reset
-        # ----------------------------
         Disable-AzContextAutosave -Scope Process     -ErrorAction SilentlyContinue | Out-Null
         Disable-AzContextAutosave -Scope CurrentUser -ErrorAction SilentlyContinue | Out-Null
 
@@ -61,33 +83,30 @@ jobs:
         Clear-AzContext -Scope Process     -Force -ErrorAction SilentlyContinue | Out-Null
         Clear-AzContext -Scope CurrentUser -Force -ErrorAction SilentlyContinue | Out-Null
 
-        # ----------------------------
-        # SAFE cache cleanup (avoid USERPROFILE on systemprofile agents)
-        # ----------------------------
-        $pathsToRemove = @()
-
-        # Azure CLI cache dir (if set)
-        if (-not [string]::IsNullOrWhiteSpace($env:AZURE_CONFIG_DIR)) {
-          $pathsToRemove += $env:AZURE_CONFIG_DIR
-        }
-
-        # Az PowerShell / Azure SDK cache under LOCALAPPDATA
-        if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-          $pathsToRemove += (Join-Path $env:LOCALAPPDATA "Azure")
-        }
-
-        foreach ($p in $pathsToRemove) {
-          if (Test-Path -LiteralPath $p) {
-            Write-Host "Removing Azure cache: $p"
-            Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
+        # Clear DefaultSubscriptionForLogin if set
+        try {
+          $cfg = Get-AzConfig -ErrorAction SilentlyContinue | Where-Object Name -like '*DefaultSubscriptionForLogin*'
+          if ($cfg) {
+            Write-Host "Existing DefaultSubscriptionForLogin: $($cfg.Value)"
+            Update-AzConfig -DefaultSubscriptionForLogin '' | Out-Null
+            Write-Host "DefaultSubscriptionForLogin cleared."
           } else {
-            Write-Host "Cache path not found (skipped): $p"
+            Write-Host "No DefaultSubscriptionForLogin set."
+          }
+        } catch {
+          Write-Host "Get/Update-AzConfig skipped: $($_.Exception.Message)"
+        }
+
+        # Remove subscription env vars that can poison runs
+        foreach ($k in @('AZURE_SUBSCRIPTION_ID','ARM_SUBSCRIPTION_ID','AZURE_SUBSCRIPTION','ARM_SUBSCRIPTION')) {
+          if (Test-Path "env:$k") {
+            $old = (Get-Item "env:$k").Value
+            Write-Host "Removing env:$k (was '$old')"
+            Remove-Item "env:$k" -ErrorAction SilentlyContinue
           }
         }
 
-        # ----------------------------
-        # Debug: show any remaining context
-        # ----------------------------
+        # Debug: prove context is clear
         try {
           $ctx = Get-AzContext -ErrorAction SilentlyContinue
           if ($ctx -and $ctx.Subscription) {
@@ -98,6 +117,8 @@ jobs:
         } catch {}
 
         Write-Host "=== HARD RESET done ==="
+    env:
+      AZURE_CORE_ONLY_SHOW_ERRORS: '1'
 
   - task: PowerShell@2
     displayName: Prepare output dir
@@ -121,7 +142,9 @@ jobs:
       arguments: ${{ parameters.arguments }}
       pwsh: true
     env:
+      # keep CLI isolated for the script task too
       AZURE_CORE_ONLY_SHOW_ERRORS: '1'
+      AZURE_CONFIG_DIR: '$(Agent.TempDirectory)\azure_config'
 
   - task: PublishBuildArtifacts@1
     displayName: Publish ${{ parameters.artifactName }}
