@@ -9,9 +9,6 @@ parameters:
     type: string
     default: ''
 
-  # OPTIONAL – can be left blank when not used (KTK only, etc.)
-  # Default is a single space so the UI doesn't block the Run button,
-  # but we normalize it to '' in variables.
   - name: adh_sub_group
     type: string
     default: ' '
@@ -35,8 +32,7 @@ parameters:
     type: string
     default: 'Self-Hosted-Pool'
 
-  # ✅ OPTIONAL: Custom agent override
-  # Use this when no adh-based agent exists (e.g. CIT, shared agents)
+  # ✅ Optional: override exact agent name
   - name: custom_agent_name
     type: string
     default: ''
@@ -90,14 +86,13 @@ variables:
   - name: adh_sub_group_normalized
     value: ${{ replace(parameters.adh_sub_group, ' ', '') }}
 
-  # ✅ Agent name resolution (default OR custom override)
-  # This is compile-time safe and works with demands
-  - name: agentName
-    value: ${{ 
-      if ne(parameters.custom_agent_name, '') 
-      then parameters.custom_agent_name 
-      else format('{0}_{1}{2}', parameters.adh_group, parameters.adh_subscription_type, parameters.poolSuffix) 
-    }}
+  # ✅ Compile-time safe agentName with override support
+  - ${{ if ne(parameters.custom_agent_name, '') }}:
+      - name: agentName
+        value: ${{ parameters.custom_agent_name }}
+  - ${{ else }}:
+      - name: agentName
+        value: ${{ format('{0}_{1}{2}', parameters.adh_group, parameters.adh_subscription_type, parameters.poolSuffix) }}
 
 
 stages:
@@ -125,7 +120,8 @@ stages:
               pwsh: true
               script: |
                 Write-Host "=== Az context cleanup start ==="
-                Write-Host "Using agent: $(agentName)"
+                Write-Host "Agent selected (expected): $(agentName)"
+                Write-Host "Agent actually running: $env:AGENT_NAME"
 
                 Import-Module Az.Accounts -ErrorAction Stop
 
@@ -185,7 +181,16 @@ stages:
               targetType: inline
               pwsh: true
               script: |
-                Write-Host "Pipeline running on agent: $(agentName)"
+                Write-Host "Agent selected (expected): $(agentName)"
+                Write-Host "Agent actually running: $env:AGENT_NAME"
+
+          - task: PowerShell@2
+            displayName: "Test Minimal PowerShell Script"
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                Write-Host "If this runs, agent is not injecting unwanted parameters."
 
           - task: PowerShell@2
             displayName: "List Environment Variables"
@@ -195,6 +200,26 @@ stages:
               script: |
                 Write-Host "=== Agent Environment Variables ==="
                 Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize
+
+          - task: PowerShell@2
+            displayName: "List Profile and Init Scripts"
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                $paths = @(
+                  "$env:USERPROFILE\Documents\WindowsPowerShell\profile.ps1",
+                  "$env:USERPROFILE\Documents\PowerShell\profile.ps1",
+                  "C:\agent\profile.ps1",
+                  "C:\agent\init.ps1"
+                )
+                foreach ($path in $paths) {
+                  if (Test-Path $path) {
+                    Write-Host "=== Found: $path ==="
+                    Get-Content $path
+                    Write-Host ""
+                  }
+                }
 
 
   # -------------------------------------------------------
@@ -209,7 +234,6 @@ stages:
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
 
-
   # -------------------------------------------------------
   # 3. RG Tags
   # -------------------------------------------------------
@@ -221,7 +245,6 @@ stages:
         adh_subscription_type: ${{ parameters.adh_subscription_type }}
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
-
 
   # -------------------------------------------------------
   # 4. Key Vault Secrets
@@ -235,7 +258,6 @@ stages:
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
 
-
   # -------------------------------------------------------
   # 5. Key Vault Permissions
   # -------------------------------------------------------
@@ -247,7 +269,6 @@ stages:
         adh_subscription_type: ${{ parameters.adh_subscription_type }}
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
-
 
   # -------------------------------------------------------
   # 6. Key Vault Firewall
@@ -261,7 +282,6 @@ stages:
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
 
-
   # -------------------------------------------------------
   # 7. VNet / Network
   # -------------------------------------------------------
@@ -272,7 +292,6 @@ stages:
         adh_subscription_type: ${{ parameters.adh_subscription_type }}
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
-
 
   # -------------------------------------------------------
   # 8. Data Factory
@@ -285,7 +304,6 @@ stages:
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
 
-
   # -------------------------------------------------------
   # 9. ADLS Validation
   # -------------------------------------------------------
@@ -297,7 +315,6 @@ stages:
         adh_subscription_type: ${{ parameters.adh_subscription_type }}
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
-
 
   # -------------------------------------------------------
   # 10. Databricks Scan
