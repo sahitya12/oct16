@@ -1,0 +1,113 @@
+parameters:
+  variableGroup: 'modernization_tfstate_backend_details'
+  displayName: ''
+  scriptPath: ''
+  workingDir: ''
+  arguments: ''
+  artifactName: ''
+  publishPath: ''
+  poolName: 'Self-Hosted-Pool'
+  agentName: ''
+
+jobs:
+- job: run_script
+  displayName: ${{ parameters.displayName }}
+  pool:
+    name: ${{ parameters.poolName }}
+    ${{ if ne(parameters.agentName, '') }}:
+      demands:
+      - Agent.Name -equals ${{ parameters.agentName }}
+
+  variables:
+  - group: ${{ parameters.variableGroup }}
+
+  steps:
+  - checkout: self
+    clean: true
+
+  # -------------------------------------------------------
+  # ✅ HARD RESET: prevents random default subscription = 0000...
+  # Add ONCE here -> applies to ALL stages that use this template
+  # -------------------------------------------------------
+  - task: PowerShell@2
+    displayName: "HARD RESET: Az + CLI contexts (pre-scan)"
+    inputs:
+      targetType: inline
+      pwsh: true
+      workingDirectory: ${{ parameters.workingDir }}
+      script: |
+        Write-Host "=== HARD RESET (pre-scan) ==="
+        Write-Host "Agent running: $env:AGENT_NAME"
+        Write-Host "UserProfile: $env:USERPROFILE"
+
+        # Clear Azure CLI cached session (best effort)
+        try { az logout | Out-Null } catch { Write-Host "az logout skipped: $($_.Exception.Message)" }
+
+        Import-Module Az.Accounts -ErrorAction Stop
+
+        # Disable autosave in BOTH scopes (Process + CurrentUser)
+        Disable-AzContextAutosave -Scope Process     -ErrorAction SilentlyContinue | Out-Null
+        Disable-AzContextAutosave -Scope CurrentUser -ErrorAction SilentlyContinue | Out-Null
+
+        # Disconnect any cached accounts (best effort)
+        Disconnect-AzAccount -Scope Process     -ErrorAction SilentlyContinue | Out-Null
+        Disconnect-AzAccount -Scope CurrentUser -ErrorAction SilentlyContinue | Out-Null
+
+        # Clear Az contexts in BOTH scopes
+        Clear-AzContext -Scope Process     -Force -ErrorAction SilentlyContinue | Out-Null
+        Clear-AzContext -Scope CurrentUser -Force -ErrorAction SilentlyContinue | Out-Null
+
+        # Remove persisted caches on self-hosted agents (best effort)
+        $cacheFiles = @(
+          Join-Path $env:USERPROFILE ".Azure\AzureRmContext.json",
+          Join-Path $env:USERPROFILE ".Azure\TokenCache.dat",
+          Join-Path $env:USERPROFILE ".Azure\msal_token_cache.bin"
+        )
+        foreach ($f in $cacheFiles) {
+          if (Test-Path $f) {
+            Write-Host "Removing cache file: $f"
+            Remove-Item $f -Force -ErrorAction SilentlyContinue
+          }
+        }
+
+        # Debug: show any remaining context
+        try {
+          $ctx = Get-AzContext -ErrorAction SilentlyContinue
+          if ($ctx -and $ctx.Subscription) {
+            Write-Host "WARNING: Context still present after reset: $($ctx.Subscription.Id) / $($ctx.Subscription.Name)"
+          } else {
+            Write-Host "Az context cleared successfully."
+          }
+        } catch {}
+
+        Write-Host "=== HARD RESET done ==="
+
+  - task: PowerShell@2
+    displayName: Prepare output dir
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $out = "${{ parameters.publishPath }}"
+        if ([string]::IsNullOrWhiteSpace($out)) { throw "publishPath is empty." }
+        if (-not (Test-Path -LiteralPath $out)) {
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+        }
+        Write-Host "Output: $out"
+
+  - task: PowerShell@2
+    displayName: Run ${{ parameters.scriptPath }}
+    inputs:
+      targetType: filePath
+      filePath: ${{ parameters.scriptPath }}
+      workingDirectory: ${{ parameters.workingDir }}
+      arguments: ${{ parameters.arguments }}
+      pwsh: true
+    env:
+      AZURE_CORE_ONLY_SHOW_ERRORS: '1'
+
+  - task: PublishBuildArtifacts@1
+    displayName: Publish ${{ parameters.artifactName }}
+    inputs:
+      PathtoPublish: ${{ parameters.publishPath }}
+      ArtifactName: ${{ parameters.artifactName }}
