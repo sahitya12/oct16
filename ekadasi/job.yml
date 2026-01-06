@@ -27,7 +27,7 @@ jobs:
 
   # -------------------------------------------------------
   # ✅ HARD RESET: prevents random default subscription = 0000...
-  # Add ONCE here -> applies to ALL stages that use this template
+  # Safe on self-hosted Windows agents running as service (systemprofile)
   # -------------------------------------------------------
   - task: PowerShell@2
     displayName: "HARD RESET: Az + CLI contexts (pre-scan)"
@@ -37,40 +37,57 @@ jobs:
       workingDirectory: ${{ parameters.workingDir }}
       script: |
         Write-Host "=== HARD RESET (pre-scan) ==="
-        Write-Host "Agent running: $env:AGENT_NAME"
-        Write-Host "UserProfile: $env:USERPROFILE"
+        Write-Host "Agent: $env:AGENT_NAME"
+        Write-Host "USERPROFILE: $env:USERPROFILE"
+        Write-Host "LOCALAPPDATA: $env:LOCALAPPDATA"
+        Write-Host "AZURE_CONFIG_DIR: $env:AZURE_CONFIG_DIR"
 
-        # Clear Azure CLI cached session (best effort)
-        try { az logout | Out-Null } catch { Write-Host "az logout skipped: $($_.Exception.Message)" }
+        # ----------------------------
+        # Azure CLI logout (best effort)
+        # ----------------------------
+        try { az logout | Out-Null } catch { Write-Host "az logout skipped" }
 
         Import-Module Az.Accounts -ErrorAction Stop
 
-        # Disable autosave in BOTH scopes (Process + CurrentUser)
+        # ----------------------------
+        # Az PowerShell context reset
+        # ----------------------------
         Disable-AzContextAutosave -Scope Process     -ErrorAction SilentlyContinue | Out-Null
         Disable-AzContextAutosave -Scope CurrentUser -ErrorAction SilentlyContinue | Out-Null
 
-        # Disconnect any cached accounts (best effort)
         Disconnect-AzAccount -Scope Process     -ErrorAction SilentlyContinue | Out-Null
         Disconnect-AzAccount -Scope CurrentUser -ErrorAction SilentlyContinue | Out-Null
 
-        # Clear Az contexts in BOTH scopes
         Clear-AzContext -Scope Process     -Force -ErrorAction SilentlyContinue | Out-Null
         Clear-AzContext -Scope CurrentUser -Force -ErrorAction SilentlyContinue | Out-Null
 
-        # Remove persisted caches on self-hosted agents (best effort)
-        $cacheFiles = @(
-          Join-Path $env:USERPROFILE ".Azure\AzureRmContext.json",
-          Join-Path $env:USERPROFILE ".Azure\TokenCache.dat",
-          Join-Path $env:USERPROFILE ".Azure\msal_token_cache.bin"
-        )
-        foreach ($f in $cacheFiles) {
-          if (Test-Path $f) {
-            Write-Host "Removing cache file: $f"
-            Remove-Item $f -Force -ErrorAction SilentlyContinue
+        # ----------------------------
+        # SAFE cache cleanup (avoid USERPROFILE on systemprofile agents)
+        # ----------------------------
+        $pathsToRemove = @()
+
+        # Azure CLI cache dir (if set)
+        if (-not [string]::IsNullOrWhiteSpace($env:AZURE_CONFIG_DIR)) {
+          $pathsToRemove += $env:AZURE_CONFIG_DIR
+        }
+
+        # Az PowerShell / Azure SDK cache under LOCALAPPDATA
+        if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+          $pathsToRemove += (Join-Path $env:LOCALAPPDATA "Azure")
+        }
+
+        foreach ($p in $pathsToRemove) {
+          if (Test-Path -LiteralPath $p) {
+            Write-Host "Removing Azure cache: $p"
+            Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "Cache path not found (skipped): $p"
           }
         }
 
+        # ----------------------------
         # Debug: show any remaining context
+        # ----------------------------
         try {
           $ctx = Get-AzContext -ErrorAction SilentlyContinue
           if ($ctx -and $ctx.Subscription) {
