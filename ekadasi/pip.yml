@@ -35,7 +35,8 @@ parameters:
     type: string
     default: 'Self-Hosted-Pool'
 
-  # ✅ NEW: Optional custom agent override
+  # ✅ OPTIONAL: Custom agent override
+  # Use this when no adh-based agent exists (e.g. CIT, shared agents)
   - name: custom_agent_name
     type: string
     default: ''
@@ -89,8 +90,8 @@ variables:
   - name: adh_sub_group_normalized
     value: ${{ replace(parameters.adh_sub_group, ' ', '') }}
 
-  # ✅ UPDATED: Agent name resolution with override support
-  # Remains compile-time safe for demands
+  # ✅ Agent name resolution (default OR custom override)
+  # This is compile-time safe and works with demands
   - name: agentName
     value: ${{ 
       if ne(parameters.custom_agent_name, '') 
@@ -101,7 +102,7 @@ variables:
 
 stages:
   # -------------------------------------------------------
-  # 0. Az context cleanup
+  # 0. Az context cleanup (KEEP THIS – IMPORTANT)
   # -------------------------------------------------------
   - stage: az_context_cleanup
     displayName: "Az context cleanup on agent"
@@ -124,18 +125,27 @@ stages:
               pwsh: true
               script: |
                 Write-Host "=== Az context cleanup start ==="
-                Write-Host "Using agent: $env:AGENT_NAME"
+                Write-Host "Using agent: $(agentName)"
 
                 Import-Module Az.Accounts -ErrorAction Stop
 
+                # Disable autosave for this process
                 Disable-AzContextAutosave -Scope Process | Out-Null
+
+                # Clear any current in-process context
                 Clear-AzContext -Scope Process -Force -ErrorAction SilentlyContinue | Out-Null
 
+                # Clear bad DefaultSubscriptionForLogin if present
                 $cfg = Get-AzConfig | Where-Object Name -like '*DefaultSubscriptionForLogin*'
                 if ($cfg) {
+                  Write-Host "Existing DefaultSubscriptionForLogin: $($cfg.Value)"
                   Update-AzConfig -DefaultSubscriptionForLogin '' | Out-Null
+                  Write-Host "DefaultSubscriptionForLogin cleared."
+                } else {
+                  Write-Host "No DefaultSubscriptionForLogin set at Az config level."
                 }
 
+                # Remove subscription-related env vars if they exist
                 foreach ($k in @(
                   'AZURE_SUBSCRIPTION_ID',
                   'ARM_SUBSCRIPTION_ID',
@@ -143,6 +153,8 @@ stages:
                   'ARM_SUBSCRIPTION'
                 )) {
                   if (Test-Path "env:$k") {
+                    $old = (Get-Item "env:$k").Value
+                    Write-Host "Removing env:$k (was '$old')"
                     Remove-Item "env:$k" -ErrorAction SilentlyContinue
                   }
                 }
@@ -173,7 +185,7 @@ stages:
               targetType: inline
               pwsh: true
               script: |
-                Write-Host "Pipeline is running on agent: $(agentName)"
+                Write-Host "Pipeline running on agent: $(agentName)"
 
           - task: PowerShell@2
             displayName: "List Environment Variables"
@@ -181,6 +193,7 @@ stages:
               targetType: inline
               pwsh: true
               script: |
+                Write-Host "=== Agent Environment Variables ==="
                 Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize
 
 
@@ -196,6 +209,7 @@ stages:
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
 
+
   # -------------------------------------------------------
   # 3. RG Tags
   # -------------------------------------------------------
@@ -207,6 +221,7 @@ stages:
         adh_subscription_type: ${{ parameters.adh_subscription_type }}
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
+
 
   # -------------------------------------------------------
   # 4. Key Vault Secrets
@@ -220,6 +235,7 @@ stages:
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
 
+
   # -------------------------------------------------------
   # 5. Key Vault Permissions
   # -------------------------------------------------------
@@ -231,6 +247,7 @@ stages:
         adh_subscription_type: ${{ parameters.adh_subscription_type }}
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
+
 
   # -------------------------------------------------------
   # 6. Key Vault Firewall
@@ -244,6 +261,7 @@ stages:
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
 
+
   # -------------------------------------------------------
   # 7. VNet / Network
   # -------------------------------------------------------
@@ -254,6 +272,7 @@ stages:
         adh_subscription_type: ${{ parameters.adh_subscription_type }}
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
+
 
   # -------------------------------------------------------
   # 8. Data Factory
@@ -266,6 +285,7 @@ stages:
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
 
+
   # -------------------------------------------------------
   # 9. ADLS Validation
   # -------------------------------------------------------
@@ -277,6 +297,7 @@ stages:
         adh_subscription_type: ${{ parameters.adh_subscription_type }}
         poolName:              ${{ parameters.poolName }}
         agentName:             ${{ variables.agentName }}
+
 
   # -------------------------------------------------------
   # 10. Databricks Scan
