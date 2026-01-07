@@ -1,0 +1,85 @@
+trigger: none
+pr: none
+
+schedules:
+  # ---- Monthly: 1st of every month @ 02:30 UTC ----
+  - cron: "30 2 1 * *"
+    displayName: Monthly sanity checks (ALL custodians)
+    branches:
+      include:
+        - main
+    always: true
+
+  # ---- Every 2 hours (UTC) ----
+  - cron: "0 */2 * * *"
+    displayName: Sanity checks (ALL custodians) - every 2 hours
+    branches:
+      include:
+        - main
+    always: true
+
+variables:
+  # ✅ Use the same login style as individual custodian pipeline
+  - group: modernization_tfstate_backend_details
+
+pool:
+  name: Self-Hosted-Pool
+
+jobs:
+- job: allsubs
+  displayName: Run sanity checks across all custodians
+  timeoutInMinutes: 240          # ✅ increase from default 60 mins
+  cancelTimeoutInMinutes: 10
+
+  steps:
+  - checkout: self
+    clean: true
+
+  - task: PowerShell@2
+    displayName: Run sanity checks across all custodians
+    inputs:
+      pwsh: true
+      targetType: inline
+      script: |
+        $ErrorActionPreference = "Stop"
+
+        Write-Host "Login TenantId    : $(tenant_id)"
+        Write-Host "Login ClientId    : $(backend_client_id)"
+        Write-Host "ClientSecret      : present (hidden)"
+
+        # Unique output folder per run so schedules don't overwrite each other
+        $outRoot = Join-Path "$(Build.SourcesDirectory)" "sanitychecks\out\$(Build.BuildId)"
+        New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
+
+        $runner = Join-Path "$(Build.SourcesDirectory)" "sanitychecks\scripts\Run-AllSubscriptions-Monthly.ps1"
+
+        pwsh -NoProfile -File $runner `
+          -TenantId "$(tenant_id)" `
+          -ClientId "$(backend_client_id)" `
+          -ClientSecret "$(backend_client_secret)" `
+          -SubscriptionsCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\subscriptions_master.csv" `
+          -RgPermsNonPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\nonprod_permissions.csv" `
+          -RgPermsPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\prod_permissions.csv" `
+          -AdlsNonPrdInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\adls_nonprd_permissions.csv" `
+          -AdlsPrdInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\adls_prd_permissions.csv" `
+          -KvSecretsInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\kvsecretsscan.csv" `
+          -KvPermInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\kvpermissions.csv" `
+          -OutputRootDir $outRoot `
+          -RunRgPermissions:$true `
+          -RunRgTags:$true `
+          -RunKvSecrets:$true `
+          -RunKvPermissions:$true `
+          -RunKvFirewall:$true `
+          -RunVnet:$true `
+          -RunAdls:$true `
+          -RunAdf:$true `
+          -RunDatabricks:$true `
+          -FailOnErrors:$false `
+          -BranchName "$(Build.SourceBranchName)"
+
+  - task: PublishPipelineArtifact@1
+    displayName: Publish outputs
+    condition: always()         # ✅ publish even if some custodians fail
+    inputs:
+      targetPath: "$(Build.SourcesDirectory)\sanitychecks\out\$(Build.BuildId)"
+      artifact: "sanitychecks_allsubs_$(Build.BuildId)"
