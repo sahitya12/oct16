@@ -18,10 +18,9 @@ pool:
 stages:
 - stage: CustodianMonthlyScheduleStage
   displayName: "Custodian Monthly Schedule Stage"
-
   jobs:
   - job: allsubs_sanity
-    displayName: Run sanity checks across all custodians
+    displayName: "Run sanity checks across all custodians"
     timeoutInMinutes: 240
 
     steps:
@@ -29,7 +28,7 @@ stages:
       clean: true
 
     - task: PowerShell@2
-      displayName: Run sanity checks (ALL custodians)
+      displayName: "Run sanity checks (ALL custodians)"
       continueOnError: true
       inputs:
         pwsh: true
@@ -41,12 +40,17 @@ stages:
           Write-Host "ClientId : $(backend_client_id)"
           Write-Host "Secret   : present (hidden)"
 
-          $dateStamp = "$(Date:yyyyMMdd)"
+          # PowerShell date stamp (YAML $(Date:yyyyMMdd) does NOT expand inside inline PowerShell)
+          $dateStamp = Get-Date -Format 'yyyyMMdd'
 
-          # Folder structure requested:
-          # sanitychecks/out/SanityCheck_AllCustodians_YYYYMMDD/All_Custodians_YYYYMMDD/<BuildId>/...
           $repoRoot = "$(Build.SourcesDirectory)"
-          $outRoot  = Join-Path $repoRoot "sanitychecks/out/SanityCheck_AllCustodians_$dateStamp/All_Custodians_$dateStamp/$(Build.BuildId)"
+
+          # Folder structure you wanted:
+          # sanitychecks/out/SanityCheck_AllCustodians_YYYYMMDD/All_Custodians_YYYYMMDD/<BuildId>
+          $rootFolder = "SanityCheck_AllCustodians_$dateStamp"
+          $childFolder = "All_Custodians_$dateStamp"
+          $outRoot = Join-Path $repoRoot "sanitychecks/out/$rootFolder/$childFolder/$(Build.BuildId)"
+
           New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
 
           pwsh -NoProfile -File `
@@ -75,8 +79,8 @@ stages:
             -BranchName "$(Build.SourceBranchName)"
 
     - task: PublishPipelineArtifact@1
-      displayName: Publish outputs
+      displayName: "Publish outputs"
       condition: always()
       inputs:
-        targetPath: "$(Build.SourcesDirectory)/sanitychecks/out/SanityCheck_AllCustodians_$(Date:yyyyMMdd)"
+        targetPath: "$(Build.SourcesDirectory)/sanitychecks/out"
         artifact: "SanityCheck_AllCustodians_$(Date:yyyyMMdd)"
