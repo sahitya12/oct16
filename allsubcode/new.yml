@@ -53,7 +53,7 @@ jobs:
           -ClientId "$(backend_client_id)" `
           -ClientSecret "$(backend_client_secret)" `
           -SubscriptionsCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/subscriptions_master.csv" `
-          -RgPermsNonPrdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprd_permissions.csv" `
+          -RgPermsNonPrdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/nonprod_permissions.csv" `
           -RgPermsPrdCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/prod_permissions.csv" `
           -AdlsNonPrdInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_nonprd_permissions.csv" `
           -AdlsPrdInputCsvPath "$(Build.SourcesDirectory)/sanitychecks/inputs/adls_prd_permissions.csv" `
@@ -71,6 +71,7 @@ jobs:
           -RunAdf:$true `
           -RunDatabricks:$true `
           -BranchName "$(Build.SourceBranchName)"
+
 
   - task: PublishPipelineArtifact@1
     displayName: Publish outputs
