@@ -2,18 +2,11 @@ trigger: none
 pr: none
 
 schedules:
-  # - cron: "30 2 1 * *"
-  #   displayName: Monthly sanity checks (ALL custodians)
-  #   branches:
-  #     include:
-  #       - main
-  #   always: true
-
   - cron: "0 */2 * * *"
     displayName: Sanity checks (ALL custodians) - every 2 hours
     branches:
       include:
-        - main
+        - test-sanitychecks
     always: true
 
 variables:
@@ -28,7 +21,7 @@ stages:
 
   jobs:
   - job: allsubs_sanity
-    displayName: "Run sanity checks across all custodians"
+    displayName: Run sanity checks across all custodians
     timeoutInMinutes: 240
 
     steps:
@@ -36,7 +29,7 @@ stages:
       clean: true
 
     - task: PowerShell@2
-      displayName: "Run sanity checks (ALL custodians)"
+      displayName: Run sanity checks (ALL custodians)
       continueOnError: true
       inputs:
         pwsh: true
@@ -48,55 +41,42 @@ stages:
           Write-Host "ClientId : $(backend_client_id)"
           Write-Host "Secret   : present (hidden)"
 
-          # Folder naming requested:
-          # Artifact name: SanityCheck_AllCustodians_YYYYMMDD
-          # Inside artifact: All_Custodians_YYYYMMDD
           $dateStamp = "$(Date:yyyyMMdd)"
 
-          $repoRoot  = "$(Build.SourcesDirectory)"
-          $outFolder = "All_Custodians_$dateStamp"
-          $outRoot   = Join-Path $repoRoot "sanitychecks/out/$outFolder/$(Build.BuildId)"
-
+          # Folder structure requested:
+          # sanitychecks/out/SanityCheck_AllCustodians_YYYYMMDD/All_Custodians_YYYYMMDD/<BuildId>/...
+          $repoRoot = "$(Build.SourcesDirectory)"
+          $outRoot  = Join-Path $repoRoot "sanitychecks/out/SanityCheck_AllCustodians_$dateStamp/All_Custodians_$dateStamp/$(Build.BuildId)"
           New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
 
-          $scriptPath = Join-Path $repoRoot "sanitychecks/scripts/Run-AllSubscriptions-Monthly.ps1"
-
-          $params = @(
-            "-TenantId", "$(tenant_id)",
-            "-ClientId", "$(backend_client_id)",
-            "-ClientSecret", "$(backend_client_secret)",
-            "-SubscriptionsCsvPath", (Join-Path $repoRoot "sanitychecks/inputs/subscriptions_master.csv"),
-            "-RgPermsNonPrdCsvPath", (Join-Path $repoRoot "sanitychecks/inputs/nonprod_permissions.csv"),
-            "-RgPermsPrdCsvPath", (Join-Path $repoRoot "sanitychecks/inputs/prod_permissions.csv"),
-            "-AdlsNonPrdInputCsvPath", (Join-Path $repoRoot "sanitychecks/inputs/adls_nonprd_permissions.csv"),
-            "-AdlsPrdInputCsvPath", (Join-Path $repoRoot "sanitychecks/inputs/adls_prd_permissions.csv"),
-            "-KvSecretsInputCsvPath", (Join-Path $repoRoot "sanitychecks/inputs/kvsecretsscan.csv"),
-            "-KvPermInputCsvPath", (Join-Path $repoRoot "sanitychecks/inputs/kvpermissions.csv"),
-            "-OutputRootDir", $outRoot,
-            "-FailOnErrors:$false",
-            "-RunRgPermissions:$true",
-            "-RunRgTags:$true",
-            "-RunKvSecrets:$true",
-            "-RunKvPermissions:$true",
-            "-RunKvFirewall:$true",
-            "-RunVnet:$true",
-            "-RunAdls:$true",
-            "-RunAdf:$true",
-            "-RunDatabricks:$true",
-            "-BranchName", "$(Build.SourceBranchName)"
-          )
-
-          & pwsh -NoProfile -File $scriptPath @params
-
-          # NOTE:
-          # continueOnError: true -> pipeline continues even if this task fails.
-          # If you want to NEVER fail this task, uncomment below:
-          # exit 0
+          pwsh -NoProfile -File `
+            "$repoRoot/sanitychecks/scripts/Run-AllSubscriptions-Monthly.ps1" `
+            -TenantId "$(tenant_id)" `
+            -ClientId "$(backend_client_id)" `
+            -ClientSecret "$(backend_client_secret)" `
+            -SubscriptionsCsvPath "$repoRoot/sanitychecks/inputs/subscriptions_master.csv" `
+            -RgPermsNonPrdCsvPath "$repoRoot/sanitychecks/inputs/nonprod_permissions.csv" `
+            -RgPermsPrdCsvPath "$repoRoot/sanitychecks/inputs/prod_permissions.csv" `
+            -AdlsNonPrdInputCsvPath "$repoRoot/sanitychecks/inputs/adls_nonprd_permissions.csv" `
+            -AdlsPrdInputCsvPath "$repoRoot/sanitychecks/inputs/adls_prd_permissions.csv" `
+            -KvSecretsInputCsvPath "$repoRoot/sanitychecks/inputs/kvsecretsscan.csv" `
+            -KvPermInputCsvPath "$repoRoot/sanitychecks/inputs/kvpermissions.csv" `
+            -OutputRootDir $outRoot `
+            -FailOnErrors:$false `
+            -RunRgPermissions:$true `
+            -RunRgTags:$true `
+            -RunKvSecrets:$true `
+            -RunKvPermissions:$true `
+            -RunKvFirewall:$true `
+            -RunVnet:$true `
+            -RunAdls:$true `
+            -RunAdf:$true `
+            -RunDatabricks:$true `
+            -BranchName "$(Build.SourceBranchName)"
 
     - task: PublishPipelineArtifact@1
-      displayName: "Publish outputs"
+      displayName: Publish outputs
       condition: always()
       inputs:
-        # Publish the parent folder so artifact root shows All_Custodians_YYYYMMDD
-        targetPath: "$(Build.SourcesDirectory)/sanitychecks/out/All_Custodians_$(Date:yyyyMMdd)"
+        targetPath: "$(Build.SourcesDirectory)/sanitychecks/out/SanityCheck_AllCustodians_$(Date:yyyyMMdd)"
         artifact: "SanityCheck_AllCustodians_$(Date:yyyyMMdd)"
