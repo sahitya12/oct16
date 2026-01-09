@@ -18,6 +18,7 @@ pool:
 stages:
 - stage: CustodianMonthlyScheduleStage
   displayName: "Custodian Monthly Schedule Stage"
+
   jobs:
   - job: allsubs_sanity
     displayName: "Run sanity checks across all custodians"
@@ -40,32 +41,27 @@ stages:
           Write-Host "ClientId : $(backend_client_id)"
           Write-Host "Secret   : present (hidden)"
 
-          # PowerShell date stamp (YAML $(Date:yyyyMMdd) does NOT expand inside inline PowerShell)
-          $dateStamp = Get-Date -Format 'yyyyMMdd'
+          # Temp output (whatever Run-AllSubscriptions creates)
+          $tmpOutRoot = "$(Build.SourcesDirectory)\sanitychecks\out_tmp"
+          New-Item -ItemType Directory -Path $tmpOutRoot -Force | Out-Null
 
-          $repoRoot = "$(Build.SourcesDirectory)"
-
-          # Folder structure you wanted:
-          # sanitychecks/out/SanityCheck_AllCustodians_YYYYMMDD/All_Custodians_YYYYMMDD/<BuildId>
-          $rootFolder = "SanityCheck_AllCustodians_$dateStamp"
-          $childFolder = "All_Custodians_$dateStamp"
-          $outRoot = Join-Path $repoRoot "sanitychecks/out/$rootFolder/$childFolder/$(Build.BuildId)"
-
-          New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
+          # Clean final artifact folder structure you want
+          $artifactRoot = "$(Build.ArtifactStagingDirectory)\SanityCheck_AllCustodian\All_Custodians"
+          New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 
           pwsh -NoProfile -File `
-            "$repoRoot/sanitychecks/scripts/Run-AllSubscriptions-Monthly.ps1" `
+            "$(Build.SourcesDirectory)\sanitychecks\scripts\Run-AllSubscriptions-Monthly.ps1" `
             -TenantId "$(tenant_id)" `
             -ClientId "$(backend_client_id)" `
             -ClientSecret "$(backend_client_secret)" `
-            -SubscriptionsCsvPath "$repoRoot/sanitychecks/inputs/subscriptions_master.csv" `
-            -RgPermsNonPrdCsvPath "$repoRoot/sanitychecks/inputs/nonprod_permissions.csv" `
-            -RgPermsPrdCsvPath "$repoRoot/sanitychecks/inputs/prod_permissions.csv" `
-            -AdlsNonPrdInputCsvPath "$repoRoot/sanitychecks/inputs/adls_nonprd_permissions.csv" `
-            -AdlsPrdInputCsvPath "$repoRoot/sanitychecks/inputs/adls_prd_permissions.csv" `
-            -KvSecretsInputCsvPath "$repoRoot/sanitychecks/inputs/kvsecretsscan.csv" `
-            -KvPermInputCsvPath "$repoRoot/sanitychecks/inputs/kvpermissions.csv" `
-            -OutputRootDir $outRoot `
+            -SubscriptionsCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\subscriptions_master.csv" `
+            -RgPermsNonPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\nonprod_permissions.csv" `
+            -RgPermsPrdCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\prod_permissions.csv" `
+            -AdlsNonPrdInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\adls_nonprd_permissions.csv" `
+            -AdlsPrdInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\adls_prd_permissions.csv" `
+            -KvSecretsInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\kvsecretsscan.csv" `
+            -KvPermInputCsvPath "$(Build.SourcesDirectory)\sanitychecks\inputs\kvpermissions.csv" `
+            -OutputRootDir $tmpOutRoot `
             -FailOnErrors:$false `
             -RunRgPermissions:$true `
             -RunRgTags:$true `
@@ -78,10 +74,25 @@ stages:
             -RunDatabricks:$true `
             -BranchName "$(Build.SourceBranchName)"
 
+          # Find the most recent "allsubs_*" folder created by the script
+          $latestRunDir = Get-ChildItem -Path $tmpOutRoot -Directory |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (-not $latestRunDir) {
+            throw "No output folder found under $tmpOutRoot"
+          }
+
+          Write-Host "Latest output folder: $($latestRunDir.FullName)"
+
+          # Copy direct custodian folders (AIS_nonprd, MDM_prd, etc.) into All_Custodians
+          Copy-Item -Path (Join-Path $latestRunDir.FullName '*') -Destination $artifactRoot -Recurse -Force
+
+          Write-Host "Final artifact structure created at: $(Build.ArtifactStagingDirectory)\SanityCheck_AllCustodian"
+
     - task: PublishPipelineArtifact@1
       displayName: "Publish outputs"
       condition: always()
       inputs:
-        targetPath: "$(Build.SourcesDirectory)/sanitychecks/out"
-        artifact: "SanityCheck_AllCustodians_$(Build.BuildId)"
-
+        targetPath: "$(Build.ArtifactStagingDirectory)\SanityCheck_AllCustodian"
+        artifact: "SanityCheck_AllCustodian"
