@@ -37,7 +37,9 @@ resource "local_file" "azure_tag_script" {
 
   $ErrorActionPreference = "Stop"
 
+  Write-Host "PWD: $(Get-Location)"
   Write-Host "Loading tags from: $TagsFile"
+
   if (-not (Test-Path -LiteralPath $TagsFile)) {
     throw "Tags file not found: $TagsFile"
   }
@@ -72,15 +74,16 @@ resource "null_resource" "add_tags" {
   }
 
   provisioner "local-exec" {
+    # run inside the module directory
     working_dir = path.module
     on_failure  = fail
 
-    # IMPORTANT: prevents cmd.exe from breaking quotes for -File
-    interpreter = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+    # ✅ Use -Command (NOT -File) to avoid Terraform/cmd quoting issues
+    interpreter = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
 
-    # Because working_dir = path.module, use relative paths
+    # ✅ Call the script using & so args are parsed correctly
     command = format(
-      ".\\tag_azure_resource.ps1 -Rid \"%s\" -TagsFile \".\\tags_%s.json\" -SleepSeconds %d",
+      "& .\\tag_azure_resource.ps1 -Rid '%s' -TagsFile '.\\tags_%s.json' -SleepSeconds %d",
       each.key,
       replace(each.key, "/", "_"),
       var.adh_standard_tags_update_delay_in_seconds
@@ -105,8 +108,8 @@ resource "null_resource" "sql_warehouse_tags" {
     working_dir = path.module
     on_failure  = fail
 
-    interpreter = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
-    command     = ".\\tag_sql_warehouse.ps1"
+    interpreter = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+    command     = "& .\\tag_sql_warehouse.ps1"
   }
 
   depends_on = [
@@ -119,6 +122,7 @@ resource "null_resource" "sql_warehouse_tags" {
 # 6) Databricks Compute tags
 # ------------------------------------------------------------
 resource "null_resource" "compute_tags" {
+  # adjust if you want to iterate a different collection
   for_each = local.tags_to_be_added
 
   triggers = {
@@ -130,14 +134,12 @@ resource "null_resource" "compute_tags" {
     working_dir = path.module
     on_failure  = fail
 
-    interpreter = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+    interpreter = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
 
-    # NOTE:
-    # Your original code calls tag_azure_resource.ps1 again (same as #4).
-    # If you truly want Databricks compute tagging, replace this with your compute tagging script
-    # (example: .\\tag_databricks_compute.ps1) and read standard_tags.json.
+    # NOTE: This is the same Azure-resource tagging call as #4.
+    # If compute tagging should use a different script, replace the script name here.
     command = format(
-      ".\\tag_azure_resource.ps1 -Rid \"%s\" -TagsFile \".\\tags_%s.json\" -SleepSeconds %d",
+      "& .\\tag_azure_resource.ps1 -Rid '%s' -TagsFile '.\\tags_%s.json' -SleepSeconds %d",
       each.key,
       replace(each.key, "/", "_"),
       var.adh_standard_tags_update_delay_in_seconds
