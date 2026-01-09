@@ -83,4 +83,5 @@ stages:
       condition: always()
       inputs:
         targetPath: "$(Build.SourcesDirectory)/sanitychecks/out"
-        artifact: "SanityCheck_AllCustodians_$(Date:yyyyMMdd)"
+        artifact: "SanityCheck_AllCustodians_$(Build.BuildId)"
+
