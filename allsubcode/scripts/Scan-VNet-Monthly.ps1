@@ -1,3 +1,17 @@
+# sanitychecks/scripts/Scan-VNet-Monthly.ps1
+# ------------------------------------------------------------
+# VNet Monthly scan (per custodian + env)
+# Outputs 3 CSVs:
+#  1) vnet_monthly_summary_*.csv
+#  2) vnet_monthly_subnets_*.csv
+#  3) vnet_monthly_peerings_*.csv
+#
+# IMPORTANT FIX:
+# - Removed [ValidateSet()] on adh_subscription_type to avoid
+#   "Argument types do not match" when invoked via pwsh -File ... @Args
+# - Added explicit validation instead.
+# ------------------------------------------------------------
+
 [CmdletBinding()]
 param(
   [Parameter(Mandatory)][string]$TenantId,
@@ -7,7 +21,7 @@ param(
   [Parameter(Mandatory)][string]$adh_group,
   [string]$adh_sub_group = '',
 
-  [ValidateSet('nonprd','prd')]
+  # NOTE: ValidateSet removed (binding issue in pipeline invocation)
   [string]$adh_subscription_type = 'nonprd',
 
   [Parameter(Mandatory)][string]$OutputDir,
@@ -19,11 +33,20 @@ $ErrorActionPreference = "Stop"
 Import-Module Az.Accounts, Az.Network -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -ErrorAction Stop
 
+# ---------------- Guards ----------------
+$adh_subscription_type = ("$adh_subscription_type").Trim().ToLower()
+if ($adh_subscription_type -notin @('nonprd','prd')) {
+  throw "Invalid adh_subscription_type: '$adh_subscription_type'. Expected: nonprd|prd"
+}
+
 # ---------------- Helpers ----------------
 function SafeJoin([object]$arr, [string]$sep=';') {
   try {
     if ($null -eq $arr) { return '' }
-    return (@($arr) | Where-Object { $_ -ne $null -and "$_".Trim() -ne '' } | ForEach-Object { "$_".Trim() }) -join $sep
+    return (@($arr) |
+      Where-Object { $_ -ne $null -and "$_".Trim() -ne '' } |
+      ForEach-Object { "$_".Trim() }
+    ) -join $sep
   } catch { return '' }
 }
 
@@ -54,8 +77,8 @@ $peeringRows = New-Object System.Collections.Generic.List[object]
 
 foreach ($v in $vnets) {
 
-  $rg  = $v.ResourceGroupName
-  $loc = $v.Location
+  $rg       = $v.ResourceGroupName
+  $loc      = $v.Location
   $vnetName = $v.Name
 
   $addr = ''
@@ -64,7 +87,7 @@ foreach ($v in $vnets) {
   $dns = ''
   try { $dns = SafeJoin $v.DhcpOptions.DnsServers } catch {}
 
-  # Subnets
+  # Subnets (from VNet object)
   $subnets = @()
   try { $subnets = @($v.Subnets) } catch { $subnets = @() }
 
@@ -78,6 +101,7 @@ foreach ($v in $vnets) {
 
     try { $nsgId = "$($s.NetworkSecurityGroup.Id)" } catch {}
     try { $rtId  = "$($s.RouteTable.Id)" } catch {}
+
     try {
       if ($s.Delegations) { $deleg = SafeJoin ($s.Delegations | ForEach-Object { $_.ServiceName }) }
     } catch {}
@@ -92,6 +116,7 @@ foreach ($v in $vnets) {
     # Optional: derive names from IDs
     $nsgName = ''
     if ($nsgId -match '/networkSecurityGroups/([^/]+)$') { $nsgName = $Matches[1] }
+
     $rtName  = ''
     if ($rtId  -match '/routeTables/([^/]+)$') { $rtName = $Matches[1] }
 
@@ -145,26 +170,36 @@ foreach ($v in $vnets) {
 
   # Summary (per VNet)
   $summaryRows.Add([pscustomobject]@{
-    SubscriptionName = $sub.Name
-    SubscriptionId   = $sub.Id
-    Environment      = $adh_subscription_type
-    Custodian        = $adh_group
-    CustodianSubGroup= $adh_sub_group
-    ResourceGroup    = $rg
-    VNetName         = $vnetName
-    Location         = $loc
-    AddressSpaces    = $addr
-    DnsServers       = $dns
-    SubnetCount      = @($subnets).Count
-    PeeringCount     = @($peerings).Count
+    SubscriptionName  = $sub.Name
+    SubscriptionId    = $sub.Id
+    Environment       = $adh_subscription_type
+    Custodian         = $adh_group
+    CustodianSubGroup = $adh_sub_group
+    ResourceGroup     = $rg
+    VNetName          = $vnetName
+    Location          = $loc
+    AddressSpaces     = $addr
+    DnsServers        = $dns
+    SubnetCount       = @($subnets).Count
+    PeeringCount      = @($peerings).Count
   }) | Out-Null
 }
 
-# Handle case: no VNets
+# Ensure all 3 CSVs are created even if no VNets/Subnets/Peerings
 if ($summaryRows.Count -eq 0) {
   $summaryRows.Add([pscustomobject]@{
-    SubscriptionName=''; SubscriptionId=''; Environment=$adh_subscription_type; Custodian=$adh_group; CustodianSubGroup=$adh_sub_group;
-    ResourceGroup=''; VNetName=''; Location=''; AddressSpaces=''; DnsServers=''; SubnetCount=0; PeeringCount=0
+    SubscriptionName  = $sub.Name
+    SubscriptionId    = $sub.Id
+    Environment       = $adh_subscription_type
+    Custodian         = $adh_group
+    CustodianSubGroup = $adh_sub_group
+    ResourceGroup     = ''
+    VNetName          = ''
+    Location          = ''
+    AddressSpaces     = ''
+    DnsServers        = ''
+    SubnetCount       = 0
+    PeeringCount      = 0
   }) | Out-Null
 }
 
@@ -178,6 +213,7 @@ Write-CsvSafe -Rows @($subnetRows)  -Path $subnetCsv
 Write-CsvSafe -Rows @($peeringRows) -Path $peeringCsv
 
 Write-Host "VNet Monthly scan completed."
+Write-Host "VNET COUNTS => VNets:$($summaryRows.Count) Subnets:$($subnetRows.Count) Peerings:$($peeringRows.Count)"
 Write-Host "Summary CSV : $summaryCsv"
 Write-Host "Subnets CSV : $subnetCsv"
 Write-Host "Peerings CSV: $peeringCsv"
