@@ -11,8 +11,6 @@ param(
   [string]$adh_subscription_type = 'nonprd',
 
   [Parameter(Mandatory)][string]$OutputDir,
-
-  # ✅ IMPORTANT: Run-AllSubscriptions passes this; keep it to avoid "Argument types do not match"
   [string]$BranchName = ''
 )
 
@@ -34,59 +32,6 @@ function BoolStr($v) {
   return [bool]$v
 }
 
-function TryGet-NameFromId([string]$id, [string]$token) {
-  # token example: 'routeTables' or 'networkSecurityGroups'
-  if ([string]::IsNullOrWhiteSpace($id)) { return '' }
-  if ($id -match "/$token/([^/]+)$") { return $Matches[1] }
-  return ''
-}
-
-function TryGet-DefaultRouteInfo {
-  param(
-    [string]$RouteTableId
-  )
-  # Returns @{ DefaultRouteName=...; DefaultRouteNextHopType=...; DefaultRouteNextHopIp=... }
-  $result = @{
-    DefaultRouteName        = ''
-    DefaultRouteNextHopType = ''
-    DefaultRouteNextHopIp   = ''
-  }
-
-  try {
-    if ([string]::IsNullOrWhiteSpace($RouteTableId)) { return $result }
-
-    # Parse RG + RT name from resource ID
-    # /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/routeTables/<name>
-    if ($RouteTableId -notmatch "/resourceGroups/([^/]+)/providers/.*/routeTables/([^/]+)$") {
-      return $result
-    }
-    $rg = $Matches[1]
-    $rtName = $Matches[2]
-
-    $rt = Get-AzRouteTable -ResourceGroupName $rg -Name $rtName -ErrorAction Stop
-    if (-not $rt -or -not $rt.Routes) { return $result }
-
-    # Prefer default route 0.0.0.0/0
-    $default = $rt.Routes | Where-Object { $_.AddressPrefix -eq '0.0.0.0/0' } | Select-Object -First 1
-    if (-not $default) {
-      # If no 0.0.0.0/0, pick first route as fallback (still useful evidence)
-      $default = $rt.Routes | Select-Object -First 1
-    }
-
-    if ($default) {
-      $result.DefaultRouteName        = "$($default.Name)"
-      $result.DefaultRouteNextHopType = "$($default.NextHopType)"
-      $result.DefaultRouteNextHopIp   = "$($default.NextHopIpAddress)"
-    }
-
-    return $result
-  }
-  catch {
-    # swallow - do not fail VNet scan because of RT read errors
-    return $result
-  }
-}
-
 Ensure-Dir -Path $OutputDir | Out-Null
 
 # ---------------- Login + subscription context ----------------
@@ -97,11 +42,20 @@ if (-not (Connect-ScAz -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cl
 $sub = Resolve-ScSubscriptions -AdhGroup $adh_group -Environment $adh_subscription_type
 Set-ScContext -Subscription $sub
 
-# ---------------- Collect VNets ----------------
-$vnets = @(Get-AzVirtualNetwork -ErrorAction SilentlyContinue)
-
 $custodianForFile = if ([string]::IsNullOrWhiteSpace($adh_sub_group)) { $adh_group } else { "${adh_group}_${adh_sub_group}" }
 $stamp = Get-Date -Format 'yyyyMMdd'
+
+Write-Host "=== VNet Monthly Scan ==="
+Write-Host "Subscription : $($sub.Name) ($($sub.Id))"
+Write-Host "Custodian    : $custodianForFile"
+Write-Host "Environment  : $adh_subscription_type"
+Write-Host "Branch       : $BranchName"
+Write-Host "OutputDir    : $OutputDir"
+Write-Host "DateStamp    : $stamp"
+Write-Host ""
+
+# ---------------- Collect VNets ----------------
+$vnets = @(Get-AzVirtualNetwork -ErrorAction SilentlyContinue)
 
 $summaryRows = New-Object System.Collections.Generic.List[object]
 $subnetRows  = New-Object System.Collections.Generic.List[object]
@@ -109,8 +63,8 @@ $peeringRows = New-Object System.Collections.Generic.List[object]
 
 foreach ($v in $vnets) {
 
-  $rg  = $v.ResourceGroupName
-  $loc = $v.Location
+  $rg       = $v.ResourceGroupName
+  $loc      = $v.Location
   $vnetName = $v.Name
 
   $addr = ''
@@ -124,6 +78,7 @@ foreach ($v in $vnets) {
   try { $subnets = @($v.Subnets) } catch { $subnets = @() }
 
   foreach ($s in $subnets) {
+
     $nsgId = ''
     $rtId  = ''
     $deleg = ''
@@ -133,6 +88,7 @@ foreach ($v in $vnets) {
 
     try { $nsgId = "$($s.NetworkSecurityGroup.Id)" } catch {}
     try { $rtId  = "$($s.RouteTable.Id)" } catch {}
+
     try {
       if ($s.Delegations) { $deleg = SafeJoin ($s.Delegations | ForEach-Object { $_.ServiceName }) }
     } catch {}
@@ -144,11 +100,12 @@ foreach ($v in $vnets) {
     try { $pvtEpPolicies = "$($s.PrivateEndpointNetworkPolicies)" } catch {}
     try { $pvtLinkSvcPolicies = "$($s.PrivateLinkServiceNetworkPolicies)" } catch {}
 
-    $nsgName = TryGet-NameFromId -id $nsgId -token 'networkSecurityGroups'
-    $rtName  = TryGet-NameFromId -id $rtId  -token 'routeTables'
+    # Optional: derive names from IDs
+    $nsgName = ''
+    if ($nsgId -match '/networkSecurityGroups/([^/]+)$') { $nsgName = $Matches[1] }
 
-    # ✅ Firewall/UDR evidence from Route Table
-    $rtInfo = TryGet-DefaultRouteInfo -RouteTableId $rtId
+    $rtName = ''
+    if ($rtId -match '/routeTables/([^/]+)$') { $rtName = $Matches[1] }
 
     $subnetRows.Add([pscustomobject]@{
       SubscriptionName               = $sub.Name
@@ -161,17 +118,10 @@ foreach ($v in $vnets) {
       Location                       = $loc
       SubnetName                     = $s.Name
       SubnetPrefix                   = (SafeJoin $s.AddressPrefix)
-
       NSGName                        = $nsgName
       NSGId                          = $nsgId
       RouteTableName                 = $rtName
       RouteTableId                   = $rtId
-
-      # ✅ Extra routing evidence (often points to Azure Firewall IP)
-      DefaultRouteName               = $rtInfo.DefaultRouteName
-      DefaultRouteNextHopType        = $rtInfo.DefaultRouteNextHopType
-      DefaultRouteNextHopIp          = $rtInfo.DefaultRouteNextHopIp
-
       Delegations                    = $deleg
       ServiceEndpoints               = $svcEp
       PrivateEndpointNetworkPolicies = $pvtEpPolicies
@@ -205,24 +155,24 @@ foreach ($v in $vnets) {
     }) | Out-Null
   }
 
-  # Summary (per VNet)
+  # Summary per VNet
   $summaryRows.Add([pscustomobject]@{
-    SubscriptionName = $sub.Name
-    SubscriptionId   = $sub.Id
-    Environment      = $adh_subscription_type
-    Custodian        = $adh_group
-    CustodianSubGroup= $adh_sub_group
-    ResourceGroup    = $rg
-    VNetName         = $vnetName
-    Location         = $loc
-    AddressSpaces    = $addr
-    DnsServers       = $dns
-    SubnetCount      = @($subnets).Count
-    PeeringCount     = @($peerings).Count
+    SubscriptionName  = $sub.Name
+    SubscriptionId    = $sub.Id
+    Environment       = $adh_subscription_type
+    Custodian         = $adh_group
+    CustodianSubGroup = $adh_sub_group
+    ResourceGroup     = $rg
+    VNetName          = $vnetName
+    Location          = $loc
+    AddressSpaces     = $addr
+    DnsServers        = $dns
+    SubnetCount       = @($subnets).Count
+    PeeringCount      = @($peerings).Count
   }) | Out-Null
 }
 
-# Handle case: no VNets (still produce CSVs)
+# Handle case: no VNets
 if ($summaryRows.Count -eq 0) {
   $summaryRows.Add([pscustomobject]@{
     SubscriptionName=''; SubscriptionId=''; Environment=$adh_subscription_type; Custodian=$adh_group; CustodianSubGroup=$adh_sub_group;
@@ -230,17 +180,106 @@ if ($summaryRows.Count -eq 0) {
   }) | Out-Null
 }
 
+# ---------------- Firewall scan (like Scan-VNet-Topology.ps1) ----------------
+$fwRows = New-Object System.Collections.Generic.List[object]
+
+try {
+  $firewalls = @(Get-AzFirewall -ErrorAction SilentlyContinue)
+} catch {
+  $firewalls = @()
+}
+
+foreach ($fw in $firewalls) {
+
+  $fwSku = ''
+  try { $fwSku = "$($fw.Sku.Name)" } catch {}
+  $tiMode = ''
+  try { $tiMode = "$($fw.ThreatIntelMode)" } catch {}
+
+  # If no IP configs -> still output one row
+  if (-not $fw.IpConfigurations -or $fw.IpConfigurations.Count -eq 0) {
+    $fwRows.Add([pscustomobject]@{
+      SubscriptionName   = $sub.Name
+      SubscriptionId     = $sub.Id
+      Environment        = $adh_subscription_type
+      Custodian          = $adh_group
+      CustodianSubGroup  = $adh_sub_group
+      ResourceGroup      = $fw.ResourceGroupName
+      Location           = $fw.Location
+      FirewallName       = $fw.Name
+      FirewallSku        = $fwSku
+      ThreatIntelMode    = $tiMode
+      PublicIpName       = ''
+      PublicIpAddress    = ''
+      PublicIpSku        = ''
+      PublicIpAllocation = ''
+    }) | Out-Null
+    continue
+  }
+
+  foreach ($ipc in $fw.IpConfigurations) {
+
+    $pipName = ''
+    $pipAddress = ''
+    $pipSku = ''
+    $pipAlloc = ''
+
+    try {
+      $pipId = $ipc.PublicIpAddress.Id
+      if ($pipId -and $pipId -match '/publicIPAddresses/([^/]+)$') { $pipName = $Matches[1] }
+
+      if ($pipId) {
+        $pipObj = Get-AzPublicIpAddress -ResourceId $pipId -ErrorAction SilentlyContinue
+        if ($pipObj) {
+          $pipAddress = "$($pipObj.IpAddress)"
+          $pipSku     = "$($pipObj.Sku.Name)"
+          $pipAlloc   = "$($pipObj.PublicIpAllocationMethod)"
+        }
+      }
+    } catch {}
+
+    $fwRows.Add([pscustomobject]@{
+      SubscriptionName   = $sub.Name
+      SubscriptionId     = $sub.Id
+      Environment        = $adh_subscription_type
+      Custodian          = $adh_group
+      CustodianSubGroup  = $adh_sub_group
+      ResourceGroup      = $fw.ResourceGroupName
+      Location           = $fw.Location
+      FirewallName       = $fw.Name
+      FirewallSku        = $fwSku
+      ThreatIntelMode    = $tiMode
+      PublicIpName       = $pipName
+      PublicIpAddress    = $pipAddress
+      PublicIpSku        = $pipSku
+      PublicIpAllocation = $pipAlloc
+    }) | Out-Null
+  }
+}
+
+# If no firewalls, still create file with one blank row (helps downstream tooling)
+if ($fwRows.Count -eq 0) {
+  $fwRows.Add([pscustomobject]@{
+    SubscriptionName=''; SubscriptionId=''; Environment=$adh_subscription_type; Custodian=$adh_group; CustodianSubGroup=$adh_sub_group;
+    ResourceGroup=''; Location=''; FirewallName=''; FirewallSku=''; ThreatIntelMode='';
+    PublicIpName=''; PublicIpAddress=''; PublicIpSku=''; PublicIpAllocation=''
+  }) | Out-Null
+}
+
 # ---------------- Write CSVs ----------------
-$summaryCsv = Join-Path $OutputDir ("vnet_monthly_summary_{0}_{1}_{2}.csv" -f $custodianForFile, $adh_subscription_type, $stamp)
+$summaryCsv = Join-Path $OutputDir ("vnet_monthly_summary_{0}_{1}_{2}.csv"  -f $custodianForFile, $adh_subscription_type, $stamp)
 $subnetCsv  = Join-Path $OutputDir ("vnet_monthly_subnets_{0}_{1}_{2}.csv"  -f $custodianForFile, $adh_subscription_type, $stamp)
 $peeringCsv = Join-Path $OutputDir ("vnet_monthly_peerings_{0}_{1}_{2}.csv" -f $custodianForFile, $adh_subscription_type, $stamp)
+$fwCsv      = Join-Path $OutputDir ("vnet_monthly_firewalls_{0}_{1}_{2}.csv" -f $custodianForFile, $adh_subscription_type, $stamp)
 
 Write-CsvSafe -Rows @($summaryRows) -Path $summaryCsv
 Write-CsvSafe -Rows @($subnetRows)  -Path $subnetCsv
 Write-CsvSafe -Rows @($peeringRows) -Path $peeringCsv
+Write-CsvSafe -Rows @($fwRows)      -Path $fwCsv
 
 Write-Host "VNet Monthly scan completed."
-Write-Host "Summary CSV : $summaryCsv"
-Write-Host "Subnets CSV : $subnetCsv"
-Write-Host "Peerings CSV: $peeringCsv"
+Write-Host "Summary  : $summaryCsv"
+Write-Host "Subnets  : $subnetCsv"
+Write-Host "Peerings : $peeringCsv"
+Write-Host "Firewalls: $fwCsv"
 exit 0
