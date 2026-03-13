@@ -1,0 +1,287 @@
+variable "use_serverless" {
+  description = "Run jobs on Databricks Serverless"
+  type        = bool
+  default     = false
+}
+
+provider "databricks" {
+  host  = "__DATABRICKS-WORKSPACE-URL__"
+  token = "__DATABRICKS_TOKEN__"
+}
+
+data "databricks_spark_version" "latest" {}
+data "databricks_node_type" "smallest" {
+  local_disk = true
+}
+
+################################################################################
+# LOCALS
+################################################################################
+
+locals {
+
+  configname     = "__configfilename__"
+  filepath       = "__terraform_file_path__"
+  catalog_suffix = "__BP-CATALOG-SUFFIX__"
+  kv_scope       = "__BP-KV-SCOPE__"
+  process_id     = "__BP-PROCESS-ID__"
+  run_id         = "__BP-RUN-ID__"
+
+  ingestion_data = jsondecode(file(local.filepath))
+  cluster_name   = "Jbc_${local.ingestion_data.bronze_table}"
+
+}
+
+locals {
+  base_params = "__is_std_task_present__" == "false" || "__is_std_task_present__" == "stream_false" ? ["one","two"] : [local.ingestion_data.std_schema,local.ingestion_data.std_table]
+}
+
+################################################################################
+# JOB WITH STD TASK
+################################################################################
+
+resource "databricks_job" "databricks_job_std" {
+
+  count = "__is_std_task_present__" == "true" ? 1 : 0
+
+  name = "__jobname__"
+
+  tags = {
+    Classification = "__TAG-CLASSIFICATION__"
+    Owner          = "__TAG-OWNER__"
+    CostCenter     = local.ingestion_data.unity_catalog
+  }
+
+  #######################################################################
+  # SERVERLESS ENVIRONMENT
+  #######################################################################
+
+  dynamic "environment" {
+    for_each = var.use_serverless ? [1] : []
+
+    content {
+      environment_key = "serverless_env"
+
+      spec {
+        client       = "1"
+        dependencies = []
+      }
+    }
+  }
+
+  #######################################################################
+  # CLUSTER (ONLY WHEN NOT SERVERLESS)
+  #######################################################################
+
+  dynamic "job_cluster" {
+    for_each = var.use_serverless ? [] : [1]
+
+    content {
+
+      job_cluster_key = local.cluster_name
+
+      new_cluster {
+
+        spark_version      = "__DATABRICKS-RUNTIME-VERSION__"
+        node_type_id       = lookup(var.node_type,"__NODE_TYPE__")
+        data_security_mode = "__data_security_mode__" == "" ? "USER_ISOLATION" : "__data_security_mode__"
+
+        enable_elastic_disk = true
+
+        autoscale {
+          min_workers = 1
+          max_workers = 4
+        }
+
+        azure_attributes {
+          availability       = "SPOT_WITH_FALLBACK_AZURE"
+          first_on_demand    = 1
+          spot_bid_max_price = 100
+        }
+
+        spark_conf = {
+          "spark.databricks.delta.preview.enabled" = true
+        }
+
+        custom_tags = {
+          Classification = "__TAG-CLASSIFICATION__"
+          Owner          = "__TAG-OWNER__"
+          CostCenter     = local.ingestion_data.unity_catalog
+        }
+      }
+    }
+  }
+
+################################################################################
+# TASK 1
+################################################################################
+
+  task {
+
+    task_key = "Load_Bronze"
+
+    job_cluster_key = var.use_serverless ? null : local.cluster_name
+    environment_key = var.use_serverless ? "serverless_env" : null
+
+    notebook_task {
+
+      notebook_path = "__DELTAINGESTION-NOTEBOOK-PATH-BRONZE__"
+      source        = "WORKSPACE"
+
+      base_parameters = {
+
+        catalog        = local.ingestion_data.unity_catalog
+        catalog_suffix = local.catalog_suffix
+        kv_scope       = local.kv_scope
+        bronze_schema  = local.ingestion_data.bronze_schema
+        environment    = "__ENVIRONMENT__"
+        bronze_table   = local.ingestion_data.bronze_table
+        process_id     = local.process_id
+        run_id         = local.run_id
+
+      }
+    }
+  }
+
+################################################################################
+# TASK 2
+################################################################################
+
+  task {
+
+    task_key = "Send_Message_Bronze"
+
+    depends_on {
+      task_key = "Load_Bronze"
+    }
+
+    job_cluster_key = var.use_serverless ? null : local.cluster_name
+    environment_key = var.use_serverless ? "serverless_env" : null
+
+    notebook_task {
+
+      notebook_path = "__DELTAINGESTION-NOTEBOOK-PATH-SEND-MESSAGE__"
+      source        = "WORKSPACE"
+
+      base_parameters = {
+
+        KV_Scope    = local.kv_scope
+        Task_Name   = "Load_Bronze"
+        Environment = "__ENVIRONMENT__"
+
+      }
+    }
+  }
+
+################################################################################
+# TASK 3
+################################################################################
+
+  task {
+
+    task_key = "Load_std"
+
+    depends_on {
+      task_key = "Load_Bronze"
+    }
+
+    job_cluster_key = var.use_serverless ? null : local.cluster_name
+    environment_key = var.use_serverless ? "serverless_env" : null
+
+    notebook_task {
+
+      notebook_path = "__DELTAINGESTION-NOTEBOOK-PATH-std__"
+      source        = "WORKSPACE"
+
+      base_parameters = {
+
+        catalog        = local.ingestion_data.unity_catalog
+        catalog_suffix = local.catalog_suffix
+        std_schema     = local.base_params[0]
+        std_table      = local.base_params[1]
+        process_id     = local.process_id
+        run_id         = local.run_id
+
+      }
+    }
+  }
+
+################################################################################
+# TASK 4
+################################################################################
+
+  task {
+
+    task_key = "Send_Message_std"
+
+    depends_on {
+      task_key = "Load_std"
+    }
+
+    job_cluster_key = var.use_serverless ? null : local.cluster_name
+    environment_key = var.use_serverless ? "serverless_env" : null
+
+    notebook_task {
+
+      notebook_path = "__DELTAINGESTION-NOTEBOOK-PATH-SEND-MESSAGE__"
+      source        = "WORKSPACE"
+
+      base_parameters = {
+
+        KV_Scope    = local.kv_scope
+        Task_Name   = "Load_std"
+        Environment = "__ENVIRONMENT__"
+
+      }
+    }
+  }
+}
+
+################################################################################
+# PERMISSIONS
+################################################################################
+
+resource "databricks_permissions" "permission_std" {
+
+  count = "__is_std_task_present__" == "true" ? 1 : 0
+
+  job_id = databricks_job.databricks_job_std[0].id
+
+  access_control {
+    service_principal_name = "__DATABRICKS-JOB-RUNAS__"
+    permission_level       = "IS_OWNER"
+  }
+
+  access_control {
+    user_name        = "__requester_email__"
+    permission_level = "CAN_MANAGE"
+  }
+
+  dynamic "access_control" {
+
+    for_each = split(";","__TERRAFORM-CAN-MANAGE-DEVELOPERS__")
+
+    content {
+
+      group_name       = access_control.value
+      permission_level = "CAN_MANAGE"
+
+    }
+  }
+}
+
+################################################################################
+# OUTPUTS
+################################################################################
+
+output "cluster_name" {
+  value = local.cluster_name
+}
+
+output "std_schema" {
+  value = local.base_params[0]
+}
+
+output "std_table" {
+  value = local.base_params[1]
+}
