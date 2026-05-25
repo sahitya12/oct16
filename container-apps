@@ -1,0 +1,34 @@
+Install required PowerShell modules
+
+$ErrorActionPreference = "Stop"
+
+Write-Host "Installing required Az modules for ADF publish..."
+
+Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+
+Install-Module Az.Accounts -RequiredVersion 5.4.0 -Scope CurrentUser -Force -AllowClobber
+Install-Module Az.Resources -Scope CurrentUser -Force -AllowClobber
+Install-Module Az.DataFactory -Scope CurrentUser -Force -AllowClobber
+Install-Module azure.datafactory.tools -Scope CurrentUser -Force -AllowClobber
+
+Write-Host "Installed module versions:"
+Get-Module Az.Accounts -ListAvailable | Sort-Object Version -Descending | Select-Object Name, Version, Path -First 5
+Get-Module Az.Resources -ListAvailable | Sort-Object Version -Descending | Select-Object Name, Version, Path -First 5
+Get-Module Az.DataFactory -ListAvailable | Sort-Object Version -Descending | Select-Object Name, Version, Path -First 5
+Get-Module azure.datafactory.tools -ListAvailable | Sort-Object Version -Descending | Select-Object Name, Version, Path -First 5
+
+
+-----------------------------------------------------------
+
+$ErrorActionPreference = "Stop"
+
+Import-Module Az.Accounts -RequiredVersion 5.4.0 -Force
+Import-Module Az.Resources -Force
+Import-Module Az.DataFactory -Force
+Import-Module azure.datafactory.tools -Force
+
+Write-Host "Loaded module versions:"
+Get-Module Az.Accounts | Select-Object Name, Version, Path
+Get-Module Az.Resources | Select-Object Name, Version, Path
+Get-Module Az.DataFactory | Select-Object Name, Version, Path
+Get-Module azure.datafactory.tools | Select-Object Name, Version, Path
