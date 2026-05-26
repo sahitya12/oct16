@@ -1,0 +1,239 @@
+.\Assign-ADF-RG-Role.ps1 -InputCsvPath "C:\Temp\adf-rg-role-input.csv" -DataOperationsGroupObjectId "<Data-Operations-Group-ObjectId>" -WhatIfMode
+
+.\Assign-ADF-RG-Role.ps1 -InputCsvPath "C:\Temp\adf-rg-role-input.csv" -DataOperationsGroupObjectId "<Data-Operations-Group-ObjectId>"
+
+<#
+Purpose:
+Assign custom role "ADH Data Factory Alert Operator" to Data Operations group
+at Resource Group scope only.
+
+Input CSV columns:
+Name, Resource group, Location, Subscription
+
+Required permissions:
+Owner or User Access Administrator on target RG/subscription.
+#>
+
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $InputCsvPath,
+
+    [Parameter(Mandatory = $true)]
+    [string] $DataOperationsGroupObjectId,
+
+    [Parameter(Mandatory = $false)]
+    [string] $RoleName = "ADH Data Factory Alert Operator",
+
+    [Parameter(Mandatory = $false)]
+    [string] $TenantId,
+
+    [Parameter(Mandatory = $false)]
+    [string] $OutputFolder = "C:\Temp\ADF-RG-RoleAssignment-Output",
+
+    [switch] $WhatIfMode
+)
+
+$ErrorActionPreference = "Stop"
+
+if (!(Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$outputCsv = Join-Path $OutputFolder "RG-RoleAssignment-Result-$timestamp.csv"
+
+$results = @()
+
+function Add-Result {
+    param(
+        [string] $SubscriptionName,
+        [string] $SubscriptionId,
+        [string] $ResourceGroupName,
+        [string] $DataFactoryName,
+        [string] $Location,
+        [string] $Scope,
+        [string] $RoleName,
+        [string] $GroupObjectId,
+        [string] $Status,
+        [string] $Message
+    )
+
+    $script:results += [PSCustomObject]@{
+        SubscriptionName  = $SubscriptionName
+        SubscriptionId    = $SubscriptionId
+        ResourceGroupName = $ResourceGroupName
+        DataFactoryName   = $DataFactoryName
+        Location          = $Location
+        Scope             = $Scope
+        RoleName          = $RoleName
+        GroupObjectId     = $GroupObjectId
+        Status            = $Status
+        Message           = $Message
+    }
+}
+
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+
+if ($TenantId) {
+    Connect-AzAccount -Tenant $TenantId | Out-Null
+}
+else {
+    Connect-AzAccount | Out-Null
+}
+
+if (!(Test-Path $InputCsvPath)) {
+    throw "Input CSV not found: $InputCsvPath"
+}
+
+$rows = Import-Csv -Path $InputCsvPath
+
+if ($rows.Count -eq 0) {
+    throw "Input CSV has no rows."
+}
+
+Write-Host "Rows found: $($rows.Count)" -ForegroundColor Green
+Write-Host "Assignment scope: Resource Group only" -ForegroundColor Yellow
+Write-Host "Role: $RoleName" -ForegroundColor Yellow
+Write-Host "Group ObjectId: $DataOperationsGroupObjectId" -ForegroundColor Yellow
+
+foreach ($row in $rows) {
+
+    $dataFactoryName = $row.Name
+    $resourceGroupName = $row.'Resource group'
+    $location = $row.Location
+    $subscriptionName = $row.Subscription
+
+    if ([string]::IsNullOrWhiteSpace($subscriptionName) -or [string]::IsNullOrWhiteSpace($resourceGroupName)) {
+        Add-Result `
+            -SubscriptionName $subscriptionName `
+            -SubscriptionId "" `
+            -ResourceGroupName $resourceGroupName `
+            -DataFactoryName $dataFactoryName `
+            -Location $location `
+            -Scope "" `
+            -RoleName $RoleName `
+            -GroupObjectId $DataOperationsGroupObjectId `
+            -Status "Skipped" `
+            -Message "Subscription or Resource group is missing."
+
+        continue
+    }
+
+    try {
+        Write-Host "`nProcessing RG-level assignment:" -ForegroundColor Cyan
+        Write-Host "Subscription : $subscriptionName"
+        Write-Host "Resource RG  : $resourceGroupName"
+        Write-Host "ADF Name     : $dataFactoryName"
+        Write-Host "Location     : $location"
+
+        $subscription = Get-AzSubscription | Where-Object { $_.Name -eq $subscriptionName }
+
+        if ($null -eq $subscription) {
+            throw "Subscription not found or no access: $subscriptionName"
+        }
+
+        if ($subscription.Count -gt 1) {
+            throw "Multiple subscriptions found with same name: $subscriptionName. Please use unique subscription names."
+        }
+
+        Set-AzContext -SubscriptionId $subscription.Id | Out-Null
+
+        # Validate RG exists
+        Get-AzResourceGroup -Name $resourceGroupName -ErrorAction Stop | Out-Null
+
+        # RG-level scope only
+        $scope = "/subscriptions/$($subscription.Id)/resourceGroups/$resourceGroupName"
+
+        Write-Host "RG Scope: $scope" -ForegroundColor Yellow
+
+        # Validate role exists
+        $roleDefinition = Get-AzRoleDefinition -Name $RoleName -ErrorAction SilentlyContinue
+
+        if ($null -eq $roleDefinition) {
+            throw "Role definition not found: $RoleName"
+        }
+
+        # Check if assignment already exists at RG scope
+        $existing = Get-AzRoleAssignment `
+            -ObjectId $DataOperationsGroupObjectId `
+            -RoleDefinitionName $RoleName `
+            -Scope $scope `
+            -ErrorAction SilentlyContinue
+
+        if ($existing) {
+            Write-Host "Role assignment already exists at RG scope. Skipping." -ForegroundColor Green
+
+            Add-Result `
+                -SubscriptionName $subscriptionName `
+                -SubscriptionId $subscription.Id `
+                -ResourceGroupName $resourceGroupName `
+                -DataFactoryName $dataFactoryName `
+                -Location $location `
+                -Scope $scope `
+                -RoleName $RoleName `
+                -GroupObjectId $DataOperationsGroupObjectId `
+                -Status "AlreadyExists" `
+                -Message "Role assignment already exists at Resource Group scope."
+
+            continue
+        }
+
+        if ($WhatIfMode) {
+            Write-Host "WHATIF: Would assign role at RG scope." -ForegroundColor Magenta
+
+            Add-Result `
+                -SubscriptionName $subscriptionName `
+                -SubscriptionId $subscription.Id `
+                -ResourceGroupName $resourceGroupName `
+                -DataFactoryName $dataFactoryName `
+                -Location $location `
+                -Scope $scope `
+                -RoleName $RoleName `
+                -GroupObjectId $DataOperationsGroupObjectId `
+                -Status "WhatIf" `
+                -Message "Would create role assignment at Resource Group scope."
+
+            continue
+        }
+
+        New-AzRoleAssignment `
+            -ObjectId $DataOperationsGroupObjectId `
+            -RoleDefinitionName $RoleName `
+            -Scope $scope `
+            -ErrorAction Stop | Out-Null
+
+        Write-Host "Role assignment created successfully at RG scope." -ForegroundColor Green
+
+        Add-Result `
+            -SubscriptionName $subscriptionName `
+            -SubscriptionId $subscription.Id `
+            -ResourceGroupName $resourceGroupName `
+            -DataFactoryName $dataFactoryName `
+            -Location $location `
+            -Scope $scope `
+            -RoleName $RoleName `
+            -GroupObjectId $DataOperationsGroupObjectId `
+            -Status "Created" `
+            -Message "Role assignment created successfully at Resource Group scope."
+    }
+    catch {
+        Write-Warning "Failed for RG '$resourceGroupName' in subscription '$subscriptionName'. Error: $($_.Exception.Message)"
+
+        Add-Result `
+            -SubscriptionName $subscriptionName `
+            -SubscriptionId "" `
+            -ResourceGroupName $resourceGroupName `
+            -DataFactoryName $dataFactoryName `
+            -Location $location `
+            -Scope "" `
+            -RoleName $RoleName `
+            -GroupObjectId $DataOperationsGroupObjectId `
+            -Status "Failed" `
+            -Message $_.Exception.Message
+    }
+}
+
+$results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host "`nCompleted." -ForegroundColor Green
+Write-Host "Output file: $outputCsv"
