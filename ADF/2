@@ -1,0 +1,254 @@
+Assign-ADF-RG-Role-To-DataOperations.ps1
+#################################
+$TenantId = "<tenant-id>"
+$ClientId = "<client-id>"
+$ClientSecret = '<client-secret>'
+$GroupObjectId = "<data-operations-group-object-id>"
+
+.\Assign-ADF-RG-Role-To-DataOperations.ps1 -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -InputCsvPath "C:\Temp\ADF-Inventory\PRD-ADF-EastUS2-NorthEurope.csv" -DataOperationsGroupObjectId $GroupObjectId -WhatIfMode
+################################
+.\Assign-ADF-RG-Role-To-DataOperations.ps1 -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -InputCsvPath "C:\Temp\ADF-Inventory\PRD-ADF-EastUS2-NorthEurope.csv" -DataOperationsGroupObjectId $GroupObjectId
+  
+#*******************************
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $TenantId,
+
+    [Parameter(Mandatory = $true)]
+    [string] $ClientId,
+
+    [Parameter(Mandatory = $true)]
+    [string] $ClientSecret,
+
+    [Parameter(Mandatory = $true)]
+    [string] $InputCsvPath,
+
+    [Parameter(Mandatory = $true)]
+    [string] $DataOperationsGroupObjectId,
+
+    [Parameter(Mandatory = $false)]
+    [string] $RoleName = "ADH Data Factory Alert Operator",
+
+    [Parameter(Mandatory = $false)]
+    [string] $OutputFolder = "C:\Temp\ADF-RG-RoleAssignment-Output",
+
+    [switch] $WhatIfMode
+)
+
+$ErrorActionPreference = "Stop"
+
+if (!(Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$outputCsv = Join-Path $OutputFolder "ADF-RG-RoleAssignment-Result-$timestamp.csv"
+
+$results = @()
+
+function Add-Result {
+    param(
+        [string] $SubscriptionName,
+        [string] $SubscriptionId,
+        [string] $ResourceGroupName,
+        [string] $DataFactoryName,
+        [string] $Location,
+        [string] $Scope,
+        [string] $RoleName,
+        [string] $GroupObjectId,
+        [string] $Status,
+        [string] $Message
+    )
+
+    $script:results += [PSCustomObject]@{
+        SubscriptionName  = $SubscriptionName
+        SubscriptionId    = $SubscriptionId
+        ResourceGroupName = $ResourceGroupName
+        DataFactoryName   = $DataFactoryName
+        Location          = $Location
+        Scope             = $Scope
+        RoleName          = $RoleName
+        GroupObjectId     = $GroupObjectId
+        Status            = $Status
+        Message           = $Message
+    }
+}
+
+Write-Host "Logging in using Service Principal..." -ForegroundColor Cyan
+
+$secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
+
+Connect-AzAccount `
+    -ServicePrincipal `
+    -Tenant $TenantId `
+    -Credential $credential | Out-Null
+
+Write-Host "SPN login successful." -ForegroundColor Green
+
+if (!(Test-Path $InputCsvPath)) {
+    throw "Input CSV not found: $InputCsvPath"
+}
+
+$rows = Import-Csv -Path $InputCsvPath
+
+if ($rows.Count -eq 0) {
+    throw "Input CSV has no rows."
+}
+
+Write-Host "Total rows found: $($rows.Count)" -ForegroundColor Green
+Write-Host "Role to assign: $RoleName" -ForegroundColor Yellow
+Write-Host "Assignment scope: Resource Group level only" -ForegroundColor Yellow
+
+foreach ($row in $rows) {
+
+    $subscriptionName = $row.SubscriptionName
+    $subscriptionId = $row.SubscriptionId
+    $resourceGroupName = $row.ResourceGroupName
+    $dataFactoryName = $row.DataFactoryName
+    $location = $row.Location
+
+    if ([string]::IsNullOrWhiteSpace($resourceGroupName)) {
+        Add-Result `
+            -SubscriptionName $subscriptionName `
+            -SubscriptionId $subscriptionId `
+            -ResourceGroupName $resourceGroupName `
+            -DataFactoryName $dataFactoryName `
+            -Location $location `
+            -Scope "" `
+            -RoleName $RoleName `
+            -GroupObjectId $DataOperationsGroupObjectId `
+            -Status "Skipped" `
+            -Message "ResourceGroupName is missing."
+
+        continue
+    }
+
+    try {
+        Write-Host "`nProcessing:" -ForegroundColor Cyan
+        Write-Host "SubscriptionName : $subscriptionName"
+        Write-Host "SubscriptionId   : $subscriptionId"
+        Write-Host "ResourceGroup    : $resourceGroupName"
+        Write-Host "ADF              : $dataFactoryName"
+        Write-Host "Location         : $location"
+
+        if (![string]::IsNullOrWhiteSpace($subscriptionId)) {
+            Set-AzContext -SubscriptionId $subscriptionId -TenantId $TenantId | Out-Null
+        }
+        elseif (![string]::IsNullOrWhiteSpace($subscriptionName)) {
+            $sub = Get-AzSubscription | Where-Object { $_.Name -eq $subscriptionName }
+
+            if ($null -eq $sub) {
+                throw "Subscription not found or SPN has no access: $subscriptionName"
+            }
+
+            if ($sub.Count -gt 1) {
+                throw "Multiple subscriptions found with name: $subscriptionName. Use SubscriptionId in CSV."
+            }
+
+            $subscriptionId = $sub.Id
+            Set-AzContext -SubscriptionId $subscriptionId -TenantId $TenantId | Out-Null
+        }
+        else {
+            throw "Both SubscriptionName and SubscriptionId are missing."
+        }
+
+        # Validate RG exists
+        Get-AzResourceGroup -Name $resourceGroupName -ErrorAction Stop | Out-Null
+
+        # RG-level scope only
+        $scope = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName"
+
+        Write-Host "Target scope: $scope" -ForegroundColor Yellow
+
+        # Validate custom role exists
+        $roleDefinition = Get-AzRoleDefinition -Name $RoleName -ErrorAction SilentlyContinue
+
+        if ($null -eq $roleDefinition) {
+            throw "Role definition not found: $RoleName"
+        }
+
+        # Check if role already assigned
+        $existing = Get-AzRoleAssignment `
+            -ObjectId $DataOperationsGroupObjectId `
+            -RoleDefinitionName $RoleName `
+            -Scope $scope `
+            -ErrorAction SilentlyContinue
+
+        if ($existing) {
+            Write-Host "Already assigned. Skipping." -ForegroundColor Green
+
+            Add-Result `
+                -SubscriptionName $subscriptionName `
+                -SubscriptionId $subscriptionId `
+                -ResourceGroupName $resourceGroupName `
+                -DataFactoryName $dataFactoryName `
+                -Location $location `
+                -Scope $scope `
+                -RoleName $RoleName `
+                -GroupObjectId $DataOperationsGroupObjectId `
+                -Status "AlreadyExists" `
+                -Message "Role assignment already exists at RG scope."
+
+            continue
+        }
+
+        if ($WhatIfMode) {
+            Write-Host "WHATIF: Would assign role at RG scope." -ForegroundColor Magenta
+
+            Add-Result `
+                -SubscriptionName $subscriptionName `
+                -SubscriptionId $subscriptionId `
+                -ResourceGroupName $resourceGroupName `
+                -DataFactoryName $dataFactoryName `
+                -Location $location `
+                -Scope $scope `
+                -RoleName $RoleName `
+                -GroupObjectId $DataOperationsGroupObjectId `
+                -Status "WhatIf" `
+                -Message "Would create role assignment at RG scope."
+
+            continue
+        }
+
+        New-AzRoleAssignment `
+            -ObjectId $DataOperationsGroupObjectId `
+            -RoleDefinitionName $RoleName `
+            -Scope $scope `
+            -ErrorAction Stop | Out-Null
+
+        Write-Host "Role assignment created successfully." -ForegroundColor Green
+
+        Add-Result `
+            -SubscriptionName $subscriptionName `
+            -SubscriptionId $subscriptionId `
+            -ResourceGroupName $resourceGroupName `
+            -DataFactoryName $dataFactoryName `
+            -Location $location `
+            -Scope $scope `
+            -RoleName $RoleName `
+            -GroupObjectId $DataOperationsGroupObjectId `
+            -Status "Created" `
+            -Message "Role assignment created successfully at RG scope."
+    }
+    catch {
+        Write-Warning "Failed for RG '$resourceGroupName'. Error: $($_.Exception.Message)"
+
+        Add-Result `
+            -SubscriptionName $subscriptionName `
+            -SubscriptionId $subscriptionId `
+            -ResourceGroupName $resourceGroupName `
+            -DataFactoryName $dataFactoryName `
+            -Location $location `
+            -Scope "" `
+            -RoleName $RoleName `
+            -GroupObjectId $DataOperationsGroupObjectId `
+            -Status "Failed" `
+            -Message $_.Exception.Message
+    }
+}
+
+$results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host "`nCompleted." -ForegroundColor Green
+Write-Host "Output file: $outputCsv"
