@@ -1,0 +1,132 @@
+Enable-CustomRole-On-Subscriptions.ps1
+
+$TenantId = "<tenant-id>"
+$ClientId = "<client-id>"
+$ClientSecret = '<client-secret>'
+$SourceSubscriptionId = "<subscription-id-where-custom-role-is-visible>"
+$InputCsvPath = "C:\Temp\ADF-Inventory\PRD-ADF-EastUS2-NorthEurope.csv"
+
+.\Enable-CustomRole-On-Subscriptions.ps1 -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -SourceSubscriptionId $SourceSubscriptionId -InputCsvPath $InputCsvPath -RoleName "ADH Data Factory Alert Operator" -WhatIfMode
+.\Enable-CustomRole-On-Subscriptions.ps1 -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -SourceSubscriptionId $SourceSubscriptionId -InputCsvPath $InputCsvPath -RoleName "ADH Data Factory Alert Operator"
+<#
+Purpose:
+Update custom role AssignableScopes to include all target subscriptions
+from a CSV file.
+
+This does NOT assign the role to users/groups.
+It only makes the custom role available in those subscriptions.
+
+Required SPN permission:
+- Microsoft.Authorization/roleDefinitions/write
+- Usually Owner or User Access Administrator at the role's current assignable scope
+  and target scopes.
+#>
+
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $TenantId,
+
+    [Parameter(Mandatory = $true)]
+    [string] $ClientId,
+
+    [Parameter(Mandatory = $true)]
+    [string] $ClientSecret,
+
+    [Parameter(Mandatory = $true)]
+    [string] $InputCsvPath,
+
+    [Parameter(Mandatory = $true)]
+    [string] $SourceSubscriptionId,
+
+    [Parameter(Mandatory = $false)]
+    [string] $RoleName = "ADH Data Factory Alert Operator",
+
+    [switch] $WhatIfMode
+)
+
+$ErrorActionPreference = "Stop"
+
+Write-Host "Logging in using Service Principal..." -ForegroundColor Cyan
+
+$secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
+
+Connect-AzAccount `
+    -ServicePrincipal `
+    -Tenant $TenantId `
+    -Credential $credential | Out-Null
+
+Write-Host "Login successful." -ForegroundColor Green
+
+if (!(Test-Path $InputCsvPath)) {
+    throw "Input CSV not found: $InputCsvPath"
+}
+
+Write-Host "Setting context to source subscription where role is currently visible..." -ForegroundColor Cyan
+Set-AzContext -SubscriptionId $SourceSubscriptionId -TenantId $TenantId | Out-Null
+
+Write-Host "Fetching custom role: $RoleName" -ForegroundColor Cyan
+
+$role = Get-AzRoleDefinition -Name $RoleName -ErrorAction SilentlyContinue
+
+if ($null -eq $role) {
+    Write-Host "Available custom roles in source subscription:" -ForegroundColor Yellow
+    Get-AzRoleDefinition -Custom |
+        Select-Object RoleName, Name, IsCustom |
+        Sort-Object RoleName |
+        Format-Table -AutoSize
+
+    throw "Custom role not found in source subscription: $RoleName"
+}
+
+Write-Host "Found role:" -ForegroundColor Green
+Write-Host "RoleName: $($role.RoleName)"
+Write-Host "RoleId  : $($role.Id)"
+
+Write-Host "`nCurrent AssignableScopes:" -ForegroundColor Yellow
+$role.AssignableScopes | ForEach-Object { Write-Host $_ }
+
+$rows = Import-Csv -Path $InputCsvPath
+
+$targetSubscriptionIds = $rows |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_.SubscriptionId) } |
+    Select-Object -ExpandProperty SubscriptionId -Unique
+
+if ($targetSubscriptionIds.Count -eq 0) {
+    throw "No SubscriptionId values found in CSV."
+}
+
+$newScopes = $targetSubscriptionIds | ForEach-Object {
+    "/subscriptions/$($_.Trim())"
+}
+
+$existingScopes = @($role.AssignableScopes)
+
+$mergedScopes = @($existingScopes + $newScopes) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    Select-Object -Unique
+
+Write-Host "`nTarget subscriptions from CSV: $($targetSubscriptionIds.Count)" -ForegroundColor Cyan
+
+Write-Host "`nNew scopes to be added if missing:" -ForegroundColor Yellow
+$newScopes | ForEach-Object { Write-Host $_ }
+
+Write-Host "`nFinal AssignableScopes count: $($mergedScopes.Count)" -ForegroundColor Green
+
+if ($WhatIfMode) {
+    Write-Host "`nWHATIF mode enabled. No changes will be made." -ForegroundColor Magenta
+    Write-Host "Final AssignableScopes would be:"
+    $mergedScopes | ForEach-Object { Write-Host $_ }
+    return
+}
+
+$role.AssignableScopes = $mergedScopes
+
+Write-Host "`nUpdating custom role AssignableScopes..." -ForegroundColor Cyan
+
+Set-AzRoleDefinition -Role $role
+
+Write-Host "Custom role updated successfully." -ForegroundColor Green
+
+Write-Host "`nUpdated AssignableScopes:" -ForegroundColor Yellow
+(Get-AzRoleDefinition -Name $RoleName).AssignableScopes | ForEach-Object { Write-Host $_ }
