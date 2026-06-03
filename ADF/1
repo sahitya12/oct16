@@ -1,0 +1,134 @@
+#Get-All-ADF-Inventory-Using-SPN.ps1
+
+#********************
+
+.\Get-All-ADF-Inventory-Using-SPN.ps1 -TenantId "<tenant-id>" -ClientId "<client-id>" -ClientSecret "<client-secret>" -OutputFolder "C:\Temp\ADF-Inventory"
+
+#*********************
+
+$inputCsv = "C:\Temp\ADF-Inventory\All-ADF-Inventory-<timestamp>.csv"
+$outputCsv = "C:\Temp\ADF-Inventory\PRD-ADF-EastUS2-NorthEurope.csv"
+
+Import-Csv $inputCsv |
+Where-Object {
+    (
+        $_.DataFactoryName -match "prd" -or
+        $_.ResourceGroupName -match "prd" -or
+        $_.SubscriptionName -match "prd"
+    ) -and
+    (
+        $_.Location -eq "eastus2" -or
+        $_.Location -eq "northeurope" -or
+        $_.Location -eq "East US 2" -or
+        $_.Location -eq "North Europe"
+    )
+} |
+Sort-Object SubscriptionName, ResourceGroupName, DataFactoryName |
+Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host "Filtered PRD ADF list exported to: $outputCsv"
+
+
+#***********
+<#
+Purpose:
+Fetch all Azure Data Factories across all subscriptions accessible by SPN.
+
+Output:
+CSV containing:
+SubscriptionName, SubscriptionId, ResourceGroupName, DataFactoryName, Location, ResourceId
+
+This script is READ ONLY.
+#>
+
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $TenantId,
+
+    [Parameter(Mandatory = $true)]
+    [string] $ClientId,
+
+    [Parameter(Mandatory = $true)]
+    [string] $ClientSecret,
+
+    [Parameter(Mandatory = $false)]
+    [string] $OutputFolder = "C:\Temp\ADF-Inventory"
+)
+
+$ErrorActionPreference = "Stop"
+
+if (!(Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$outputCsv = Join-Path $OutputFolder "All-ADF-Inventory-$timestamp.csv"
+
+Write-Host "Logging in using Service Principal..." -ForegroundColor Cyan
+
+$secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
+
+Connect-AzAccount `
+    -ServicePrincipal `
+    -Tenant $TenantId `
+    -Credential $credential | Out-Null
+
+Write-Host "Login successful." -ForegroundColor Green
+
+$subscriptions = Get-AzSubscription | Sort-Object Name
+
+Write-Host "Subscriptions accessible by SPN: $($subscriptions.Count)" -ForegroundColor Green
+
+$adfInventory = @()
+
+foreach ($sub in $subscriptions) {
+
+    Write-Host "`nProcessing subscription: $($sub.Name) [$($sub.Id)]" -ForegroundColor Yellow
+
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -TenantId $TenantId | Out-Null
+
+        $adfs = Get-AzResource `
+            -ResourceType "Microsoft.DataFactory/factories" `
+            -ErrorAction SilentlyContinue
+
+        if ($null -eq $adfs -or $adfs.Count -eq 0) {
+            Write-Host "No ADF found in subscription: $($sub.Name)"
+            continue
+        }
+
+        foreach ($adf in $adfs) {
+            $adfInventory += [PSCustomObject]@{
+                SubscriptionName  = $sub.Name
+                SubscriptionId    = $sub.Id
+                ResourceGroupName = $adf.ResourceGroupName
+                DataFactoryName   = $adf.Name
+                Location          = $adf.Location
+                ResourceId        = $adf.ResourceId
+            }
+
+            Write-Host "Found ADF: $($adf.Name) | RG: $($adf.ResourceGroupName) | Location: $($adf.Location)"
+        }
+    }
+    catch {
+        Write-Warning "Failed to process subscription $($sub.Name): $($_.Exception.Message)"
+
+        $adfInventory += [PSCustomObject]@{
+            SubscriptionName  = $sub.Name
+            SubscriptionId    = $sub.Id
+            ResourceGroupName = ""
+            DataFactoryName   = ""
+            Location          = ""
+            ResourceId        = ""
+            Error             = $_.Exception.Message
+        }
+    }
+}
+
+$adfInventory |
+    Sort-Object SubscriptionName, ResourceGroupName, DataFactoryName |
+    Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host "`nCompleted." -ForegroundColor Green
+Write-Host "Output file: $outputCsv"
