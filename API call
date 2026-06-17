@@ -29,3 +29,14 @@
     }
   ]
 }
+
+___________________________________
+
+{
+  "add": [
+    {
+      "workspace_id": 4388421591619472,
+      "binding_type": "BINDING_TYPE_READ_WRITE"
+    }
+  ]
+}
