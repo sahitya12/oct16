@@ -1,0 +1,31 @@
+{
+  "changes": [
+    {
+      "principal": "3bd29ae3-2ce5-42a3-bad0-b9e8ca5b196a",
+      "add": [
+        "BROWSE",
+        "MANAGE",
+        "USE_CATALOG"
+      ]
+    },
+    {
+      "principal": "68349ff4-4131-4ec3-bff6-2949d950b976",
+      "add": [
+        "APPLY_TAG",
+        "MANAGE",
+        "SELECT",
+        "USE_CATALOG",
+        "USE_SCHEMA"
+      ]
+    },
+    {
+      "principal": "7307caca-6171-4eef-8264-8145e2c65813",
+      "add": [
+        "APPLY_TAG",
+        "MANAGE",
+        "USE_CATALOG",
+        "USE_SCHEMA"
+      ]
+    }
+  ]
+}
