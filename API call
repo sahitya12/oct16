@@ -48,3 +48,6 @@ https://adb-4388421591619472.12.azuredatabricks.net/api/2.1/unity-catalog/catalo
 {
   "isolation_mode": "ISOLATED"
 }
+
+
+GET https://adb-4388421591619472.12.azuredatabricks.net/api/2.1/unity-catalog/bindings/catalog/adh_sab_coe_dev?max_results=0
