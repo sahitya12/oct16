@@ -40,3 +40,11 @@ ___________________________________
     }
   ]
 }
+
+---------------------
+
+https://adb-4388421591619472.12.azuredatabricks.net/api/2.1/unity-catalog/catalogs/adh_sab_coe_dev
+
+{
+  "isolation_mode": "ISOLATED"
+}
