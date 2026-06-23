@@ -1,0 +1,171 @@
+az ad group show `
+  --group "paz_app_myID_tr1_groups" `
+  --query id `
+  -o tsv
+
+
+$TargetGroupId = az ad group show `
+  --group "paz_app_myID_tr1_groups" `
+  --query id `
+  -o tsv
+
+$TargetGroupId
+
+Step 2 — Save your Excel as CSV
+
+Save the Excel as:
+
+C:\Temp\exportGroupMembers.csv
+
+Make sure it has this column:
+
+id
+
+That column contains the group object IDs to be added.
+
+Step 3 — Login using SPN with no subscription
+az login `
+  --service-principal `
+  --username "<client-id>" `
+  --password "<client-secret>" `
+  --tenant "<tenant-id>" `
+  --allow-no-subscriptions
+Step 4 — Add all groups as members of target group
+$CsvPath = "C:\Temp\exportGroupMembers.csv"
+$TargetGroupId = "<paz_app_myID_tr1_groups-object-id>"
+
+$members = Import-Csv $CsvPath
+
+foreach ($member in $members) {
+
+    $MemberGroupId = $member.id
+
+    if ([string]::IsNullOrWhiteSpace($MemberGroupId)) {
+        Write-Host "Skipping empty member id"
+        continue
+    }
+
+    Write-Host "Checking membership for member group: $MemberGroupId"
+
+    $check = az ad group member check `
+      --group $TargetGroupId `
+      --member-id $MemberGroupId `
+      --query value `
+      -o tsv
+
+    if ($check -eq "true") {
+        Write-Host "Already member. Skipping: $MemberGroupId" -ForegroundColor Yellow
+        continue
+    }
+
+    Write-Host "Adding member group: $MemberGroupId"
+
+    az ad group member add `
+      --group $TargetGroupId `
+      --member-id $MemberGroupId
+
+    Write-Host "Added: $MemberGroupId" -ForegroundColor Green
+}
+Step 5 — Verify members after adding
+az ad group member list `
+  --group $TargetGroupId `
+  --query "[].{displayName:displayName, objectType:'@odata.type', id:id}" `
+  -o table
+
+Or export result:
+
+az ad group member list `
+  --group $TargetGroupId `
+  --query "[].{displayName:displayName, id:id}" `
+  -o json |
+ConvertFrom-Json |
+Export-Csv "C:\Temp\paz_app_myID_tr1_groups_members_after.csv" -NoTypeInformation
+Full script with output report
+
+Use this if you want a result CSV.
+
+$CsvPath = "C:\Temp\exportGroupMembers.csv"
+$TargetGroupName = "paz_app_myID_tr1_groups"
+$OutputCsv = "C:\Temp\Add-Groups-To-TR1-Result.csv"
+
+$TargetGroupId = az ad group show `
+  --group $TargetGroupName `
+  --query id `
+  -o tsv
+
+if ([string]::IsNullOrWhiteSpace($TargetGroupId)) {
+    throw "Target group not found: $TargetGroupName"
+}
+
+Write-Host "Target group: $TargetGroupName"
+Write-Host "Target group id: $TargetGroupId"
+
+$members = Import-Csv $CsvPath
+$results = @()
+
+foreach ($member in $members) {
+
+    $MemberGroupId = $member.id
+    $MemberDisplayName = $member.displayName
+
+    if ([string]::IsNullOrWhiteSpace($MemberGroupId)) {
+        $results += [PSCustomObject]@{
+            DisplayName = $MemberDisplayName
+            MemberId    = $MemberGroupId
+            Status      = "Skipped"
+            Message     = "Empty id"
+        }
+        continue
+    }
+
+    try {
+        Write-Host "`nProcessing: $MemberDisplayName | $MemberGroupId"
+
+        $check = az ad group member check `
+          --group $TargetGroupId `
+          --member-id $MemberGroupId `
+          --query value `
+          -o tsv
+
+        if ($check -eq "true") {
+            Write-Host "Already member. Skipping." -ForegroundColor Yellow
+
+            $results += [PSCustomObject]@{
+                DisplayName = $MemberDisplayName
+                MemberId    = $MemberGroupId
+                Status      = "AlreadyExists"
+                Message     = "Group is already member of target group"
+            }
+
+            continue
+        }
+
+        az ad group member add `
+          --group $TargetGroupId `
+          --member-id $MemberGroupId
+
+        Write-Host "Added successfully." -ForegroundColor Green
+
+        $results += [PSCustomObject]@{
+            DisplayName = $MemberDisplayName
+            MemberId    = $MemberGroupId
+            Status      = "Added"
+            Message     = "Added to target group"
+        }
+    }
+    catch {
+        Write-Warning "Failed for $MemberDisplayName | $MemberGroupId : $($_.Exception.Message)"
+
+        $results += [PSCustomObject]@{
+            DisplayName = $MemberDisplayName
+            MemberId    = $MemberGroupId
+            Status      = "Failed"
+            Message     = $_.Exception.Message
+        }
+    }
+}
+
+$results | Export-Csv $OutputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host "`nCompleted."
+Write-Host "Output report: $OutputCsv"
